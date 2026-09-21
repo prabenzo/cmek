@@ -1,6 +1,6 @@
 # Spec coverage matrix (cross-milestone completeness critic)
 
-Sources: SPEC.md (binding), P0_EXPLAINED.md, HANDOFF.md, ARCHITECTURE.md (canonical), ARCH-NOTES.md (overrides), plan/M0.md–M6.md (revised plans only; drafts ignored).
+Sources: SPEC.md (binding), P0_EXPLAINED.md, HANDOFF.md, DESIGN-REFERENCE.md (canonical), ARCH-NOTES.md (overrides), plan/M0.md–M6.md (revised plans only; drafts ignored).
 Updated after the cross-milestone fix pass: every GAP the critic found was closed in the plans (the closing plan and review-log id are named in the row).
 Milestone column = the plan whose Files/Order of work delivers the item. "cut line" = the spec's cut for that box; "expected cut" = the plan itself says the cut is the expected path. "cond." = conditional row in a later plan. **GAP** = no plan delivers it on the expected path.
 
@@ -102,7 +102,7 @@ Milestone column = the plan whose Files/Order of work delivers the item. "cut li
 | error rate | M2 |
 | key state (enabled, disabled) | M2 (`Revoke`/`Restore`) |
 
-### 3d. ARCHITECTURE › Params, by field (which plan adds it to `params.go`)
+### 3d. DESIGN-REFERENCE › Params, by field (which plan adds it to `params.go`)
 
 | Block | Fields → milestone |
 | --- | --- |
