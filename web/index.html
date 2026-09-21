@@ -1,0 +1,14 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Killswitch</title>
+<h1>Killswitch</h1>
+<p>Placeholder page (M0). Live tick from <code>/v1/stream</code>:</p>
+<p>world <b id="world">-</b> · tick <b id="tick">-</b></p>
+<script>
+  const es = new EventSource('/v1/stream');
+  es.onmessage = e => {
+    const s = JSON.parse(e.data);
+    document.getElementById('tick').textContent = s.tick;
+    document.getElementById('world').textContent = s.world;
+  };
+</script>
