@@ -20,13 +20,32 @@ These are the build plans for the seven milestones in `docs/SPEC.md › Plan and
 
 | Milestone | Clock | Plan | Approved by Ben | Decisions changed |
 | --- | --- | --- | --- | --- |
-| M0 Skeleton and deploy | 0:00–0:20 | [M0.md](M0.md) | [ ] | |
+| M0 Skeleton and deploy | 0:00–0:20 | [M0.md](M0.md) | [x] 2026-09-21, PR #1 review | all three as recommended |
 | M1 Data path | 0:20–1:05 (expected ≈ 1:11) | [M1.md](M1.md) | [ ] | |
 | M2 CMEK core | 1:05–1:50 | [M2.md](M2.md) | [ ] | |
 | M3 Admission and surges | 1:50–2:20 | [M3.md](M3.md) | [ ] | |
 | M4 UI and scenarios | 2:20–3:15 | [M4.md](M4.md) | [ ] | |
 | M5 Checker and hardening | 3:15–3:40 | [M5.md](M5.md) | [ ] | |
 | M6 Rationale | 3:40–4:25 | [M6.md](M6.md) | [ ] | |
+
+## Decisions recorded so far
+
+| Decision | Where | Ben's call | Recorded |
+| --- | --- | --- | --- |
+| Scheduler class | ARCHITECTURE.md, M3 | as recommended (interleaved two-class ring) | PR #1 review, 2026-09-21 |
+| DEK rotation during ride-through | ARCHITECTURE.md, M2 | as recommended (keep sealing under the exhausted DEK; "look good for the demo, adjust from there") | PR #1 review, 2026-09-21 |
+| Provider bulkhead full | ARCHITECTURE.md, M2 | as recommended (wait within the call deadline) | PR #1 review, 2026-09-21 |
+| Stale-OK guard | ARCHITECTURE.md, M2 | as recommended (keep the guard) | PR #1 review, 2026-09-21 |
+| M0: deploy path, cross-compiling builder stage, tick burn | M0 | all as recommended | PR #1 review, 2026-09-21 |
+
+## Working asynchronously
+
+Ben reviewed the time commitments as fine but will work asynchronously, not to the proposed timing in real time. The plans stay as written; read them as follows:
+
+- **The clock is a budget of working minutes per lane, not wall time.** Every "0:07", "T+14" and trigger minute is measured on that lane's own working clock, from the moment the lane's owner picks the milestone up. `docs/TIMELOG.md` records working minutes per lane and per milestone, which is what the assignment's "time spent" needs.
+- **Hand-offs become pushed-and-waiting states.** Where a plan has Claude and Ben working in parallel, Claude's lane runs in a session to its next push point and stops; Ben's lane runs whenever he picks it up (pull, his files, reviews, deploys) and ends with a push; the next Claude session starts by pulling. Nothing in either lane waits idle for the other in real time.
+- **Cut lines and fallback triggers still apply**, judged on the lane's working clock and on the same signals (a build not green, a measurement over its threshold), never on the calendar.
+- **Acceptance checks that need both hands** (Ben's laptop for browser, Docker and gcloud; the session for curl and Go) are split as the plans already say; the live-URL checks simply happen at Ben's next pickup.
 
 ## Ground rules carried into every plan
 
