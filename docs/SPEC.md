@@ -1,6 +1,6 @@
 # Killswitch: CMEK event queue spec
 
-2026-09-20 · @Beb
+2026-09-20 · @Ben
 
 ## Summary
 
