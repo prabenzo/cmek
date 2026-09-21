@@ -1,6 +1,6 @@
 # Killswitch: CMEK event queue spec
 
-2026-09-20 · @Someone
+2026-09-20 · @Beb
 
 ## Summary
 
@@ -8,17 +8,17 @@ Killswitch is a multi-tenant webhook event queue that encrypts every payload und
 
 CMEK puts a third-party dependency that the customer controls into the hot path. The service must cache keys to survive KMS outages, yet every second of caching delays revocation. Killswitch makes that tradeoff one explicit knob, a **key lease**: cached keys are usable only while a time-bounded lease on the customer's authorization is valid.
 
-A reviewer opens one URL and sees live traffic from 1,000 fake tenants spread across three fake KMS providers. They start a scenario (provider outage, key revocation, slow KMS) and watch a tenant grid, four charts, and a live invariant panel show the system degrading predictably. "Killswitch" is a working title.
+A reviewer opens one URL and sees live traffic from 1,000 fake tenants spread across three fake KMS providers. They start a scenario (provider outage, key revocation, slow KMS, tenant surge, global surge) and watch a tenant grid, four charts, and a live invariant panel show the system degrading predictably. "Killswitch" is a working title.
 
 ## Constraints and success criteria
 
-The plan is sized at 4 hours total, inside the assignment's 8-hour hard cap. Every assignment requirement maps to a concrete choice below.
+The plan is sized at 4 hours 45 minutes total, inside the assignment's 8-hour hard cap. Every assignment requirement maps to a concrete choice below.
 
 | Assignment requirement | How this spec meets it |
 | --- | --- |
-| Deployed; usable in a browser or via API with no install | One Go binary on an always-on VM; dashboard at the root URL; `POST /v1/events` works from curl |
+| Deployed; usable in a browser or via API with no install | One Go binary on Cloud Run, scaled to zero when idle and capped at one instance; dashboard at the root URL; `POST /v1/events` works from curl |
 | Self-contained evaluation | Fake tenants, traffic and KMS providers run in-process; each scenario card says what to watch |
-| Target 1–2 hours, hard cap 8; scoping is graded | 4-hour plan with a cut line per milestone; stretch work starts only after P0 is live |
+| Target 1–2 hours, hard cap 8; scoping is graded | 4:45 plan with a cut line per milestone; stretch work starts only after P0 is live |
 | Code on GitHub | Public repo; this spec exported to `docs/SPEC.md` |
 | Rationale as a \~5 min video plus a short written doc | Drafted from Summary, The CMEK core, and the Decision log |
 | AI transcripts; judgment is evaluated | Decision log records each call and who made it |
@@ -32,36 +32,35 @@ The submission succeeds if three things hold:
 
 ## Scope
 
-P0 is the smallest system that proves the thesis: one data path, the CMEK core, three scenarios, and a live checker. Everything else is ordered stretch work or an explicit non-goal.
+P0 is the smallest system that proves the thesis: one data path, the CMEK core, five scenarios, and a live checker. Everything else is ordered stretch work or an explicit non-goal.
 
 | Area | P0 |
 | --- | --- |
 | Data path | Ingest API → envelope encryption (AES-256-GCM) → SQLite queue → fair round-robin scheduler → workers → fake sink |
 | CMEK core | Key lease with soft and hard TTL, singleflight, error classification, tenant key state machine with backoff probes, key fetcher behind bulkheads, tenant parking |
-| Admission | Per-tenant token bucket (429) and per-tenant backlog cap |
-| Fakes | 3 KMS providers, 1,000 tenants with Zipf traffic, fault injection: fast-fail outage, latency, revoke and restore |
-| Scenarios | Provider outage, key revocation, slow KMS |
+| Admission | Per-tenant token bucket (429), per-tenant backlog cap, and a global backlog cap that sheds the heaviest tenants first (503) |
+| Fakes | 3 KMS providers, 1,000 tenants with Zipf traffic, fault injection: fast-fail outage, latency, revoke and restore; surge controls per tenant and global |
+| Scenarios | Provider outage, key revocation, slow KMS, tenant surge, global surge |
 | UI | Scenario cards, tenant grid, 4 charts, invariant panel, event timeline, reset |
 | Checks | Live invariant checker; unit tests for the lease, classifier and envelope |
 | World | One shared World with no globals; reset button; pause and auto-reset when nobody is watching |
 
 Every term in this table is unpacked, row by row, in [P0 explained](file/fa225fcb-06cd).
 
-Stretch items start only after P0 is deployed and smoke-tested. Each one ships independently.
+Stretch items start only after P0 is deployed and smoke-tested. Each one ships independently. They are numbered X1 to X4 so they can't be confused with safety invariants S1 to S4.
 
 | # | Stretch item | Estimate | Why this position |
 | --- | --- | --- | --- |
-| S1 | Noisy-neighbor scenario: one tenant at 100x | 15 min | Nearly free once the token bucket and fair scheduler exist; shows KMS calls staying flat under a surge |
-| S2 | Naive-mode switch for the slow-KMS scenario: workers unwrap inline per message, with no lease, cache or bulkheads | 20 min | The most persuasive moment: one slow KMS takes everyone down, then the switch brings them back |
-| S3 | Per-session worlds | 45–60 min | Removes reviewer interference; cheap because World has no globals |
-| S4 | Global surge with load shedding; KMS throttling (429) class; blackhole outage; cold start; key rotation; lease slider | 10–30 min each | Breadth; each is independent |
-| S5 | Scenario tests in virtual time (`testing/synctest`) | 45 min | Turns the invariants into CI checks |
+| X1 | Naive-mode switch for the slow-KMS scenario: workers unwrap inline per message, with no lease, cache or bulkheads | 20 min | The most persuasive moment: one slow KMS takes everyone down, then the switch brings them back |
+| X2 | Per-session worlds | 45–60 min | Removes reviewer interference; cheap because World has no globals |
+| X3 | Surge during a KMS brownout; KMS throttling (429) class; blackhole outage; cold start; key rotation; lease slider | 10–30 min each | Breadth; each is independent |
+| X4 | Scenario tests in virtual time (`testing/synctest`) | 45 min | Turns the invariants into CI checks |
 
 Non-goals: real webhook delivery (signing, endpoint retries), real KMS SDK integrations, multi-node or multi-region deployment, auth beyond a tenant header, durable restart recovery, and message ordering guarantees.
 
 ## Correctness contract
 
-"Handles CMEK correctly" means four safety invariants that must never break, plus three isolation SLOs that hold under every fault. The UI shows each one live as a pass/fail light.
+"Handles CMEK correctly" means four safety invariants that must never break, plus four isolation and overload SLOs that hold under every fault or surge. The UI shows each one live as a pass/fail light.
 
 The checker sits outside the service's trust boundary. Because the KMS is a fake, it records ground truth (the exact moment a key was revoked), so the checker compares what truly happened against what the service did.
 
@@ -71,9 +70,10 @@ The checker sits outside the service's trust boundary. Because the KMS is a fake
 | S2 Tenant key isolation | A payload is only ever encrypted under a DEK wrapped by its own tenant's KEK. | AAD binds tenant, message and DEK IDs. The sink verifies payload tenant equals envelope tenant. |
 | S3 Bounded revocation | After a key is revoked at time t, none of that tenant's payloads is decrypted after t + lease (30 s in the demo). An authoritative deny purges keys at once. | Checker counts decrypts later than ground-truth t + lease. Count must be 0. Detection latency is displayed. |
 | S4 No loss from key unavailability | A transient key failure never drops a message, dead-letters it, or burns its retry budget. | Conservation per tenant: accepted = delivered + queued + expired + dead. |
-| L1 Blast radius | During a fault on some tenants, unaffected tenants keep p99 end-to-end latency within 1.25x of baseline and a rejection rate of 0. | Healthy-vs-affected p99 chart and an SLO light. |
+| L1 Blast radius | During a fault or surge on some tenants, unaffected tenants keep p99 end-to-end latency within 1.25x of baseline and a rejection rate of 0. | Healthy-vs-affected p99 chart and an SLO light. |
 | L2 KMS call economy | KMS calls per tenant are bounded by lease renewals (at most 1 per soft TTL) plus DEK rotations, whatever that tenant's request rate. | KMS calls/s charted against events/s; per-tenant call rate in the tenant detail. |
 | L3 Self-healing | When a fault clears, affected tenants return to ACTIVE and backlog drains with no operator action and no call spike above the bulkhead cap. | Timeline events and a displayed recovery time. |
+| L4 Overload | When offered load exceeds delivery capacity, delivered throughput holds at capacity and backlog stays bounded. Excess is rejected at ingest, heaviest tenants first. Tenants within their fair share see no rejections. | Delivered-against-capacity tile, backlog chart, and rejections split by tenants within and over their share. |
 
 ## Architecture
 
@@ -98,7 +98,7 @@ flowchart LR
 
 Solid arrows are the data path; dotted arrows are key lookups and checker reads.
 
-1. **Ingest.** Check the tenant's token bucket and backlog cap. Get the tenant's active DEK from the key lease: in memory if the lease is valid, otherwise one bounded synchronous key fetch. Encrypt with a fresh 96-bit nonce and AAD = tenant ID, message ID, DEK ID. Insert the row and return 202.
+1. **Ingest.** Check the global backlog cap, then the tenant's token bucket and backlog cap. Get the tenant's active DEK from the key lease: in memory if the lease is valid, otherwise one bounded synchronous key fetch. Encrypt with a fresh 96-bit nonce and AAD = tenant ID, message ID, DEK ID. Insert the row and return 202.
 2. **Delivery.** The scheduler round-robins over tenants that have backlog, a valid lease, and the needed DEK in cache. Workers never call a KMS. If a DEK is missing, the scheduler asks the key fetcher for it and moves on to the next tenant.
 3. **Key fetch.** The key fetcher applies a per-call timeout, singleflight per DEK, concurrency caps per provider and per tenant, and per-tenant backoff with jitter. Every call and every purge lands in the audit log.
 
@@ -109,7 +109,7 @@ The queue is the right substrate for this demo, and the rationale should say so.
 | Store | Fields | Notes |
 | --- | --- | --- |
 | `deks` table | id, tenant\_id, kek\_id, kek\_version, wrapped\_dek, created\_at | Wrapped keys only, safe at rest |
-| `messages` table | id, tenant\_id, dek\_id, nonce, ciphertext, state, attempts, enqueued\_at, lease\_until | Index on (tenant\_id, state, id). States: ready, leased, dead. Deleted on ack. |
+| `messages` table | id, tenant\_id, dek\_id, nonce, ciphertext, state, attempts, enqueued\_at, claimed\_until | Index on (tenant\_id, state, id). States: ready, claimed, dead. Deleted on ack. |
 | Audit log (in-memory ring) | ts, tenant\_id, op, kek\_version, outcome, class | Every KMS call, purge and state change |
 
 ## The CMEK core
@@ -170,6 +170,7 @@ RIDING\_THROUGH has no customer impact; KEY\_UNAVAILABLE and REVOKED fail closed
 | Per-tenant backoff with jitter; single probe when half-open | No retry storm against a struggling KMS; no thundering herd at recovery |
 | Parking at tenant level | A parked tenant costs zero worker time, and its messages keep their retry budget |
 | Per-tenant token bucket and backlog cap; round-robin scheduler | A surging tenant can't flood the queue or starve other tenants' delivery |
+| Global backlog cap that sheds tenants above their fair share first | A surge from everyone slows the few heaviest senders, not the many light ones, and total backlog stays bounded |
 
 ## Fakes and scenarios
 
@@ -180,16 +181,27 @@ The fakes are honest stand-ins: the fake KMS does real cryptography and keeps gr
 | KMS | The interface a real adapter would implement: `GenerateDataKey` and `Unwrap`. Three simulated providers (labelled aws, gcp, azure) each host a third of the tenants. Real AES-256-GCM wrapping under per-tenant KEKs, so a revoked key is truly unusable. |
 | KMS faults | Per provider or per tenant: mode (ok, fast-fail), lognormal latency (p50, p99), error rate, key state (enabled, disabled). |
 | KMS ground truth | A timestamped log of every call and every key state change. Only the invariant checker reads it. |
-| Traffic | 1,000 tenants with Zipf-distributed rates, about 300 events/s in total. Payloads are \~1 KB synthetic webhook events containing the canary `PLAINTEXT-CANARY-<tenant>`. Rejections are counted by reason and not retried. |
-| Sink | Accepts deliveries with 5–20 ms simulated latency, verifies the canary's tenant, and records delivery time. Worker count times sink latency sets a synthetic capacity, so behavior doesn't depend on the VM's CPU. |
+| Traffic | 1,000 tenants with Zipf-distributed rates, about 300 events/s in total. Payloads are \~1 KB synthetic webhook events containing the canary `PLAINTEXT-CANARY-<tenant>`. Surge controls multiply one tenant's rate or every tenant's rate. Rejections are counted by reason and not retried. |
+| Sink | Accepts deliveries with 5–20 ms simulated latency, verifies the canary's tenant, and records delivery time. Worker count times sink latency sets a synthetic capacity, so behavior doesn't depend on the host's CPU. |
 
-Each scenario is a scripted fault with a card that tells the reviewer what to watch.
+Each scenario is a scripted fault or surge with a card that tells the reviewer what to watch.
 
 | Scenario | Fault | What to watch | Exercises |
 | --- | --- | --- | --- |
 | Provider outage | Provider gcp fast-fails. Two buttons: a 10 s blip and a 60 s outage. | Blip: a third of the grid turns yellow, then green; no chart moves. Outage: yellow spreads over 0–15 s with no customer impact. From 15–30 s leases run out at staggered times, cells turn orange, and those tenants get 503s. The other two providers' tenants stay flat. Calls to gcp decay through backoff. On restore, cells go green within about 10 s and parked messages deliver. | S1, S4, L1, L3 |
 | Key revocation | Disable the key of one high-traffic tenant. | One cell turns purple, typically within 15 s and always within 30 s. The timeline shows revoked (ground truth), detected, DEKs purged, and 0 decrypts after. Ingest returns `403 key_revoked`. Click Restore: the re-probe sees it within 5 s and the parked messages deliver. | S3, S4, L1 |
 | Slow KMS | Provider azure latency rises to p50 400 ms and p99 3 s against a 500 ms timeout. | Azure tenants flicker yellow; cold ones see slow ingest and some 503s. The healthy-tenant p99 line stays flat. Key-fetcher in-flight for azure pins at its cap of 32 while the other providers' fetches run freely. | L1, L2 |
+| Tenant surge | One top-20 tenant sends 100x its normal rate for 60 s. | Its cell stays green, marked with a ring. Above its limit of 100 events/s it gets 429 rate\_limited. Its KMS calls stay flat, at most 1 per 15 s, while its traffic is 100x. Other tenants' p99 and delivery lag don't move, because the scheduler gives every tenant one turn per round. | L1, L2 |
+| Global surge | Every tenant sends 5x for 60 s: about 1,500 events/s offered against a delivery capacity near 640. | Delivered throughput holds at capacity instead of collapsing. A few dozen of the heaviest tenants are held to their fair share and see 429s. The rest notice nothing. Backlog rises, then levels off under its caps, and drains within about a minute after the surge. KMS calls per second stay under the bound of 1,000 tenants ÷ 15 s, about 67. | L1, L2, L4 |
+
+The two surge scenarios depend on four load settings, all World parameters.
+
+| Load setting | Demo value | Effect |
+| --- | --- | --- |
+| Delivery capacity | 8 workers at 12.5 ms mean sink latency, about 640 events/s | Roughly twice the 300 events/s baseline |
+| Tenant rate limit | 100 events/s, burst 200 | Above it: `429 rate_limited` |
+| Tenant backlog cap | 500 messages | Above it: `429 backlog_full` |
+| Global backlog cap | 20,000 messages | Above it, tenants over their fair share of the backlog get `503 overloaded` |
 
 Once the lease expires, ingest for that tenant is rejected rather than queued, because a symmetric DEK that can encrypt can also decrypt. Parked backlog is therefore small: the messages in flight when the lease ran out. Removing that limit is the first item under With more time.
 
@@ -201,17 +213,17 @@ The UI is one page with one hero visual: a 1,000-cell tenant grid that makes bla
 | --- | --- |
 | Header | Three sentences on what CMEK is and the thesis; a notice that this is a shared live system; Reset |
 | Scenario cards (left) | Title, what to watch, Start and Stop, and a phase countdown while running |
-| Tenant grid (center) | 40 × 25 canvas, banded by provider so an outage lights one contiguous band. Green ACTIVE, yellow RIDING\_THROUGH, orange KEY\_UNAVAILABLE, purple REVOKED. Hover shows tenant, provider, lease remaining and backlog. Click pins a detail strip with the tenant's last 10 audit entries. |
-| Tiles | Events delivered per second, healthy-tenant p99, KMS calls per second, tenants by state |
-| Charts (2-minute window) | 1. Ingest outcomes per second: accepted, 429, 503 key\_unavailable, 403 key\_revoked. 2. End-to-end p99: healthy versus affected tenants. 3. KMS calls per second by class, against events per second. 4. Backlog: total and affected set. |
-| Invariant panel | S1–S4 and L1, each with a light, a counter and a last-checked time |
+| Tenant grid (center) | 40 × 25 canvas, banded by provider so an outage lights one contiguous band. Green ACTIVE, yellow RIDING\_THROUGH, orange KEY\_UNAVAILABLE, purple REVOKED. A ring marks any tenant a scenario targets. Hover shows tenant, provider, lease remaining and backlog. Click pins a detail strip with the tenant's last 10 audit entries. |
+| Tiles | Events delivered per second against capacity, healthy-tenant p99, KMS calls per second, tenants by state |
+| Charts (2-minute window) | 1. Ingest outcomes per second: accepted, 429, 503 key\_unavailable, 503 overloaded, 403 key\_revoked. 2. End-to-end p99: healthy versus affected tenants. 3. KMS calls per second by class, against events per second. 4. Backlog: total and affected set. |
+| Invariant panel | S1–S4, L1 and L4, each with a light, a counter and a last-checked time |
 | Event timeline | State transitions and scenario markers, newest first, such as `12:01:07 t-0042 REVOKED, detected in 8.2 s, 3 DEKs purged` |
 
-The server pushes one JSON snapshot over SSE at 2 Hz: global aggregates, a 1,000-byte state array for the grid, and new timeline events. That is a few KB per tick. The World pauses when no viewer is connected and resets to baseline on the first connection after an idle period.
+The server pushes one JSON snapshot over SSE at 2 Hz: global aggregates, a 1,000-byte state array for the grid, and new timeline events. That is a few KB per tick. The World runs only while a viewer's stream is open, which is also the only time Cloud Run allocates CPU. The first connection after more than 10 s without viewers builds a fresh World, and the page shows a starting state until the first snapshot arrives.
 
 ## Stack, API and deployment
 
-The whole system is one static Go binary with the UI embedded, deployed as a single always-on container. That keeps deployment risk small and gives real concurrency, real timeouts and real crypto.
+The whole system is one static Go binary with the UI embedded, deployed as a single container that scales to zero when idle. That keeps deployment risk small and gives real concurrency, real timeouts and real crypto.
 
 | Choice | Decision | Reason |
 | --- | --- | --- |
@@ -219,7 +231,7 @@ The whole system is one static Go binary with the UI embedded, deployed as a sin
 | Storage | `modernc.org/sqlite`, WAL mode, single writer connection | Pure Go, so no CGO and a simple static build; "at rest" stays tangible |
 | Libraries | stdlib `net/http`, `crypto/aes`, `crypto/cipher`; `x/sync/singleflight`; `x/time/rate` | Little to review beyond our own code |
 | UI | `index.html`, vanilla JS, uPlot, served through `go:embed` | No npm, no build step |
-| Hosting | Fly.io by default: one small VM, no scale-to-zero | Reviewers never hit a cold start; any always-on host works |
+| Hosting | Cloud Run, scaled to zero: min 0 and max 1 instance, request-based billing, startup CPU boost, 60-minute request timeout, 1 GiB memory | Max one instance keeps the World in a single process. The World only needs CPU while someone is watching, and an open stream is an in-flight request, so [request-based billing](https://docs.cloud.google.com/run/docs/configuring/billing-settings) fits and idle time costs nothing. The price is a short cold start on the first visit, softened by [startup CPU boost](https://docs.cloud.google.com/run/docs/configuring/services/cpu). The [filesystem is in-memory](https://docs.cloud.google.com/run/docs/container-contract), so SQLite counts against instance memory. Streams end at the [request timeout](https://docs.cloud.google.com/run/docs/configuring/request-timeout), so the UI reconnects by itself. |
 
 ```
 cmd/killswitch/     HTTP server, embeds the UI, owns the World
@@ -236,10 +248,11 @@ web/                index.html, app.js, uPlot
 
 | Endpoint | Purpose |
 | --- | --- |
-| `POST /v1/events` with header `X-Tenant-ID` | Enqueue an event. Returns 202, 429 (`rate_limited`, `backlog_full`), 503 (`key_unavailable`) or 403 (`key_revoked`) |
+| `POST /v1/events` with header `X-Tenant-ID` | Enqueue an event. Returns 202, 429 (`rate_limited`, `backlog_full`), 503 (`key_unavailable`, `overloaded`) or 403 (`key_revoked`) |
 | `GET /v1/stream` | SSE snapshots at 2 Hz |
 | `POST /v1/scenarios/{name}/start` and `/stop` | Run or stop a scripted scenario |
 | `POST /v1/faults` | Manual fault injection: scope (provider or tenant), mode, latency, error rate |
+| `POST /v1/traffic` | Manual surge control: a rate multiplier for one tenant or for all tenants |
 | `POST /v1/tenants/{id}/key` | Body `{"action": "revoke"}` or `{"action": "restore"}` |
 | `GET /v1/tenants/{id}` | Tenant state, lease age, backlog, recent audit entries |
 | `POST /v1/reset` | Rebuild the World |
@@ -249,29 +262,31 @@ Testing stays proportionate. Table-driven unit tests cover the classifier, the l
 
 ## Plan and cut lines
 
-The 4 hours split into 3:00 of build, 0:45 of rationale and 0:15 of buffer. Deployment happens in the first 20 minutes, so the riskiest external dependency is retired before any feature work.
+The 4:45 splits into 3:40 of build, 0:45 of rationale and 0:20 of buffer. Deployment happens in the first 20 minutes, so the riskiest external dependency is retired before any feature work.
 
 | Milestone | Clock | Output | If it overruns, cut |
 | --- | --- | --- | --- |
-| M0 Skeleton and deploy | 0:00–0:20 | Repo, empty World, `/healthz`, static page, Dockerfile, live URL | Nothing |
+| M0 Skeleton and deploy | 0:00–0:20 | Repo, empty World, `/healthz`, static page, Dockerfile, live URL on Cloud Run, plus a check that a background ticker keeps running while a stream is open | Nothing |
 | M1 Data path | 0:20–1:05 | Fake KMS with real wrapping, envelope, SQLite queue, scheduler, workers, sink, load generator, SSE with raw counters | Tenant detail endpoint |
-| M2 CMEK core | 1:05–1:50 | Lease, classifier, key state machine, key fetcher with bulkheads, parking, admission, fault API, unit tests | Backlog cap; per-tenant fetch cap (keep per-provider) |
-| M3 UI and scenarios | 1:50–2:35 | Grid, tiles, 4 charts, scenario cards, timeline; three scenarios tuned to read within 90 s | Hover and pinned detail; drop to 2 charts |
-| M4 Checker and hardening | 2:35–3:00 | Invariant panel, reset, idle pause, README, final deploy, clean-browser smoke test | L1 light (keep S1, S3, S4) |
-| M5 Rationale | 3:00–3:45 | Short written doc drawn from this spec; 5-minute video | Second video take |
-| Buffer | 3:45–4:00 |  |  |
+| M2 CMEK core | 1:05–1:50 | Lease, classifier, key state machine, key fetcher with bulkheads, parking, fault API, unit tests | Per-tenant fetch cap (keep per-provider) |
+| M3 Admission and surges | 1:50–2:20 | Token buckets, tenant backlog cap, global fair-share shedding, surge controls, both surge scenarios scripted | Fair-share shedding (fall back to a plain global cap) |
+| M4 UI and scenarios | 2:20–3:15 | Grid, tiles, 4 charts, scenario cards, timeline; five scenarios tuned to read within 90 s each | Hover and pinned detail; drop to 2 charts |
+| M5 Checker and hardening | 3:15–3:40 | Invariant panel, reset, idle pause, README, final deploy, clean-browser smoke test | L1 and L4 lights (keep S1, S3, S4) |
+| M6 Rationale | 3:40–4:25 | Short written doc drawn from this spec; 5-minute video | Second video take |
+| Buffer | 4:25–4:45 |  |  |
 
-Stretch items S1–S3 add about 1.5 hours, which still lands near 5.5 hours, well under the cap.
+Stretch items X1 and X2 add a little over an hour, which lands near 6 hours, still under the cap.
 
 | Risk | Mitigation |
 | --- | --- |
-| Scope creep past 4 hours | Cut lines above; stretch only after P0 is deployed and smoke-tested |
-| The demo is hard to read | One hero visual, cards that say what to watch, three scenarios only |
-| Scenario timing reads badly | All time constants are World parameters; tune them in M3 |
-| Two reviewers collide in the shared World | Banner, reset, auto-reset when idle; S3 if time allows |
-| A small VM makes behavior noisy | Capacity is synthetic (workers × sink latency), not real CPU saturation |
+| Scope creep past 4:45 | Cut lines above; stretch only after P0 is deployed and smoke-tested |
+| The demo is hard to read | One hero visual, cards that say what to watch, five short scenarios |
+| Scenario timing reads badly | All time constants are World parameters; tune them in M4 |
+| Two reviewers collide in the shared World | Banner, reset, auto-reset when idle; X2 if time allows |
+| A small instance makes behavior noisy | Capacity is synthetic (workers × sink latency), not real CPU saturation |
 | Reads as AI-generated with no judgment | Ben reads and owns `internal/cmek` end to end; the decision log and transcripts show who decided what |
 | SQLite write contention | WAL, a single writer connection, batched lease and ack |
+| Request-based billing throttles CPU whenever no request is in flight | The World runs only while a stream is open, and M0 verifies that on the live service. Fallback: min 1 instance with instance-based billing |
 
 ## With more time
 
@@ -290,7 +305,7 @@ The most valuable extension removes the KMS from the write path entirely; the re
 
 ## Decision log and open questions
 
-Five decisions are settled and three of Claude's proposals still need Ben's confirmation. This table doubles as source material for the written rationale.
+All nine decisions are settled, including one proposal of Claude's that Ben declined (D8). This table doubles as source material for the written rationale.
 
 | # | Decision | Who | Why |
 | --- | --- | --- | --- |
@@ -298,17 +313,19 @@ Five decisions are settled and three of Claude's proposals still need Ben's conf
 | D2 | Center the project on revocation versus availability; revocation is a first-class scenario | Claude proposed, Ben accepted | It is what separates CMEK from generic resilience work |
 | D3 | Go | Ben | Concurrency primitives map onto the mechanisms; single binary |
 | D4 | A real service in real time with compressed time constants; one shared World in P0, per-session worlds as a follow-up | Ben | Reads as a system rather than a simulation |
-| D5 | 4-hour total budget; lean P0 with three scenarios | Ben | Closest to the 1–2 hour target; scoping is graded |
-| D6 | Build the queue directly on a SQLite table; no separate store-on-disk phase | Claude proposed, to confirm | One step instead of two; "at rest" stays tangible |
-| D7 | Stub webhook delivery with a fake sink | Claude proposed, to confirm | Endpoint failures are a webhook problem, not a CMEK one |
-| D8 | Single-tenant and global surge move from the core to stretch (S1, S4) | Follows from D5, to confirm | Both were in Ben's original list; S1 is first in line |
+| D5 | 4-hour total budget; lean P0 with three scenarios (amended by D8: five scenarios, 4:45 total) | Ben | Closest to the 1–2 hour target; scoping is graded |
+| D6 | Build the queue directly on a SQLite table; no separate store-on-disk phase | Claude proposed, Ben accepted | One step instead of two; "at rest" stays tangible |
+| D7 | Stub webhook delivery with a fake sink | Claude proposed, Ben accepted | Endpoint failures are a webhook problem, not a CMEK one |
+| D8 | Single-tenant and global surge move from the core to stretch (S1, S4) | Claude proposed; Ben declined | Ben keeps both surge scenarios in P0, as in his original brief. This adds about 45 minutes, so the plan is now 4:45 |
+| D9 | Host on Cloud Run, scaled to zero: at most one instance, request-based billing, a short cold start accepted | Ben | Ben's choice of host, and of near-zero idle cost over a warm start. It fits because the World lives in one process and already pauses when nobody is watching |
+|  |  |  |  |
 
-- [ ] Confirm D6, D7 and D8, or push back.
-- [ ] Stretch order: per-session worlds is ranked third, behind two cheaper items that every reviewer sees. Claude first said it would be the first stretch item, before the 4-hour budget was set. Reorder if you disagree.
-- [ ] Name: keep "Killswitch"?
-- [ ] Hosting: Fly.io is the default. Any account you already have works if it stays always-on.
-- [ ] Does spec and planning time count toward the 4 hours? The plan assumes it does not.
-- [ ] Demo lease length: 30 s keeps every scenario under 90 s. A shorter lease reads faster but makes the yellow ride-through phase easy to miss.
+- [x] Confirm D7 and D8, or push back.
+- [x] Stretch order: per-session worlds is X2, behind the naive-mode switch, now that D8 moved the tenant surge into P0. Claude first said it would be the first stretch item, before the budget was set.
+- [x] Name: keep "Killswitch"?
+- [x] Hosting: Fly.io is the default. Any account you already have works if it stays always-on.
+- [x] Does spec and planning time count toward the 4:45? The plan assumes it does not.
+- [x] Demo lease length: 30 s keeps every scenario under 90 s. A shorter lease reads faster but makes the yellow ride-through phase easy to miss.
 
 ## Prior art
 
