@@ -3,7 +3,7 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -13,45 +13,60 @@ import (
 
 	"github.com/prabenzo/cmek/internal/world"
 
-	// Blank imports warm the module and build caches in the M0 image; M1 uses all three.
-	_ "golang.org/x/sync/singleflight"
+	// x/time is first used in M3 (admission); the blank import keeps the module in the build cache.
 	_ "golang.org/x/time/rate"
-	_ "modernc.org/sqlite"
 )
 
 func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
-	burnMs := 50
-	if v, err := strconv.Atoi(os.Getenv("KS_TICK_BURN_MS")); err == nil && v >= 0 {
-		burnMs = v
-	}
 	p := world.Demo()
-	holder := world.NewHolder(p)
-	s := &server{holder: holder, burn: time.Duration(burnMs) * time.Millisecond}
+	if v, err := strconv.ParseInt(os.Getenv("SEED"), 10, 64); err == nil {
+		p.Seed = v
+	}
+	if v, err := strconv.ParseFloat(os.Getenv("KS_BASE_RATE"), 64); err == nil && v > 0 {
+		p.BaseRate = v
+	}
+	if v := os.Getenv("KS_DB_DIR"); v != "" {
+		p.DBDir = v
+	}
+	if v := os.Getenv("KS_SYNC"); v != "" {
+		p.SyncMode = v
+	}
+	if v, err := strconv.Atoi(os.Getenv("KS_WAL_AUTOCHECKPOINT")); err == nil && v > 0 {
+		p.WALAutocheckpoint = v
+	}
+	holder := world.NewHolder(p, world.Deps{Logger: logger})
+	s := &server{holder: holder}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	w, release := holder.Ensure()
-	defer release()
-	go s.runTicker(ctx, w, p.SnapshotInterval)
+	w, release := holder.Ensure() // build the World at boot so /health has one
+	release()
+	if w == nil {
+		logger.Error("no world at boot")
+		os.Exit(1)
+	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", s.health)
-	mux.HandleFunc("GET /v1/stream", s.stream)
+	s.routes(mux)
 	routeUI(mux)
 	srv := &http.Server{Addr: ":" + port, Handler: mux, ReadHeaderTimeout: 10 * time.Second, WriteTimeout: 0}
-
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
+		if cur := holder.Current(); cur != nil {
+			cur.Stop()
+		}
 	}()
-	log.Printf("killswitch %s listening on :%s (tick burn %d ms)", w.ID, port, burnMs)
+	logger.Info("killswitch listening", "port", port, "world", w.ID, "base_rate", p.BaseRate)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatal(err)
+		logger.Error("listen", "err", err)
+		os.Exit(1)
 	}
 }
