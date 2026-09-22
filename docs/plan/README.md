@@ -23,10 +23,10 @@ These are the build plans for the seven milestones in `docs/SPEC.md › Plan and
 | M0 Skeleton and deploy | 0:00–0:20 | [M0.md](M0.md) | [x] 2026-09-21, PR #1 review | all three as recommended |
 | M1 Data path | 0:20–1:05 (expected ≈ 1:11) | [M1.md](M1.md) | [x] 2026-09-22, chat | Ben reviews the tests only (Claude writes envelope, tests and the load script); every other decision as recommended |
 | M2 CMEK core | 1:05–1:50 | [M2.md](M2.md) | [x] 2026-09-22, chat | Claude writes all the code and tests (Ben reviews at his pickup); Manager locking: per-tenant mutexes; every other decision as recommended |
-| M3 Admission and surges | 1:50–2:20 | [M3.md](M3.md) | [ ] | |
-| M4 UI and scenarios | 2:20–3:15 | [M4.md](M4.md) | [ ] | |
-| M5 Checker and hardening | 3:15–3:40 | [M5.md](M5.md) | [ ] | |
-| M6 Rationale | 3:40–4:25 | [M6.md](M6.md) | [ ] | |
+| M3 Admission and surges | 1:50–2:20 | [M3.md](M3.md) | [ ] | standing (2026-09-22): Claude writes all code and tests, Ben reviews; the rest open |
+| M4 UI and scenarios | 2:20–3:15 | [M4.md](M4.md) | [ ] | standing: Claude writes everything incl. `hist.go`, its test and the card copy; Ben observes in the browser, deploys, reviews; the rest open |
+| M5 Checker and hardening | 3:15–3:40 | [M5.md](M5.md) | [ ] | standing: Claude writes everything incl. `holder.go`, reset and the README draft; Ben deploys, runs the clean-browser check, reviews; the rest open |
+| M6 Rationale | 3:40–4:25 | [M6.md](M6.md) | [ ] | standing: Claude writes every file; Ben reviews, records the video, exports his transcripts, deploys; the rest open |
 
 ## Decisions recorded so far
 
@@ -39,6 +39,7 @@ These are the build plans for the seven milestones in `docs/SPEC.md › Plan and
 | M0: deploy path, cross-compiling builder stage, tick burn | M0 | all as recommended | PR #1 review, 2026-09-21 |
 | D9 fallback: one always-on instance, instance-based billing | M0, ARCH-NOTES 1 | taken (viewer count could not be made honest on Cloud Run; ARCH-NOTES 11) | chat, 2026-09-22 |
 | M1: nonce source, DBDir + Deps.ID, measurement trigger, insert strategy, M1 tests, load generator shape, id allocation, audit storage, Retry-After, provider mapping, grid encoding, 202 body id | M1 | all as recommended; "who writes" changed: Claude writes everything, Ben reviews the tests only | chat, 2026-09-22 |
+| M3–M6: who writes | M3, M4, M5, M6, ARCH-NOTES 9 | Claude writes all the code, tests and drafts in every remaining milestone; Ben reviews at his pickup and keeps only what needs his laptop: browser observation, docker/gcloud deploys, the video, the transcript exports. Each plan's order of work is one Claude lane; Ben's review is at his pickup and never gates a step | chat, 2026-09-22 |
 | M2: cold-fetch edge, M2 split, slow-azure rows, walk extras, tenant/waiter cap full, Manager locking | M2 | Manager locking: per-tenant mutexes (the alternative); M2 split: Claude writes all of `internal/cmek` and every test, Ben reviews at his pickup and writes no tests (so the M5 walk extras' owner is Claude); the rest as recommended | chat, 2026-09-22 |
 
 ## Working asynchronously
@@ -46,7 +47,7 @@ These are the build plans for the seven milestones in `docs/SPEC.md › Plan and
 Ben reviewed the time commitments as fine but will work asynchronously, not to the proposed timing in real time. The plans stay as written; read them as follows:
 
 - **The clock is a budget of working minutes per lane, not wall time.** Every "0:07", "T+14" and trigger minute is measured on that lane's own working clock, from the moment the lane's owner picks the milestone up. `docs/TIMELOG.md` records working minutes per lane and per milestone, which is what the assignment's "time spent" needs.
-- **Hand-offs become pushed-and-waiting states.** Where a plan has Claude and Ben working in parallel, Claude's lane runs in a session to its next push point and stops; Ben's lane runs whenever he picks it up (pull, his files, reviews, deploys) and ends with a push; the next Claude session starts by pulling. Nothing in either lane waits idle for the other in real time.
+- **Hand-offs become pushed-and-waiting states.** From M2 on (Ben's call, 2026-09-22) Claude's lane writes every file and runs in a session to its push point; Ben's lane runs whenever he picks it up (pull, review, browser observation, deploys) and ends with review comments or a push of his own laptop-only artefacts; the next Claude session starts by pulling and fixing his findings first. Nothing in either lane waits idle for the other in real time.
 - **Cut lines and fallback triggers still apply**, judged on the lane's working clock and on the same signals (a build not green, a measurement over its threshold), never on the calendar.
 - **Acceptance checks that need both hands** (Ben's laptop for browser, Docker and gcloud; the session for curl and Go) are split as the plans already say; the live-URL checks simply happen at Ben's next pickup.
 

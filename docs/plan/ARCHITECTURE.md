@@ -116,7 +116,7 @@ The layout is the spec's (SPEC › Stack, API and deployment). Two rules it enfo
 
 | Package | Owner |
 | --- | --- |
-| `internal/cmek` | Ben writes or line-reviews every line |
+| `internal/cmek` | Claude writes; Ben line-reviews every line (from M2 on, Ben's call of 2026-09-22; before that the plan had Ben writing the classifier, lease and tests) |
 | `internal/queue` | Claude; Ben reviews claim, release and the scheduler's next-tenant rule |
 | `internal/kms` | Claude; Ben reviews the interface and the fake's revoke ordering |
 | `internal/world` | Claude; Ben reviews ingest, wiring and the World holder |
