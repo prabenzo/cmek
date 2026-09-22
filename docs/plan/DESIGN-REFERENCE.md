@@ -1075,7 +1075,7 @@ func (w *World) Tenant(id string) (TenantDetail, error)
 | `README.md` | 60 | M5 | B | thesis in three sentences, live URL, how to run, scenario guide, deploy recipe, the stale-OK sentence, links to rationale and TIMELOG |
 | `.github/workflows/deploy.yml` | 30 | optional (Ben, after M0) | B | `docker build` with BuildKit cache → push → `gcloud run deploy --image`; not required for the plan |
 
-Deploy path (from Ben's machine): `docker build -t $IMG .` (BuildKit cache mounts make every build after the first < 1 min; the first compiles modernc.org/sqlite, ~3 min) → `docker push $IMG` → `gcloud run deploy killswitch --image "$IMG" --region "$REGION" --platform managed --allow-unauthenticated --min-instances 0 --max-instances 1 --cpu-boost --cpu-throttling --timeout 3600 --memory 1Gi --port 8080` (request-based billing; the exact command is ARCH-NOTES 1 and M0.md step 4). Never `--source` (no layer cache; every deploy would pay the sqlite compile again) `[BB-10]`.
+Deploy path (from Ben's machine): `docker build -t $IMG .` (BuildKit cache mounts make every build after the first < 1 min; the first compiles modernc.org/sqlite, ~3 min) → `docker push $IMG` → `gcloud run deploy killswitch --image "$IMG" --region "$REGION" --platform managed --allow-unauthenticated --min-instances 1 --max-instances 1 --cpu-boost --no-cpu-throttling --timeout 3600 --memory 1Gi --port 8080` (request-based billing; the exact command is ARCH-NOTES 1 and M0.md step 4). Never `--source` (no layer cache; every deploy would pay the sqlite compile again) `[BB-10]`.
 
 Totals: non-test Go ≈ 3,065 (cmek 520, kms 300, queue 440, admit 110, traffic 220, check 150, metrics 450, world 580, cmd 295); tests ≈ 350; web ≈ 530 + vendored uPlot `[SF-F10]`.
 
