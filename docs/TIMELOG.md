@@ -4,7 +4,7 @@ Working minutes per lane, per milestone (docs/plan/README.md › Working asynchr
 
 | Milestone | Planned | Actual [C] | Actual [B] | Started | Ended | Notes (cuts, fallbacks, decisions, parameter changes) |
 | --- | --- | --- | --- | --- | --- | --- |
-| M0 Skeleton and deploy | 20 | | | | 7:39pm|7:59pm |
+| M0 Skeleton and deploy | 20 | | | | 7:39pm| 7:59pm; Live on Cloud Run; ticker check PASS (2026-09-22): D9 request-based billing kept, no fallback; /health replaces /healthz (Cloud Run reserves /healthz); all three M0 decisions as recommended |
 | M1 Data path | 45 | | | | | |
 | M2 CMEK core | 45 | | | | | |
 | M3 Admission and surges | 30 | | | | | |
