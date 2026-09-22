@@ -4,7 +4,7 @@
 #   A: stream 60 s; ticks must advance ≈ 2/s (PASS ≥ 100; 60–99 rerun once; < 60 → D9 fallback)
 #   B: idle 30 s with no viewer; ticks must advance ≤ 20 (request-based billing throttles the idle instance)
 set -u; URL=${1:?usage: $0 URL [A|B|AB]}; PART=${2:-AB}
-hz() { curl -sf "$URL/healthz" || { echo "FAIL: /healthz not 200 (check --allow-unauthenticated)"; return 1; }; }
+hz() { curl -sf "$URL/health" || { echo "FAIL: /healthz not 200 (check --allow-unauthenticated)"; return 1; }; }
 field() { grep -oE "\"$1\":[^,}]+" | cut -d: -f2 | tr -d '"'; }
 hz  || exit 1   # absorbs the cold start
 if [[ $PART == *A* ]]; then echo "A: streaming 60 s"
