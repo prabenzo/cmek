@@ -65,7 +65,7 @@ package world
 
 // World owns one complete running system: service, fakes, checker, metrics. No globals anywhere.
 type World struct {
-	ID     string // "w-<n>"; changes on every rebuild; carried in every snapshot and /healthz
+	ID     string // "w-<n>"; changes on every rebuild; carried in every snapshot and /health
 	P      Params
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -242,7 +242,7 @@ func (w *World) Stop()
 func (w *World) Viewers() int
 // IdleFor is how long there have been no viewers (0 while watched).
 func (w *World) IdleFor(now time.Time) time.Duration
-// Health is the /healthz body: ticks from the metrics ticker, uptime, world id, insert timing (M1 instrument).
+// Health is the /health body: ticks from the metrics ticker, uptime, world id, insert timing (M1 instrument).
 func (w *World) Health() HealthInfo
 
 // Holder owns "the current World" for main; instantiated once in main, no package-level state.
@@ -253,7 +253,7 @@ func NewHolder(p Params, d Deps) *Holder
 func (h *Holder) Acquire() (w *World, snaps <-chan []byte, release func())
 // Ensure returns the current World (building one, paused, if none exists) plus a release func the handler defers; Reset's Stop waits ≤ StopTimeout for released handlers. [SC-F11]
 func (h *Holder) Ensure() (w *World, release func())
-// Current returns the current World or nil; never builds. Used by /healthz and GET /v1/tenants/{id}.
+// Current returns the current World or nil; never builds. Used by /health and GET /v1/tenants/{id}.
 func (h *Holder) Current() *World
 // Reset stops the current World and builds a fresh one (POST /v1/reset); open streams end and the page reconnects.
 func (h *Holder) Reset() *World
@@ -480,7 +480,7 @@ The checker holds `*queue.Store` only as `check.Rows`, the sink as `check.Delive
 
 ```
 metrics tick (500 ms):
-  1. ticks++ (atomic; /healthz reads it)
+  1. ticks++ (atomic; /health reads it)
   2. BEFORE taking reg.mu: grid.States(states[:1000]) (lock-free copy of the Manager's atomic array), backlog totals from the ledger atomics   [SC-F4]
   3. lock reg.mu: swap per-tick atomics (ingest by reason and share class, delivered, kms calls by class) into the 2-min rings
   4. p99: sum the last P99Window (10) tick histograms for healthy and affected; read the 99th-percentile bucket
@@ -553,7 +553,7 @@ Connection strategy: two `*sql.DB` on the same file (`file:<path>?_pragma=journa
 
 Expected writer load at the global-surge peak: ≤ 1,400 inserts + ≤ 200 claims + ≤ 200 acks + 1 reclaim + 0.2 expire + 1 census ≈ 1,800 statements/s. modernc.org/sqlite's pure-Go VFS writes 2–3 WAL pages per autocommit of a ~1.1 KB row plus one index entry, so 150–300 µs per insert on one Cloud Run vCPU is the honest expectation ⇒ the writer is busy ≈ 50–60 % of the time at the peak, ≈ 12 % at baseline; `202` means "committed to the WAL" `[BB-05]`.
 
-**M1 measurement and pre-decided fallbacks, cheapest first** `[BB-02][BB-05]`: run 60 s with `KS_BASE_RATE=1500` at 1:00 and read `/healthz` (`insert_mean_us`, `insert_max_us`, `census_max_us`) plus `BenchmarkInsert` on the laptop; decide at 1:05. (1) insert mean > 300 µs or max > 2 ms → `synchronous=OFF` (no code). (2) still over → confirm `wal_autocheckpoint=4000` is in effect and raise to 10000 (no code). (3) only then group commit, designed now so it is not invented at 1:00: `Insert` enqueues `{idx, id, env, done chan error}` on a channel; one batcher goroutine collects until 64 rows or 5 ms (`clock.After`), then under `store.mu` runs `BEGIN; INSERT ×N; COMMIT`, updates the ledger per row inside the transaction, and closes every `done`; callers block on `done` so `202` keeps its meaning; ≈ 40 lines, no change to the ledger rules or the S4 argument.
+**M1 measurement and pre-decided fallbacks, cheapest first** `[BB-02][BB-05]`: run 60 s with `KS_BASE_RATE=1500` at 1:00 and read `/health` (`insert_mean_us`, `insert_max_us`, `census_max_us`) plus `BenchmarkInsert` on the laptop; decide at 1:05. (1) insert mean > 300 µs or max > 2 ms → `synchronous=OFF` (no code). (2) still over → confirm `wal_autocheckpoint=4000` is in effect and raise to 10000 (no code). (3) only then group commit, designed now so it is not invented at 1:00: `Insert` enqueues `{idx, id, env, done chan error}` on a channel; one batcher goroutine collects until 64 rows or 5 ms (`clock.After`), then under `store.mu` runs `BEGIN; INSERT ×N; COMMIT`, updates the ledger per row inside the transaction, and closes every `done`; callers block on `done` so `202` keeps its meaning; ≈ 40 lines, no change to the ledger rules or the S4 argument.
 
 ## Per-package exported surface
 
@@ -736,7 +736,7 @@ type Message struct { ID int64; DEKID string; Nonce [12]byte; Ciphertext []byte;
 type Batch struct { Tenant string; Idx int; Msgs []Message }
 // Census is one consistent per-tenant ledger plus SQL row counts taken in one critical section (Q1).
 type Census struct { Accepted, Delivered, Expired, Ready, Claimed, Dead []int64; Total, Backlogged int; At time.Time }
-// InsertStats is the M1 load instrument (/healthz).
+// InsertStats is the M1 load instrument (/health).
 type InsertStats struct { N, MeanUs, MaxUs, CensusMaxUs int64 }
 
 // Clock is the store's time source.
@@ -965,7 +965,7 @@ func (r *Registry) TenantCallsPerMin(idx int) float64
 func (r *Registry) Subscribe() (<-chan []byte, func())
 func (r *Registry) CloseAll()
 func (r *Registry) Viewers() int
-// Ticks is the snapshot counter (/healthz, M0 check).
+// Ticks is the snapshot counter (/health, M0 check).
 func (r *Registry) Ticks() int64
 // check.Health methods
 func (r *Registry) HealthyP99() (current, baseline time.Duration, ok bool)
@@ -1013,7 +1013,7 @@ var ErrUnknownTenant = errors.New("world: unknown tenant")
 func (w *World) Ingest(ctx context.Context, tenant string, payload []byte) error
 // Outcome maps an Ingest error to HTTP status, JSON reason and the fixed Retry-After seconds (0 = none) by sentinel; the only mapping in the program.
 func Outcome(err error, ra RetryAfter) (status int, reason string, retryAfter int)
-// HealthInfo is the /healthz body.
+// HealthInfo is the /health body.
 type HealthInfo struct {
 	World        string  `json:"world"`
 	Ticks        int64   `json:"ticks"`
@@ -1048,8 +1048,8 @@ func (w *World) Tenant(id string) (TenantDetail, error)
 | File | ~Lines | M | Contents |
 | --- | --- | --- | --- |
 | `main.go` | 40 | M0 | env (PORT, SEED, KS_BASE_RATE), `world.Demo()`, `world.NewHolder`, mux, `http.Server`, graceful shutdown |
-| `sse.go` | 45 | M0 → M1 | M0: a 2 Hz ticker goroutine incrementing an atomic, a subscriber hub, `/v1/stream` writing `data:{"tick":n}` with flush, `/healthz`; M1: rewired to `metrics.Registry.Subscribe`, `retry:`, `id:`; M5: select on `r.Context()`, write deadline, `StreamMaxAge` |
-| `server.go` | 190 | M1 → M5 | routes (Go 1.22 patterns), handlers, `writeJSON`, body limit 64 KiB; M1: events, tenant detail, healthz via `Holder.Current`; M2: faults, key (~30 `[SF-F15]`); M3: traffic, scenarios; M5: reset |
+| `sse.go` | 45 | M0 → M1 | M0: a 2 Hz ticker goroutine incrementing an atomic, a subscriber hub, `/v1/stream` writing `data:{"tick":n}` with flush, `/health`; M1: rewired to `metrics.Registry.Subscribe`, `retry:`, `id:`; M5: select on `r.Context()`, write deadline, `StreamMaxAge` |
+| `server.go` | 190 | M1 → M5 | routes (Go 1.22 patterns), handlers, `writeJSON`, body limit 64 KiB; M1: events, tenant detail, health via `Holder.Current`; M2: faults, key (~30 `[SF-F15]`); M3: traffic, scenarios; M5: reset |
 | `embed.go` | 8 | M0 | one `http.FileServerFS(web.Files)` line; the `//go:embed` directive lives in `web/embed.go` (`package web`), because go:embed cannot reach `../web` (M0.md) |
 
 ### web (~530 lines, C) and tests
@@ -1105,8 +1105,8 @@ Rates: M0 6 lines/min plus a deploy that runs while writing; M1 ≈ 26/min (Clau
 
 Acceptance signals that exist at each box (so no box waits on a later one's instruments) `[BB-14]`:
 
-- **M0**: `curl -sN $URL/v1/stream` shows `tick` advancing ≈ 2/s for 60 s; after closing and waiting 30 s, `/healthz` `ticks` advanced far less than 60 (Q10).
-- **M1**: `/healthz` after 60 s at `KS_BASE_RATE=1500`: `insert_mean_us ≤ 300`, `insert_max_us ≤ 2000`, `census_max_us ≤ 3000`; the raw-counter stream shows `accepted ≈ delivered` and `by_state == [1000,0,0,0]`.
+- **M0**: `curl -sN $URL/v1/stream` shows `tick` advancing ≈ 2/s for 60 s; after closing and waiting 30 s, `/health` `ticks` advanced far less than 60 (Q10).
+- **M1**: `/health` after 60 s at `KS_BASE_RATE=1500`: `insert_mean_us ≤ 300`, `insert_max_us ≤ 2000`, `census_max_us ≤ 3000`; the raw-counter stream shows `accepted ≈ delivered` and `by_state == [1000,0,0,0]`.
 - **M2** (counters only; no histograms yet): `POST /v1/faults {"provider":"gcp","mode":"fast_fail"}` → within 15 s `tiles.by_state ≈ [667,333,0,0]`, by 30 s `[667,0,333,0]` and `ingest_ps.key_unavailable > 0`, with `kms_ps.transient` decaying through backoff; clear → `[1000,0,0,0]` within ~12 s. `POST /v1/tenants/t-XXXX/key {"action":"revoke"}` → `by_state[3] == 1`, `ingest_ps.key_revoked > 0`, exactly one `REVOKED` timeline line; restore → ACTIVE within 5 s. `POST /v1/faults {"provider":"azure","latency_p50_ms":400,"latency_p99_ms":3000}` → `inflight.azure` pins at 32 while `inflight.aws`/`gcp` stay ≤ 2.
 - **M3**: `POST /v1/traffic {"multiplier":10}` → `tiles.delivered_ps ≈ 640`, `ingest_ps.rate_limited > 0` on ranks 1–2, `backlog_full > 0` on the top ~20, `overloaded > 0` only with `l4.rejected_within_share_ps == 0`, within ≈ 40 s; multiplier 1 → backlog drains.
 - **M4**: each of the five cards reads within 90 s; healthy p99 line flat during slow-KMS and tenant-surge.
@@ -1166,7 +1166,7 @@ Lock order (never reversed): `holder.mu` → nothing (New/Stop take no other loc
 
 5. **Scheduler without SQL scans.** Ring membership is the ledger: `Store.Ready(idx) > 0`, one atomic load. Workers pull: `Next` under `sched.mu` scans up to 1,000 indexes from a cursor; the cursor advances past the returned tenant so each tenant gets one turn per pass. With `TwoClassSched` the ring is interleaved, not prioritised `[SF-F1]`: `SchedLightTurns` (4) consecutive turns go to cursor A (first ready tenant with `Backlog ≤ FairShare()` that `Gate.Hot` accepts), then one turn to cursor B (first other ready, hot tenant), and either cursor falls through to the other when its class has nothing ready (work-conserving). Starvation bound: an over-share tenant with ready rows is served within `(SchedLightTurns + 1) × (over-share tenants ready)` turns ≈ 5 × 110 × 8 rows / 640 per s ≈ 7 s worst case during the global surge, while a light tenant waits at most `SchedLightTurns + 1` turns × the light-class pass. A full miss returns false and the worker waits on `Wake` or `IdlePoll` (20 ms). Claim: `UPDATE messages SET state='claimed', claimed_until=?1 WHERE id IN (SELECT id FROM messages WHERE tenant_id=?2 AND state='ready' ORDER BY id LIMIT ?3) RETURNING …` with batch 8 and `claimed_until = now + 30 s`; `Reclaim` returns timed-out claims to `ready` every 1 s (at-least-once). Worker outcomes: success → `Ack` (one DELETE via json_each); poison or unknown dek_id → `Dead` for that id; lease-gone → `Release` the rest; DEK-cold → `Warm` (tenant `pending[dekID]` until the unwrap succeeds or is denied, so `Hot` is false and the rows are not re-claimed every round; Tick retries on the backoff schedule) then `Release` the rest. This is where the spec's "the scheduler asks the key fetcher and moves on" lands: one claim later than the spec's sentence, bounded to one Claim + Release per cold DEK `[SF-F4]`.
 
-6. **SQLite strategy and write rate.** WAL, `synchronous=NORMAL`, `wal_autocheckpoint=4000`, `busy_timeout=5000`, one pinned writer connection behind `store.mu`, one reader pool (2) for the canary scan and tenant detail. Global-surge peak ≈ 1,400 inserts + ≤ 200 claims + ≤ 200 ack batches + 1 reclaim + 0.2 expire + 1 census ≈ 1,800 statements/s at 150–300 µs each on modernc's pure-Go VFS ⇒ the writer is busy 50–60 % of the time at the peak, plus a 1–3 ms census stall once a second `[BB-05]`. Per-event synchronous insert is therefore acceptable; `202` means "the ciphertext row is committed to the WAL" (on Cloud Run's in-memory filesystem, disk durability is moot). M1 measures it at 1,500/s through `/healthz` and `BenchmarkInsert`; the fallbacks are pre-ordered by cost, `synchronous=OFF`, then a larger autocheckpoint, then the 40-line group commit designed in the SQL section (callers wait on the group; `202` keeps its meaning).
+6. **SQLite strategy and write rate.** WAL, `synchronous=NORMAL`, `wal_autocheckpoint=4000`, `busy_timeout=5000`, one pinned writer connection behind `store.mu`, one reader pool (2) for the canary scan and tenant detail. Global-surge peak ≈ 1,400 inserts + ≤ 200 claims + ≤ 200 ack batches + 1 reclaim + 0.2 expire + 1 census ≈ 1,800 statements/s at 150–300 µs each on modernc's pure-Go VFS ⇒ the writer is busy 50–60 % of the time at the peak, plus a 1–3 ms census stall once a second `[BB-05]`. Per-event synchronous insert is therefore acceptable; `202` means "the ciphertext row is committed to the WAL" (on Cloud Run's in-memory filesystem, disk durability is moot). M1 measures it at 1,500/s through `/health` and `BenchmarkInsert`; the fallbacks are pre-ordered by cost, `synchronous=OFF`, then a larger autocheckpoint, then the 40-line group commit designed in the SQL section (callers wait on the group; `202` keeps its meaning).
 
 7. **Fair-share shedding in O(1).** `fairShare = GlobalBacklogCap / max(1, Backlogged)` (Backlogged = ledger count of tenants with backlog > 0); per ingest `Total ≥ GlobalCap && Backlog[idx] > fairShare → 503 overloaded`; overshoot ≤ Backlogged × fairShare ≤ GlobalCap, so total ≤ 2 × GlobalCap worst case. Demo numbers: Zipf(1) over 1,000 tenants, H₁₀₀₀ ≈ 7.49, rate_k ≈ 40/k events/s; at 5× rank 1 offers 200/s and rank 2 100/s → the 100/s bucket gives rank 1 ~100/s of `429 rate_limited` after the 200 burst (≈ 2 s). With the interleaved scheduler the light class (ranks > ~110, Σ ≈ 440/s) takes ≈ 70 % of turns, leaving ≈ 200/s ≈ 1.8/s each for the ~110 heavy tenants, whose backlog grows at (200/k − 1.8)/s: rank 1 hits the 500 cap at ~5 s, rank 5 at ~13 s, rank 10 at ~28 s, rank 20 at ~60 s ⇒ about the top 20 draw `429 backlog_full` inside the surge. Total backlog ≈ 10,000 (capped) + Σ₂₁..₁₁₀ t·(200/k − 1.8) ≈ 19,500–20,100 at t = 60 s: with the spec's 60 s the 20,000 global cap is touched only in the last seconds and `503 overloaded` has no visible story `[BB-06]`. Recommended `GlobalSurgeFor = 90 s`: the cap is hit at ≈ 75 s, `fairShare ≈ 20,000/110 ≈ 182`, tenants with backlog > 182 (ranks ≲ 42) see `503 overloaded` for ~15 s while the other ~890 never see a rejection; alternative `GlobalBacklogCap = 12,000` (binding table value, needs Ben's sign-off) hits at ≈ 35 s. Drain after the surge: 20,000 / (640 − 300) ≈ 59 s, which is why the tail is per scenario (Q19). With `FairShare = false` (M3 cut) the cap rejects everyone.
 
@@ -1174,7 +1174,7 @@ Lock order (never reversed): `holder.mu` → nothing (New/Stop take no other loc
 
 9. **p99 and the snapshot.** Fixed 28-bucket log-spaced histogram (1 ms … 60 s, ratio 1.5) per class per tick, recorded with one atomic increment; p99 reads the bucket at the 99th percentile of the sum of the last `P99Window = 10` tick histograms (5 s, 1,500–7,500 samples), O(28) per tick, no sample buffers. The snapshot (above) holds tiles, per-second ingest by reason, the L4 within/over-share rejection split `[SF-F3]`, p99 healthy/affected/baseline, KMS calls by class against events/s, backlog total/affected, per-provider in-flight, six verdicts, the running scenario with `ends_at`, `recovery_s` and `drain_s` `[SF-F7]`, the last 20 timeline entries with seqs (the page dedupes), and the grid as a 1,000-character string with `char = '0' + state + (affected ? 4 : 0)`: one `charCodeAt` per cell, no base64, no separate target list; the colour table is in Shared types.
 
-10. **World lifecycle on Cloud Run.** `main` owns one `world.Holder` (a local passed to the handlers). In M0/M1 the holder is `Ensure`/`Current` only; M5 adds `Acquire` (called by `/v1/stream`), which builds the first World or replaces one with `Viewers()==0 && IdleFor > 10 s` and subscribes under the same mutex so two simultaneous reconnects cannot double-build; `Ensure` builds if none exists but never applies the idle rule (curl `POST /v1/events` works against a paused-traffic World); `Current` never builds (`/healthz`, `GET /v1/tenants/{id}`); `Reset` replaces unconditionally. Handlers hold a refcount (`release`) so `Reset`'s `Stop` waits ≤ `StopTimeout` for them instead of closing the DB under an in-flight ingest; `Stop` closes the subscriber channels first so SSE loops exit, and logs rather than hangs if a goroutine is late, so a stuck goroutine never turns every later `/v1/stream` into a hang `[SC-F11]`. Viewer count is the hub's subscriber count; 1→0 pauses the generator and stamps `idleSince`, 0→1 resumes it. Nothing runs on a timer to detect idleness because without an in-flight request there is no CPU. M0 check on the live URL `[BB-01]`: `sse.go`'s ticker increments `ticks` at 2 Hz; `curl -sN $URL/v1/stream` for 60 s must show `tick` advancing ≈ 2/s with gaps < 1.5 s (proves CPU while a stream is open, and that the proxy does not batch); then close the stream, wait 30 s, `curl $URL/healthz` → `{"ticks":n,"uptime_s":s,"world":"w-1"}` must show `ticks` advanced far less than 60 (confirms throttling when idle, the billing model). If the first part fails, switch to min 1 instance with instance-based billing (D9 fallback).
+10. **World lifecycle on Cloud Run.** `main` owns one `world.Holder` (a local passed to the handlers). In M0/M1 the holder is `Ensure`/`Current` only; M5 adds `Acquire` (called by `/v1/stream`), which builds the first World or replaces one with `Viewers()==0 && IdleFor > 10 s` and subscribes under the same mutex so two simultaneous reconnects cannot double-build; `Ensure` builds if none exists but never applies the idle rule (curl `POST /v1/events` works against a paused-traffic World); `Current` never builds (`/health`, `GET /v1/tenants/{id}`); `Reset` replaces unconditionally. Handlers hold a refcount (`release`) so `Reset`'s `Stop` waits ≤ `StopTimeout` for them instead of closing the DB under an in-flight ingest; `Stop` closes the subscriber channels first so SSE loops exit, and logs rather than hangs if a goroutine is late, so a stuck goroutine never turns every later `/v1/stream` into a hang `[SC-F11]`. Viewer count is the hub's subscriber count; 1→0 pauses the generator and stamps `idleSince`, 0→1 resumes it. Nothing runs on a timer to detect idleness because without an in-flight request there is no CPU. M0 check on the live URL `[BB-01]`: `sse.go`'s ticker increments `ticks` at 2 Hz; `curl -sN $URL/v1/stream` for 60 s must show `tick` advancing ≈ 2/s with gaps < 1.5 s (proves CPU while a stream is open, and that the proxy does not batch); then close the stream, wait 30 s, `curl $URL/health` → `{"ticks":n,"uptime_s":s,"world":"w-1"}` must show `ticks` advanced far less than 60 (confirms throttling when idle, the billing model). If the first part fails, switch to min 1 instance with instance-based billing (D9 fallback).
 
 11. **Audit ring.** `cmek` emits `Audit` values through `Auditor.Audit` and stores nothing; world's bridge converts them to `metrics.Audit`, and `metrics.Registry` keeps a per-tenant ring of 16 (`[1000][16]`, ≈ 1.5 MB) plus the 200-entry timeline. `GET /v1/tenants/{id}` = `world.Tenant(id)` = `keys.Info` + `store.Backlog/Ready` + rank + `gen.Offered(idx)` as `OfferedPS` + `metrics.TenantCallsPerMin(idx)` as `KMSCallsPerMin` (unwrap/generate entries newer than 60 s in the ring; exact for a healthy tenant, a lower bound during a probe storm) `[SF-F6]` + affected + `metrics.TenantAudit(idx, 10)`. The grid's click-to-pin fetches that endpoint once and every 2 s while pinned; hover shows tenant, provider and state from the snapshot at once and fills lease remaining, backlog and the call rate from a debounced (150 ms) fetch of the same endpoint (M4 cut line drops hover and pin; they are built last).
 
@@ -1222,7 +1222,7 @@ Each bullet: recommended option, then the alternative. Deduplicated; settled dec
 - **Revocation restore.** Recommended: manual Restore per the card ("Click Restore"); Stop also restores; the S3 window closes at the ground-truth restore so the drain is never counted. Alternative: auto-restore after 45 s.
 - **Revocation timeline lines.** Recommended: two lines per episode, `t-0042 REVOKED, 3 DEKs purged` from the service's audit and `t-0042 revoked at 12:00:59 (ground truth), detected in 8.2 s` from the checker. Alternative: checker-only single line in the spec's exact format (absent until M5).
 - **Holder location and phasing.** Recommended: `internal/world` (idle rule testable without HTTP); M0/M1 ship `Ensure`/`Current` only, M5 adds the idle rule, `Reset` and the handler refcount. Alternative: `cmd/killswitch`, full Holder in M0.
-- **Insert strategy and fallbacks.** Recommended: per-event synchronous insert with `synchronous=NORMAL`, measured in M1 at 1,500/s through `/healthz`; fallbacks in cost order `OFF` → larger autocheckpoint → the 40-line group commit already designed. Alternative: 5 ms group commit from day one.
+- **Insert strategy and fallbacks.** Recommended: per-event synchronous insert with `synchronous=NORMAL`, measured in M1 at 1,500/s through `/health`; fallbacks in cost order `OFF` → larger autocheckpoint → the 40-line group commit already designed. Alternative: 5 ms group commit from day one.
 - **M2 split.** Recommended: Ben writes `types.go`, `lease.go`, `classify.go`, `envelope.go` and their table tests while Claude drafts `fetcher.go`/`manager.go` from this doc; Ben line-reviews those ~300 lines in the last 15 minutes of M2. Alternative: Ben writes all of cmek himself and M2 takes the `TenantInflight = 0` cut plus `Info` deferred.
 - **Hover and pinned detail.** Recommended: build them last in M4 (after 3:05, only if tuning is done), which makes the spec's cut automatic without deciding it now. Alternative: take the cut up front and reclaim ~15 minutes for scenario tuning.
 - **M3 slack.** Recommended: if M3's acceptance passes by 2:12, spend the remainder on M5's data side (`Expire`, `Census`, `CanaryFull`, the sink ring, the check loop with S1/S4, ≈ 130 lines; no UI dependency) rather than starting M4 early; record it in TIMELOG. Alternative: start M4 early and let M5 carry its nominal 450 lines.
@@ -1271,8 +1271,8 @@ Ids are prefixed by lens because the review reused `F1…` in two lenses: `SC-` 
 | SF-F15 | accepted | ~30 cmd lines for the fault and key handlers budgeted in M2. |
 | SF-F16 | accepted | Four-row colour table next to the grid-char row, same order as `cmek.State`. |
 | SF-F17 | accepted | Q17 states the real bound (32 inside + ≤ `IngestWaiters + 1` queued per tenant for ≤ `KMSTimeout`); fail-fast kept as the alternative. |
-| BB-01 | accepted | M0 = main.go, sse.go (ticker + hub + stream + healthz), world stub, placeholder page, Dockerfile, go.mod with blank imports, TIMELOG; ordered timeline in the fallback table; Holder idle rule/Reset to M5. |
-| BB-02 | accepted | M1 re-budgeted to ≈ 1,180 with `Expire`/`Census`/`CanaryFull` deferred and `Fail`/`MaxAttempts` deleted; `KS_BASE_RATE` plus insert-timing atomics surfaced in `/healthz`; slip to 1:15 pre-agreed. |
+| BB-01 | accepted | M0 = main.go, sse.go (ticker + hub + stream + health), world stub, placeholder page, Dockerfile, go.mod with blank imports, TIMELOG; ordered timeline in the fallback table; Holder idle rule/Reset to M5. |
+| BB-02 | accepted | M1 re-budgeted to ≈ 1,180 with `Expire`/`Census`/`CanaryFull` deferred and `Fail`/`MaxAttempts` deleted; `KS_BASE_RATE` plus insert-timing atomics surfaced in `/health`; slip to 1:15 pre-agreed. |
 | BB-03 | accepted | `keys_m1.go` and the `keySource` interface deleted; a 40-line `cmek.Manager` skeleton ships in M1 and is grown in place. |
 | BB-04 | accepted (partial) | `WaitIdle`, `TestImports`, `RetryAfterer` deleted; M2 split between Ben and Claude; tests trimmed to one scripted walk (≈ 180 lines). The `deniedAt` stale-OK guard is kept: with `TenantInflight = 2` a probe and a warm can be in flight together and a late OK would un-park a revoked tenant; it is 2 lines and now a Decision. |
 | BB-05 | accepted | Per-statement cost restated at 150–300 µs, writer 50–60 % and process ≈ 60 % at the peak; fallbacks ordered by cost with the group-commit design written now; `wal_autocheckpoint=4000` pre-applied; `BenchmarkInsert` added. |
