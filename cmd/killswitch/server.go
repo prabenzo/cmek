@@ -27,6 +27,66 @@ func (s *server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/tenants/{id}", s.tenant)
 	mux.HandleFunc("POST /v1/faults", s.faults)
 	mux.HandleFunc("POST /v1/tenants/{id}/key", s.key)
+	mux.HandleFunc("POST /v1/traffic", s.traffic)
+	mux.HandleFunc("POST /v1/scenarios/{name}/start", s.scenarioStart)
+	mux.HandleFunc("POST /v1/scenarios/{name}/stop", s.scenarioStop)
+}
+
+// traffic is POST /v1/traffic {"tenant":"t-0042"|"","multiplier":5}: one tenant's or everyone's offered rate
+// (200 echoes the body; 400 on bad JSON or multiplier ≤ 0; 404 unknown_tenant).
+func (s *server) traffic(rw http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Tenant     string  `json:"tenant"`
+		Multiplier float64 `json:"multiplier"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(rw, r.Body, maxBody)).Decode(&req); err != nil || req.Multiplier <= 0 {
+		writeJSON(rw, http.StatusBadRequest, errorBody{Error: "bad_request", Tenant: req.Tenant})
+		return
+	}
+	w, release := s.holder.Ensure()
+	defer release()
+	if w == nil {
+		writeJSON(rw, http.StatusServiceUnavailable, errorBody{Error: "no_world"})
+		return
+	}
+	if err := w.Surge(req.Tenant, req.Multiplier); err != nil {
+		s.controlOutcome(rw, err, req.Tenant)
+		return
+	}
+	writeJSON(rw, http.StatusOK, req)
+}
+
+// scenarioStart is POST /v1/scenarios/{name}/start: 200 {"scenario":name}; 409 busy; 404 unknown_scenario.
+func (s *server) scenarioStart(rw http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	w, release := s.holder.Ensure()
+	defer release()
+	if w == nil {
+		writeJSON(rw, http.StatusServiceUnavailable, errorBody{Error: "no_world"})
+		return
+	}
+	switch err := w.StartScenario(name); {
+	case err == nil:
+		writeJSON(rw, http.StatusOK, map[string]string{"scenario": name})
+	case errors.Is(err, world.ErrBusy):
+		writeJSON(rw, http.StatusConflict, errorBody{Error: "busy"})
+	case errors.Is(err, world.ErrUnknownScenario):
+		writeJSON(rw, http.StatusNotFound, errorBody{Error: "unknown_scenario"})
+	default:
+		writeJSON(rw, http.StatusBadRequest, errorBody{Error: "bad_request"})
+	}
+}
+
+// scenarioStop is POST /v1/scenarios/{name}/stop: cancels whatever runs and returns 200 with the name of the
+// scenario that was actually stopped ("" while idle), whatever the path said.
+func (s *server) scenarioStop(rw http.ResponseWriter, r *http.Request) {
+	w, release := s.holder.Ensure()
+	defer release()
+	if w == nil {
+		writeJSON(rw, http.StatusServiceUnavailable, errorBody{Error: "no_world"})
+		return
+	}
+	writeJSON(rw, http.StatusOK, map[string]string{"scenario": w.StopScenario()})
 }
 
 // faults is POST /v1/faults: install or clear a fault on a provider or a tenant (204; 400 bad_request; 404 unknown_tenant).

@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/prabenzo/cmek/internal/admit"
 	"github.com/prabenzo/cmek/internal/cmek"
 	"github.com/prabenzo/cmek/internal/kms"
 	"github.com/prabenzo/cmek/internal/logx"
@@ -61,8 +62,10 @@ type World struct {
 
 	kms     *kms.Fake
 	keys    *cmek.Manager
+	admit   *admit.Gate
 	store   *queue.Store
 	sched   *queue.Scheduler
+	scen    *scenarios
 	workers *queue.Workers
 	gen     *traffic.Generator
 	sink    *traffic.Sink
@@ -140,13 +143,22 @@ func New(p Params, d Deps) (*World, error) {
 	w.gen = traffic.NewGenerator(traffic.GeneratorConfig{Tenants: w.ids, Rates: rates, PayloadBytes: p.PayloadBytes, CanaryPrefix: p.CanaryPrefix, Ingest: w, Clock: d.Clock, Rand: w.rnd, Lock: &w.rndMu})
 	capacity := float64(p.Workers) / ((p.SinkLatencyMin + p.SinkLatencyMax) / 2).Seconds()
 	w.metrics = metrics.New(metrics.Config{Tenants: w.ids, Providers: p.Providers, Grid: &gridAdapter{w: w, buf: make([]cmek.State, n)}, Backlog: store, Offered: w.gen, Watcher: watcher{w}, Clock: d.Clock, Interval: p.SnapshotInterval, AuditRing: p.AuditRing, TimelineRing: p.TimelineRing, SnapshotEvents: p.SnapshotEvents, ViewerQueue: p.ViewerQueue, Capacity: capacity, WorldID: d.ID})
-	w.sched = queue.NewScheduler(queue.SchedulerConfig{Store: store, Gate: w.keys, Tenants: w.ids})
+	w.admit = admit.New(admit.Config{Tenants: n, Rate: p.TenantRate, Burst: p.TenantBurst, TenantCap: p.TenantBacklogCap, GlobalCap: p.GlobalBacklogCap, FairShare: p.FairShare, Backlog: store, Clock: d.Clock})
+	w.sched = queue.NewScheduler(queue.SchedulerConfig{Store: store, Gate: w.keys, Share: w.admit, Tenants: w.ids, TwoClass: p.TwoClassSched, LightTurns: p.SchedLightTurns})
+	w.scen = newScenarios(w)
 	w.workers = queue.NewWorkers(queue.WorkersConfig{Store: store, Sched: w.sched, Keys: w.keys, Sink: w.sink, Recorder: w.metrics, Clock: d.Clock, Tenants: w.ids, Workers: p.Workers, ClaimBatch: p.ClaimBatch, ClaimTimeout: p.ClaimTimeout, IdlePoll: p.IdlePoll, Logger: w.log})
 	attrs := []any{"tenants", n}
 	for r := 0; r < n && r < 5; r++ { // the top ranks (the scenarios' revoke target is rank 3)
 		attrs = append(attrs, fmt.Sprintf("rank%d", r+1), w.ids[w.byRank[r]])
 	}
 	w.log.Info("world built", append(attrs, "capacity_ps", capacity)...)
+	ranks := []any{}
+	for _, r := range []int{1, 2, 3, 5, 20, 30, 120, 150, 200, 500, 900} { // the rank → id map the acceptance curls read
+		if r <= n {
+			ranks = append(ranks, fmt.Sprintf("rank%d", r), w.ids[w.byRank[r-1]])
+		}
+	}
+	w.log.Info("ranks", ranks...)
 	return w, nil
 }
 
@@ -188,6 +200,7 @@ func (w *World) sweep(ctx context.Context) {
 
 // Stop cancels the context, closes every subscriber channel, waits ≤ StopTimeout for goroutines, then closes and deletes the DB file; a late goroutine is logged, not waited for.
 func (w *World) Stop() {
+	w.scen.stop() // no scenario may start (and wg.Add) once the wait below can begin
 	w.cancel()
 	w.metrics.CloseAll()
 	done := make(chan struct{})
@@ -361,6 +374,22 @@ func (w *World) Fault(f FaultRequest) error {
 	fault.P50, fault.P99, fault.ErrorRate = time.Duration(f.LatencyP50Ms)*time.Millisecond, time.Duration(f.LatencyP99Ms)*time.Millisecond, f.ErrorRate
 	w.kms.SetFault(scope, fault)
 	w.log.Info("fault", "provider", f.Provider, "tenant", f.Tenant, "mode", f.Mode, "p50_ms", f.LatencyP50Ms, "p99_ms", f.LatencyP99Ms, "error_rate", f.ErrorRate)
+	return nil
+}
+
+// Surge multiplies one tenant's offered rate, or everyone's when tenant is ""; the handler rejects mult ≤ 0.
+func (w *World) Surge(tenant string, mult float64) error {
+	if tenant == "" {
+		w.gen.SetGlobal(mult)
+		w.log.Info("surge", "tenant", "", "multiplier", mult)
+		return nil
+	}
+	idx, ok := w.index[tenant]
+	if !ok {
+		return ErrUnknownTenant
+	}
+	w.gen.SetMultiplier(idx, mult)
+	w.log.Info("surge", "tenant", tenant, "multiplier", mult)
 	return nil
 }
 

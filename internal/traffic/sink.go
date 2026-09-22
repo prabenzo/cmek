@@ -47,7 +47,9 @@ func (s *Sink) latency() time.Duration {
 // Deliver accepts one plaintext delivery; the canary must name the delivering tenant (S2).
 func (s *Sink) Deliver(ctx context.Context, tenant string, idx int, msgID int64, plaintext []byte) (time.Time, error) {
 	at := s.cfg.Clock.Now()
-	if !bytes.Contains(plaintext, []byte(`"`+s.cfg.CanaryPrefix+tenant+`"`)) {
+	// S2 is evidence of cross-tenant delivery, not of payload shape: a payload that carries a canary must carry this
+	// tenant's; a payload without one (a manual curl) is delivered like any other.
+	if i := bytes.Index(plaintext, []byte(`"`+s.cfg.CanaryPrefix)); i >= 0 && !bytes.HasPrefix(plaintext[i:], []byte(`"`+s.cfg.CanaryPrefix+tenant+`"`)) {
 		s.mismatches.Add(1)
 		return at, ErrTenantMismatch
 	}

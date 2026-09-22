@@ -96,3 +96,36 @@ func BenchmarkInsert(b *testing.B) {
 		}
 	}
 }
+
+// TestExpire: retention deletes the oldest ready rows up to the limit and moves the ledger by exactly that count.
+func TestExpire(t *testing.T) {
+	ctx := context.Background()
+	s, clk := openTest(t, t.TempDir())
+	t0 := clk.now
+	for i := 0; i < 3; i++ {
+		if err := s.Insert(ctx, 0, s.NextID(), env(byte(i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	clk.now = t0.Add(time.Minute)
+	if err := s.Insert(ctx, 1, s.NextID(), env(9)); err != nil { // young row for tenant 1: never expires here
+		t.Fatal(err)
+	}
+	n, err := s.Expire(ctx, t0.Add(time.Second), 2)
+	if err != nil || n != 2 {
+		t.Fatalf("expire limit 2: n=%d err=%v", n, err)
+	}
+	if s.expired[0].Load() != 2 || s.Ready(0) != 1 || s.Total() != 2 || s.Backlogged() != 2 {
+		t.Fatalf("after first expire: expired=%d ready=%d total=%d backlogged=%d", s.expired[0].Load(), s.Ready(0), s.Total(), s.Backlogged())
+	}
+	n, err = s.Expire(ctx, t0.Add(time.Second), 10)
+	if err != nil || n != 1 {
+		t.Fatalf("expire the rest: n=%d err=%v", n, err)
+	}
+	if s.expired[0].Load() != 3 || s.Backlog(0) != 0 || s.Total() != 1 || s.Backlogged() != 1 || s.Ready(1) != 1 {
+		t.Fatalf("after second expire: expired=%d backlog0=%d total=%d backlogged=%d ready1=%d", s.expired[0].Load(), s.Backlog(0), s.Total(), s.Backlogged(), s.Ready(1))
+	}
+	if n, _ := s.Expire(ctx, t0.Add(time.Second), 10); n != 0 {
+		t.Fatalf("nothing left to expire, got %d", n)
+	}
+}

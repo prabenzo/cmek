@@ -62,7 +62,7 @@ type Store struct {
 	w     *sql.Conn
 	mu    sync.Mutex
 
-	insert, putDEK, claim, ack, release, dead, reclaim, reclaimCount *sql.Stmt
+	insert, putDEK, claim, ack, release, dead, reclaim, reclaimCount, expire, expireCount *sql.Stmt
 
 	nextID                                              atomic.Int64
 	accepted, delivered, expired, ready, claimed, deadN []atomic.Int64
@@ -173,6 +173,8 @@ func Open(cfg Config) (*Store, error) {
 		{&s.dead, `UPDATE messages SET state='dead', claimed_until=NULL, attempts=attempts+1 WHERE id=?1 AND state='claimed'`},
 		{&s.reclaim, `UPDATE messages SET state='ready', claimed_until=NULL WHERE state='claimed' AND claimed_until < ?1`},
 		{&s.reclaimCount, `SELECT tenant_id, COUNT(*) FROM messages WHERE state='claimed' AND claimed_until < ?1 GROUP BY tenant_id`},
+		{&s.expire, `DELETE FROM messages WHERE id IN (SELECT id FROM messages WHERE state='ready' AND enqueued_at < ?1 ORDER BY id LIMIT ?2)`},
+		{&s.expireCount, `SELECT tenant_id, COUNT(*) FROM (SELECT tenant_id FROM messages WHERE state='ready' AND enqueued_at < ?1 ORDER BY id LIMIT ?2) GROUP BY tenant_id`},
 	} {
 		if err := prep(x.dst, x.q); err != nil {
 			return fail(err)
@@ -191,7 +193,7 @@ func Open(cfg Config) (*Store, error) {
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, st := range []*sql.Stmt{s.insert, s.putDEK, s.claim, s.ack, s.release, s.dead, s.reclaim, s.reclaimCount} {
+	for _, st := range []*sql.Stmt{s.insert, s.putDEK, s.claim, s.ack, s.release, s.dead, s.reclaim, s.reclaimCount, s.expire, s.expireCount} {
 		if st != nil {
 			st.Close()
 		}
@@ -416,6 +418,57 @@ func (s *Store) Reclaim(ctx context.Context, now time.Time) (int, error) {
 		s.ready[i].Add(c)
 	}
 	s.signal()
+	return int(total), nil
+}
+
+// Expire deletes ready rows enqueued before `before`, at most limit per call (retention). Compiled in M3, wired by
+// M5's sweep. Like Reclaim it counts per tenant first and deletes second, both under store.mu on the writer, so the
+// ledger delta (expired up, ready and total down) is exact and a failed read or write changes nothing.
+func (s *Store) Expire(ctx context.Context, before time.Time, limit int) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.expireCount.QueryContext(s.bg(), ms(before), limit)
+	if err != nil {
+		return 0, err
+	}
+	counts := make(map[int]int64)
+	var total int64
+	for rows.Next() {
+		var tenant string
+		var c int64
+		if err := rows.Scan(&tenant, &c); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		if i, ok := s.index[tenant]; ok {
+			counts[i] += c
+			total += c
+		}
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return 0, err
+	}
+	if total == 0 {
+		return 0, nil
+	}
+	res, err := s.expire.ExecContext(s.bg(), ms(before), limit)
+	if err != nil {
+		return 0, err
+	}
+	ra, _ := res.RowsAffected()
+	if ra != total {
+		return 0, fmt.Errorf("expire: counted %d rows, deleted %d", total, ra) // cannot happen under store.mu
+	}
+	for i, c := range counts {
+		s.expired[i].Add(c)
+		s.ready[i].Add(-c)
+		s.total.Add(-c)
+		if s.backlogOf(i) == 0 {
+			s.backlogged.Add(-1)
+		}
+	}
 	return int(total), nil
 }
 

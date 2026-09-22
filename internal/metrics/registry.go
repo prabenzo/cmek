@@ -91,9 +91,12 @@ type Registry struct {
 	hub   *hub
 	ticks atomic.Int64
 
-	ingest    [reasonCount]atomic.Int64 // per tick
-	delivered atomic.Int64              // per tick
-	kms       [3]atomic.Int64           // per tick: ok, transient, deny
+	ingest     [reasonCount]atomic.Int64 // per tick
+	delivered  atomic.Int64              // per tick
+	kms        [3]atomic.Int64           // per tick: ok, transient, deny
+	rejWithin  atomic.Int64              // per tick: admission rejections of within-share tenants (the L4 split)
+	rejOver    atomic.Int64              // per tick: admission rejections of over-share tenants
+	overWithin atomic.Int64              // cumulative: overloaded rejections of within-share tenants (L4 judges it)
 
 	mu        sync.Mutex
 	audits    [][]Audit // per tenant ring
@@ -105,6 +108,13 @@ type Registry struct {
 	tlHead    int
 	tlN       int
 	tlSeq     int64
+	scen      scenarioState // the running scenario's card state
+}
+
+// scenarioState is what the card countdown reads; name "" means idle.
+type scenarioState struct {
+	name, phase   string
+	endsAt, since time.Time
 }
 
 // event is one timeline line as the snapshot carries it.
@@ -174,9 +184,46 @@ func stateName(s uint8) string {
 	return "?"
 }
 
-// Ingest counts one outcome by reason and by share class (L4 split, M3).
+// Ingest counts one outcome by reason and, for the three admission reasons only, by share class: the L4 split.
+// KMS-fault reasons are not fair-share shedding and stay out of the split.
 func (r *Registry) Ingest(idx int, reason string, withinShare bool) {
-	r.ingest[reasonIndex(reason)].Add(1)
+	i := reasonIndex(reason)
+	r.ingest[i].Add(1)
+	switch i {
+	case reasonRateLimited, reasonBacklogFull, reasonOverloaded:
+		if withinShare {
+			r.rejWithin.Add(1)
+			if i == reasonOverloaded {
+				r.overWithin.Add(1)
+			}
+		} else {
+			r.rejOver.Add(1)
+		}
+	}
+}
+
+// OverloadedWithinShare is the cumulative count of overloaded rejections dealt to within-share tenants (L4: must stay 0).
+func (r *Registry) OverloadedWithinShare() int64 { return r.overWithin.Load() }
+
+// SetScenario publishes the card countdown; an empty name clears it; a zero endsAt means an open-ended phase.
+func (r *Registry) SetScenario(name, phase string, endsAt time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if name == "" {
+		r.scen = scenarioState{}
+		return
+	}
+	if r.scen.name != name {
+		r.scen.since = r.cfg.Clock.Now()
+	}
+	r.scen.name, r.scen.phase, r.scen.endsAt = name, phase, endsAt
+}
+
+// Scenario reports the running scenario, if any, and when it started.
+func (r *Registry) Scenario() (name string, running bool, since time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.scen.name, r.scen.name != "", r.scen.since
 }
 
 // Delivered records one delivery (histograms arrive in M4).
@@ -254,10 +301,21 @@ type snapshot struct {
 		Deny      float64 `json:"deny"`
 		EventsPS  float64 `json:"events_ps"`
 	} `json:"kms_ps"`
+	L4 struct {
+		RejectedWithinSharePS float64 `json:"rejected_within_share_ps"`
+		RejectedOverSharePS   float64 `json:"rejected_over_share_ps"`
+	} `json:"l4"`
 	Backlog struct {
 		Total    int `json:"total"`
 		Affected int `json:"affected"`
 	} `json:"backlog"`
+	Scenario struct {
+		Name      string   `json:"name"`
+		Phase     string   `json:"phase"`
+		EndsAt    *int64   `json:"ends_at"`
+		RecoveryS *float64 `json:"recovery_s"`
+		DrainS    *float64 `json:"drain_s"`
+	} `json:"scenario"`
 	Grid   string  `json:"grid"`
 	Events []event `json:"events"`
 }
@@ -303,6 +361,13 @@ func (r *Registry) tick() {
 	s.IngestPS.Internal = float64(ing[reasonInternal]) * perSec
 	s.KMSPS.OK, s.KMSPS.Transient, s.KMSPS.Deny = float64(k[0])*perSec, float64(k[1])*perSec, float64(k[2])*perSec
 	s.KMSPS.EventsPS = s.IngestPS.Accepted
+	s.L4.RejectedWithinSharePS = float64(r.rejWithin.Swap(0)) * perSec
+	s.L4.RejectedOverSharePS = float64(r.rejOver.Swap(0)) * perSec
+	s.Scenario.Name, s.Scenario.Phase = r.scen.name, r.scen.phase
+	if r.scen.name != "" && !r.scen.endsAt.IsZero() {
+		ends := r.scen.endsAt.UnixMilli()
+		s.Scenario.EndsAt = &ends
+	}
 	s.Backlog.Total = total
 	s.Grid = string(r.grid)
 	s.Events = r.events(r.cfg.SnapshotEvents)
