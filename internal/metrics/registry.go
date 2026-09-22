@@ -347,8 +347,9 @@ func (r *Registry) Delivered(idx int, latency time.Duration) {
 
 // Audit stores the entry in the tenant ring, counts KMS calls by class, and turns a state change into a timeline
 // line: a REVOKED transition posts at once with its purge count (never aggregated); ACTIVE↔RIDING_THROUGH churn is
-// counted per provider and flushed once per second as one line; every other transition waits for the tick, where
-// AggregateMin or more of the same (provider, from, to) collapse to one line and the rest keep the M2 form.
+// counted per provider and flushed once per second as one line; every other transition waits for the next
+// per-second flush, where AggregateMin or more of the same (provider, from, to) collapse to one line and the rest
+// keep the M2 form (a single waits ≤ 1 s).
 func (r *Registry) Audit(e Audit) {
 	if e.Op == "unwrap" || e.Op == "generate" {
 		if e.Class < 3 {
@@ -421,8 +422,13 @@ func (r *Registry) TenantCallsPerMin(idx int) float64 {
 	return float64(n)
 }
 
-// flushTransitions turns the tick's buffered transitions into timeline lines (step 6); caller holds r.mu.
+// flushTransitions turns the buffered transitions into timeline lines (step 6) once per second, so an outage
+// posts at most one line per (provider, from, to) per second plus its singles; caller holds r.mu.
 func (r *Registry) flushTransitions(now time.Time) {
+	if now.Sub(r.rtFlushed) < time.Second {
+		return
+	}
+	r.rtFlushed = now
 	if len(r.pendTrans) > 0 {
 		type key struct{ prov, from, to uint8 }
 		counts := map[key]int{}
@@ -442,10 +448,6 @@ func (r *Registry) flushTransitions(now time.Time) {
 		}
 		r.pendTrans = r.pendTrans[:0]
 	}
-	if now.Sub(r.rtFlushed) < time.Second {
-		return
-	}
-	r.rtFlushed = now
 	for p := range r.rt {
 		c := r.rt[p]
 		if c.up == 0 && c.down == 0 {

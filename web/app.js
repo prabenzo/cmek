@@ -58,9 +58,9 @@ function paintGrid(str) {
     ctx.fillStyle = code < 0 ? '#2a2f3a' : COLORS[code & 3];
     ctx.fillRect(x + 1, y + 1, CELL - 2, CELL - 2);
     if (code >= 0 && (code & 4)) { // scenario target
-      ctx.strokeStyle = '#fff';
+      ctx.strokeStyle = 'rgba(255,255,255,.85)';
       ctx.lineWidth = 2;
-      ctx.strokeRect(x + 3, y + 3, CELL - 6, CELL - 6);
+      ctx.strokeRect(x + 4, y + 4, CELL - 8, CELL - 8);
     }
   }
 }
@@ -72,7 +72,7 @@ function drawBands() {
     const start = Math.ceil(k * N / PROVIDERS.length);
     const d = document.createElement('div');
     d.textContent = p;
-    d.style.top = (Math.floor(start / COLS) * CELL + 2) + 'px';
+    d.style.top = (Math.ceil(start / COLS) * CELL + 2) + 'px'; // the band's first full row
     el.appendChild(d);
   });
 }
@@ -171,8 +171,8 @@ function toast(text) {
 
 // ---- charts ---------------------------------------------------------------------------------------------------------
 
-function ring() { return new Array(RING).fill(null); }
-function push(arr, v) { arr.push(v); arr.shift(); }
+function ring() { return []; } // grows to RING, then slides (uPlot needs a numeric, ascending x array: no null padding)
+function push(arr, v) { arr.push(v); if (arr.length > RING) arr.shift(); }
 
 const SERIES = {
   ingest: [['accepted', '#2ecc71'], ['rate_limited', '#f1c40f'], ['backlog_full', '#e67e22'], ['overloaded', '#e74c3c'], ['key_unavailable', '#3498db'], ['key_revoked', '#9b59b6']],
