@@ -4,6 +4,7 @@ package metrics
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -100,6 +101,17 @@ type Registry struct {
 	auditN    []int
 	states    []uint8
 	grid      []byte
+	timeline  []event // ring of TimelineRing entries
+	tlHead    int
+	tlN       int
+	tlSeq     int64
+}
+
+// event is one timeline line as the snapshot carries it.
+type event struct {
+	Seq  int64  `json:"seq"`
+	At   int64  `json:"at"`
+	Text string `json:"text"`
 }
 
 // New builds the registry.
@@ -107,9 +119,59 @@ func New(cfg Config) *Registry {
 	if cfg.AuditRing <= 0 {
 		cfg.AuditRing = 16
 	}
+	if cfg.TimelineRing <= 0 {
+		cfg.TimelineRing = 200
+	}
+	if cfg.SnapshotEvents <= 0 {
+		cfg.SnapshotEvents = 20
+	}
 	n := len(cfg.Tenants)
-	r := &Registry{cfg: cfg, hub: newHub(cfg.ViewerQueue, cfg.Watcher), audits: make([][]Audit, n), auditHead: make([]int, n), auditN: make([]int, n), states: make([]uint8, n), grid: make([]byte, n)}
+	r := &Registry{cfg: cfg, hub: newHub(cfg.ViewerQueue, cfg.Watcher), audits: make([][]Audit, n), auditHead: make([]int, n), auditN: make([]int, n), states: make([]uint8, n), grid: make([]byte, n), timeline: make([]event, cfg.TimelineRing)}
 	return r
+}
+
+// Timeline appends a free-text line (scenarios and the checker use it; state transitions post through Audit).
+func (r *Registry) Timeline(text string) {
+	r.mu.Lock()
+	r.post(r.cfg.Clock.Now(), text)
+	r.mu.Unlock()
+}
+
+// post appends one timeline line; caller holds r.mu.
+func (r *Registry) post(at time.Time, text string) {
+	r.tlSeq++
+	r.timeline[r.tlHead] = event{Seq: r.tlSeq, At: at.UnixMilli(), Text: text}
+	r.tlHead = (r.tlHead + 1) % len(r.timeline)
+	if r.tlN < len(r.timeline) {
+		r.tlN++
+	}
+}
+
+// events returns the newest n timeline lines, newest first; caller holds r.mu.
+func (r *Registry) events(n int) []event {
+	if n > r.tlN {
+		n = r.tlN
+	}
+	out := make([]event, 0, n)
+	for i := 1; i <= n; i++ {
+		out = append(out, r.timeline[(r.tlHead-i+len(r.timeline))%len(r.timeline)])
+	}
+	return out
+}
+
+// stateNames mirrors cmek.State without importing it (metrics never imports the core).
+func stateName(s uint8) string {
+	switch s {
+	case 0:
+		return "ACTIVE"
+	case 1:
+		return "RIDING_THROUGH"
+	case 2:
+		return "KEY_UNAVAILABLE"
+	case 3:
+		return "REVOKED"
+	}
+	return "?"
 }
 
 // Ingest counts one outcome by reason and by share class (L4 split, M3).
@@ -120,7 +182,8 @@ func (r *Registry) Ingest(idx int, reason string, withinShare bool) {
 // Delivered records one delivery (histograms arrive in M4).
 func (r *Registry) Delivered(idx int, latency time.Duration) { r.delivered.Add(1) }
 
-// Audit stores the entry in the tenant ring and counts KMS calls by class.
+// Audit stores the entry in the tenant ring, counts KMS calls by class, and turns a state change into a timeline
+// line (one per transition; M4 aggregates same-transition bursts). A REVOKED line carries the purge count.
 func (r *Registry) Audit(e Audit) {
 	if e.Op == "unwrap" || e.Op == "generate" {
 		if e.Class < 3 {
@@ -131,6 +194,14 @@ func (r *Registry) Audit(e Audit) {
 		return
 	}
 	r.mu.Lock()
+	if e.Op == "state" {
+		id := r.cfg.Tenants[e.Idx]
+		if e.To == 3 {
+			r.post(e.At, fmt.Sprintf("%s REVOKED, %d DEKs purged", id, e.Purged))
+		} else {
+			r.post(e.At, fmt.Sprintf("%s %s → %s (%s)", id, stateName(e.From), stateName(e.To), e.Detail))
+		}
+	}
 	ring := r.audits[e.Idx]
 	if ring == nil {
 		ring = make([]Audit, r.cfg.AuditRing)
@@ -187,7 +258,8 @@ type snapshot struct {
 		Total    int `json:"total"`
 		Affected int `json:"affected"`
 	} `json:"backlog"`
-	Grid string `json:"grid"`
+	Grid   string  `json:"grid"`
+	Events []event `json:"events"`
 }
 
 // tick builds one snapshot: sources are read before the lock, per-tick atomics are swapped, and the encoded bytes go to the hub.
@@ -233,6 +305,7 @@ func (r *Registry) tick() {
 	s.KMSPS.EventsPS = s.IngestPS.Accepted
 	s.Backlog.Total = total
 	s.Grid = string(r.grid)
+	s.Events = r.events(r.cfg.SnapshotEvents)
 	b, err := json.Marshal(&s)
 	if err != nil {
 		return

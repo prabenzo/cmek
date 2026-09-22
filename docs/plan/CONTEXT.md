@@ -32,7 +32,7 @@ Nothing is to be built yet. Ben must approve each milestone's plan before any bu
 - Every time constant and load setting is a World parameter (a Params struct with demo defaults), never a constant buried in a package.
 - The invariant checker sits outside the service's trust boundary: it reads stored rows, the sink's delivery record and the fake KMS's ground truth; the service must not be able to influence its verdicts.
 - Lease validity is measured from when the renewal request was SENT; the lease expires locally 1 s early.
-- Budget: 3:40 of build across M0–M6 with the clock and cut lines in the spec's "Plan and cut lines" table. Plans must fit those boxes. Claude (an AI pair) drafts most non-core code at Ben's direction; Ben writes or line-reviews internal/cmek himself. Mark ownership per file.
+- Budget: 3:40 of build across M0–M6 with the clock and cut lines in the spec's "Plan and cut lines" table. Plans must fit those boxes. Claude (an AI pair) drafts most non-core code at Ben's direction; Ben writes or line-reviews internal/cmek himself. Mark ownership per file. (Superseded 2026-09-22: Claude writes all code and tests; Ben reviews. ARCH-NOTES 9.)
 - Deliverables to keep in view: deployed URL, GitHub repo, ~5 min video + short written doc (M6), AI transcripts, and a note of time spent (keep docs/TIMELOG.md: planned vs actual per milestone, created in M0).
 
 ## Output style (binding for every agent that writes plan text)

@@ -45,6 +45,21 @@ const (
 	Poison
 )
 
+// String names the class.
+func (c Class) String() string {
+	switch c {
+	case OK:
+		return "ok"
+	case Transient:
+		return "transient"
+	case Deny:
+		return "deny"
+	case Poison:
+		return "poison"
+	}
+	return "unknown"
+}
+
 // Envelope is one message's ciphertext plus what is needed to open it; AAD is derived, never stored.
 type Envelope struct {
 	DEKID      string
