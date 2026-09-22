@@ -68,7 +68,7 @@ Milestone column = the plan whose Files/Order of work delivers the item. "cut li
 | `POST /v1/tenants/{id}/key` | M2 | |
 | `GET /v1/tenants/{id}` | M1 (cut line, **expected cut**) → M4 cond. (+10 cmd, +20 world) | closed: M4 budgets `world.Tenant`/`TenantDetail` on M1's expected-cut path (M4 CR-5) |
 | `POST /v1/reset` | M5 | |
-| `GET /healthz` | M0 → M1 (`HealthInfo` + insert instrument) → M5 (`Current` release) | |
+| `GET /health` | M0 → M1 (`HealthInfo` + insert instrument) → M5 (`Current` release) | |
 
 ## 3. Parameters
 
@@ -198,7 +198,7 @@ Milestone column = the plan whose Files/Order of work delivers the item. "cut li
 | Goroutine inventory: traffic loops, workers, checker, metrics tick, scenario runner | M1 / M1 / M5 / M1 / M3 |
 | M0 ticker check on Cloud Run + D9 fallback rule | M0 (`scripts/m0-ticker-check.sh`, thresholds) |
 | SSE write deadline, `r.Context()` select, `StreamMaxAge` reconnect | M0 (select) → M1 (rewrite; select not restated) → M5 (C3) |
-| `/healthz` ticks, uptime, world id, insert instrument | M0 → M1 |
+| `/health` ticks, uptime, world id, insert instrument | M0 → M1 |
 | DB file per World, removed on Stop, stale-file pre-remove | M1 |
 
 ## 9. Deliverables (SPEC › Constraints and success criteria; HANDOFF)

@@ -39,7 +39,7 @@ func main() {
 	go s.runTicker(ctx, w, p.SnapshotInterval)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", s.healthz)
+	mux.HandleFunc("GET /health", s.health)
 	mux.HandleFunc("GET /v1/stream", s.stream)
 	routeUI(mux)
 	srv := &http.Server{Addr: ":" + port, Handler: mux, ReadHeaderTimeout: 10 * time.Second, WriteTimeout: 0}

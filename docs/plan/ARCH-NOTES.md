@@ -13,3 +13,4 @@ DESIGN-REFERENCE.md is canonical for package layout, signatures, SQL, concurrenc
 7. **M0 acceptance must be runnable by Ben alone from a terminal** (curl only), and must include the D9 fallback decision rule with a concrete threshold.
 8. **Time log.** Every milestone plan's "Order of work" ends with "record actual time in docs/TIMELOG.md" as its last step (1 minute).
 9. **Ownership marks.** Use the architecture's B/C marks. Ben owns `internal/cmek` end to end (writes or line-reviews every line); he also reviews `Claim`/`Release`/`Next` in queue, `kms.go`, `ingest.go`, `holder.go`, `world.go` wiring, and the checker's verdict rules.
+10. **Liveness path is `/health`, not `/healthz` (Ben, 2026-09-22).** Cloud Run does not allow a `/healthz` path, so the implementation, the ticker-check script and every plan use `GET /health`. `docs/SPEC.md`'s endpoint table still says `/healthz`; read it as `/health`.

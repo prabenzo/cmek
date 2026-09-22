@@ -15,7 +15,7 @@ type World struct {
 	ticks   atomic.Int64
 }
 
-// HealthInfo is the /healthz body.
+// HealthInfo is the /health body.
 type HealthInfo struct {
 	World   string  `json:"world"`
 	Ticks   int64   `json:"ticks"`
@@ -27,10 +27,10 @@ type HealthInfo struct {
 // Tick increments and returns the M0 ticker counter (M1 removes it: metrics owns ticks).
 func (w *World) Tick() int64 { return w.ticks.Add(1) }
 
-// Ticks is the counter, read by /healthz and the stream handler.
+// Ticks is the counter, read by /health and the stream handler.
 func (w *World) Ticks() int64 { return w.ticks.Load() }
 
-// Health builds the /healthz body; now and the viewer count are passed in because M0 has no clock and no hub.
+// Health builds the /health body; now and the viewer count are passed in because M0 has no clock and no hub.
 func (w *World) Health(now time.Time, viewers, burnMs int) HealthInfo {
 	return HealthInfo{World: w.ID, Ticks: w.Ticks(), UptimeS: now.Sub(w.started).Seconds(), Viewers: viewers, BurnMs: burnMs}
 }

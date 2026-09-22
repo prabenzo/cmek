@@ -69,8 +69,8 @@ func (s *server) stream(rw http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// healthz is GET /healthz: liveness plus the tick counter the M0 check reads.
-func (s *server) healthz(rw http.ResponseWriter, r *http.Request) {
+// health is GET /health: liveness plus the tick counter the M0 check reads.
+func (s *server) health(rw http.ResponseWriter, r *http.Request) {
 	w := s.holder.Current()
 	rw.Header().Set("Content-Type", "application/json")
 	if w == nil {
