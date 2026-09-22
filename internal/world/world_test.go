@@ -79,6 +79,9 @@ func TestTwoWorlds(t *testing.T) {
 			if x.w.store.Backlog(i) != 0 {
 				t.Errorf("%s: tenant %d backlog %d", x.w.ID, i, x.w.store.Backlog(i))
 			}
+			if x.w.sink.Delivered(i) < 1 { // every tenant sent at least once: a Next that starves a class cannot pass on other tenants' deliveries
+				t.Errorf("%s: tenant %d delivered nothing", x.w.ID, i)
+			}
 		}
 		if x.w.sink.Mismatches() != 0 {
 			t.Errorf("%s: %d canary mismatches", x.w.ID, x.w.sink.Mismatches())

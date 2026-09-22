@@ -32,6 +32,8 @@ type Params struct {
 	ClaimTimeout      time.Duration // 30s  claimed_until horizon (message claim, not the key lease)
 	ReclaimInterval   time.Duration // 1s   sweep returning timed-out claims to ready
 	IdlePoll          time.Duration // 20ms worker wait when Next finds nothing
+	TwoClassSched     bool          // true interleave within-share and over-share turns (M3 Decision)
+	SchedLightTurns   int           // 32   within-share turns per over-share turn (ARCH: 4; unstable below ≈ 18, M3 Decision)
 	DBDir             string        // ""   → os.TempDir(); the file is <DBDir>/killswitch-<pid>-<ID>.db
 	SyncMode          string        // "normal"; env KS_SYNC
 	WALAutocheckpoint int           // 4000; env KS_WAL_AUTOCHECKPOINT
@@ -54,8 +56,23 @@ type Params struct {
 	SnapshotEvents   int           // 20 most recent timeline entries per snapshot
 	ViewerQueue      int           // 1  per-viewer buffered snapshots, drop-on-slow
 
-	// Admission: Retry-After header values (M3 adds the caps)
-	RetryAfter RetryAfter
+	// Admission
+	TenantRate       float64    // 100 events/s
+	TenantBurst      int        // 200
+	TenantBacklogCap int        // 500
+	GlobalBacklogCap int        // 20000
+	FairShare        bool       // true; false = plain global cap (M3 cut line)
+	RetryAfter       RetryAfter // fixed header values, all of them
+
+	// Scenarios (M3: the two surges and the tail bounds; M4 adds the fault scenarios)
+	SurgeTenantRank        int           // 5   a top-20 tenant
+	TenantSurgeMult        float64       // 100
+	TenantSurgeFor         time.Duration // 60s
+	GlobalSurgeMult        float64       // 5
+	GlobalSurgeFor         time.Duration // 90s (M3 Decision; the spec card says 60 s)
+	GlobalSurgeAffectedTop int           // 150 heaviest ranks form the declared affected set
+	ScenarioTailMin        time.Duration // 15s observation after the fault clears, at least this long (M4 reads it)
+	ScenarioTailMax        time.Duration // 90s tail ends earlier when every target is ACTIVE and affected backlog is drained
 
 	// Lifecycle
 	IdleRebuild time.Duration // 10s  no viewers longer than this → next connection builds a fresh World (M5)
@@ -79,11 +96,15 @@ func Demo() Params {
 		DEKMaxMessages: 10000, DEKMaxAge: 10 * time.Minute, ProviderInflight: 32, TenantInflight: 2, IngestWaiters: 4,
 		SweepInterval: 250 * time.Millisecond,
 		Workers:       8, ClaimBatch: 8, ClaimTimeout: 30 * time.Second, ReclaimInterval: time.Second, IdlePoll: 20 * time.Millisecond,
+		TwoClassSched: true, SchedLightTurns: 32,
 		SyncMode: "normal", WALAutocheckpoint: 4000,
 		SinkLatencyMin: 5 * time.Millisecond, SinkLatencyMax: 20 * time.Millisecond, SinkRing: 1024,
 		BaseRate: 300, ZipfExponent: 1, PayloadBytes: 1024, CanaryPrefix: "PLAINTEXT-CANARY-",
 		SnapshotInterval: 500 * time.Millisecond, AuditRing: 16, TimelineRing: 200, SnapshotEvents: 20, ViewerQueue: 1,
-		RetryAfter:  RetryAfter{RateLimited: 1, BacklogFull: 5, Overloaded: 5, KeyUnavailable: 1},
+		TenantRate: 100, TenantBurst: 200, TenantBacklogCap: 500, GlobalBacklogCap: 20000, FairShare: true,
+		RetryAfter:      RetryAfter{RateLimited: 1, BacklogFull: 5, Overloaded: 5, KeyUnavailable: 1},
+		SurgeTenantRank: 5, TenantSurgeMult: 100, TenantSurgeFor: 60 * time.Second, GlobalSurgeMult: 5, GlobalSurgeFor: 90 * time.Second,
+		GlobalSurgeAffectedTop: 150, ScenarioTailMin: 15 * time.Second, ScenarioTailMax: 90 * time.Second,
 		IdleRebuild: 10 * time.Second, StopTimeout: 2 * time.Second,
 	}
 }
