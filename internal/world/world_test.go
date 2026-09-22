@@ -117,13 +117,16 @@ func TestSmallPopulation(t *testing.T) {
 	w.Stop()
 }
 
-// TestScenarioRunner: start, busy, unknown, stop (returns the name, restores the multiplier, clears the card), stop
-// while idle, and a natural end.
+// TestScenarioRunner: start, busy, unknown, stop (returns the name, restores the multiplier, clears the card and the
+// targets), stop while idle, a natural end with its tail (recovery and drain stamped, the restored line), and the
+// revocation's open phase ended by Restore.
 func TestScenarioRunner(t *testing.T) {
 	p := Small()
 	p.DBDir = t.TempDir()
 	p.TenantSurgeFor = 60 * time.Millisecond
-	w, err := New(p, Deps{ID: "s", Clock: &testClock{now: time.Now()}})
+	p.SnapshotInterval = 20 * time.Millisecond
+	p.ScenarioTailMin, p.ScenarioTailMax = 100*time.Millisecond, 2*time.Second
+	w, err := New(p, Deps{ID: "s"}) // the real clock: the tail measures elapsed time
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,6 +146,9 @@ func TestScenarioRunner(t *testing.T) {
 	if name, running, _ := w.metrics.Scenario(); !running || name != "tenant_surge" {
 		t.Errorf("card: %q running=%v", name, running)
 	}
+	if !w.metrics.Affected(surge) {
+		t.Error("surge tenant not affected after start")
+	}
 	if got := w.gen.Offered(surge); math.Abs(got-base*p.TenantSurgeMult) > 1e-9 {
 		t.Errorf("surge multiplier: offered %v, want %v", got, base*p.TenantSurgeMult)
 	}
@@ -155,6 +161,9 @@ func TestScenarioRunner(t *testing.T) {
 	if got := w.gen.Offered(surge); got != base {
 		t.Errorf("after stop: offered %v, want %v", got, base)
 	}
+	if w.metrics.Affected(surge) {
+		t.Error("surge tenant still affected after stop")
+	}
 	if name := w.StopScenario(); name != "" {
 		t.Errorf("idle stop returned %q", name)
 	}
@@ -162,15 +171,25 @@ func TestScenarioRunner(t *testing.T) {
 	if err := w.StartScenario("tenant_surge"); err != nil {
 		t.Fatalf("restart: %v", err)
 	}
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(3 * time.Second)
+	seenDone := false // the tail holds the card for ≥ ScenarioTailMin once recovery and drain are stamped
 	for time.Now().Before(deadline) {
 		if _, running, _ := w.metrics.Scenario(); !running {
 			break
 		}
+		if _, _, done := w.metrics.Recovered(); done {
+			seenDone = true
+		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	if _, running, _ := w.metrics.Scenario(); running {
-		t.Fatal("scenario still running 2 s after a 60 ms phase")
+		t.Fatal("scenario still running 3 s after a 60 ms phase")
+	}
+	if !seenDone {
+		t.Error("tail: Recovered never reported done while the card was up")
+	}
+	if got := w.gen.Offered(surge); got != base {
+		t.Errorf("after natural end: offered %v, want %v", got, base)
 	}
 	if got := w.gen.Offered(surge); got != base {
 		t.Errorf("after natural end: offered %v, want %v", got, base)
@@ -178,5 +197,33 @@ func TestScenarioRunner(t *testing.T) {
 	if err := w.StartScenario("global_surge"); err != nil { // the slot is free again
 		t.Errorf("start after natural end: %v", err)
 	}
-	w.StopScenario()
+	if name := w.StopScenario(); name != "global_surge" {
+		t.Errorf("stop returned %q", name)
+	}
+	// key_revocation: an open phase that Restore (on the target only) ends, then the tail
+	rev := w.byRank[p.RevokeTenantRank-1]
+	if err := w.StartScenario("key_revocation"); err != nil {
+		t.Fatalf("revocation: %v", err)
+	}
+	other := w.byRank[0]
+	if err := w.SetKey(w.ids[other], "restore"); err != nil { // not the target: the run stays open
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if name, running, _ := w.metrics.Scenario(); !running || name != "key_revocation" {
+		t.Errorf("revocation ended by a restore of another tenant: %q running=%v", name, running)
+	}
+	if err := w.SetKey(w.ids[rev], "restore"); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, running, _ := w.metrics.Scenario(); !running {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, running, _ := w.metrics.Scenario(); running {
+		t.Fatal("revocation still running 3 s after Restore")
+	}
 }

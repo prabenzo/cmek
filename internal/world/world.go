@@ -142,7 +142,9 @@ func New(p Params, d Deps) (*World, error) {
 	w.sink = traffic.NewSink(traffic.SinkConfig{Tenants: w.ids, MinLatency: p.SinkLatencyMin, MaxLatency: p.SinkLatencyMax, Ring: p.SinkRing, CanaryPrefix: p.CanaryPrefix, Clock: d.Clock, Rand: w.rnd, Lock: &w.rndMu})
 	w.gen = traffic.NewGenerator(traffic.GeneratorConfig{Tenants: w.ids, Rates: rates, PayloadBytes: p.PayloadBytes, CanaryPrefix: p.CanaryPrefix, Ingest: w, Clock: d.Clock, Rand: w.rnd, Lock: &w.rndMu})
 	capacity := float64(p.Workers) / ((p.SinkLatencyMin + p.SinkLatencyMax) / 2).Seconds()
-	w.metrics = metrics.New(metrics.Config{Tenants: w.ids, Providers: p.Providers, Grid: &gridAdapter{w: w, buf: make([]cmek.State, n)}, Backlog: store, Offered: w.gen, Watcher: watcher{w}, Clock: d.Clock, Interval: p.SnapshotInterval, AuditRing: p.AuditRing, TimelineRing: p.TimelineRing, SnapshotEvents: p.SnapshotEvents, ViewerQueue: p.ViewerQueue, Capacity: capacity, WorldID: d.ID})
+	w.metrics = metrics.New(metrics.Config{Tenants: w.ids, Providers: p.Providers, Grid: &gridAdapter{w: w, buf: make([]cmek.State, n)}, Backlog: store, Offered: w.gen, Inflight: w.keys, Watcher: watcher{w}, Clock: d.Clock,
+		Interval: p.SnapshotInterval, ChartWindow: p.ChartWindow, P99Window: p.P99Window, BaselineTicks: p.BaselineTicks, AggregateMin: p.TimelineAggregateMin, DrainSlack: p.Workers * p.ClaimBatch,
+		AuditRing: p.AuditRing, TimelineRing: p.TimelineRing, SnapshotEvents: p.SnapshotEvents, ViewerQueue: p.ViewerQueue, Capacity: capacity, WorldID: d.ID})
 	w.admit = admit.New(admit.Config{Tenants: n, Rate: p.TenantRate, Burst: p.TenantBurst, TenantCap: p.TenantBacklogCap, GlobalCap: p.GlobalBacklogCap, FairShare: p.FairShare, Backlog: store, Clock: d.Clock})
 	w.sched = queue.NewScheduler(queue.SchedulerConfig{Store: store, Gate: w.keys, Share: w.admit, Tenants: w.ids, TwoClass: p.TwoClassSched, LightTurns: p.SchedLightTurns})
 	w.scen = newScenarios(w)
@@ -299,7 +301,8 @@ type TenantDetail struct {
 	Audit            []metrics.Audit `json:"audit"`
 }
 
-// Tenant returns the tenant read model (M1: state, rank, backlog, offered rate).
+// Tenant returns the tenant read model: state and lease (cmek), rank, backlog, offered rate, KMS calls per minute
+// and the last 10 audit entries (metrics ring), and the affected bit (hover and pin read it, Q11).
 func (w *World) Tenant(id string) (TenantDetail, error) {
 	idx, ok := w.index[id]
 	if !ok {
@@ -308,7 +311,8 @@ func (w *World) Tenant(id string) (TenantDetail, error) {
 	info := w.keys.Info(id)
 	return TenantDetail{ID: id, Provider: w.P.Providers[idx*len(w.P.Providers)/w.P.Tenants], State: info.State.String(), Rank: w.rankOf[idx],
 		LeaseAgeMs: info.LeaseAge.Milliseconds(), LeaseRemainingMs: info.LeaseRemaining.Milliseconds(), NextProbeMs: info.NextProbeIn.Milliseconds(),
-		Backlog: w.store.Backlog(idx), Ready: w.store.Ready(idx), OfferedPS: w.gen.Offered(idx), Audit: []metrics.Audit{}}, nil
+		Backlog: w.store.Backlog(idx), Ready: w.store.Ready(idx), OfferedPS: w.gen.Offered(idx),
+		KMSCallsPerMin: w.metrics.TenantCallsPerMin(idx), Affected: w.metrics.Affected(idx), Audit: w.metrics.TenantAudit(idx, 10)}, nil
 }
 
 // FaultRequest is the flat body of POST /v1/faults: one of Provider or Tenant, plus a mode and optional latency
@@ -393,7 +397,8 @@ func (w *World) Surge(tenant string, mult float64) error {
 	return nil
 }
 
-// SetKey maps "revoke" / "restore" to the fake KMS's Revoke / Restore of the tenant's KEK.
+// SetKey maps "revoke" / "restore" to the fake KMS's Revoke / Restore of the tenant's KEK; a restore also signals
+// the running key_revocation scenario when the tenant is its target.
 func (w *World) SetKey(tenant, action string) error {
 	idx, ok := w.index[tenant]
 	if !ok {
@@ -404,6 +409,7 @@ func (w *World) SetKey(tenant, action string) error {
 		w.kms.Revoke(w.specs[idx].KEKID)
 	case "restore":
 		w.kms.Restore(w.specs[idx].KEKID)
+		w.scen.restore(idx) // ends a running key_revocation on this tenant (a no-op otherwise)
 	default:
 		return fmt.Errorf("%w: unknown action %q", ErrBadFault, action)
 	}

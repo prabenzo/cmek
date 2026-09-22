@@ -74,6 +74,27 @@ type Params struct {
 	ScenarioTailMin        time.Duration // 15s observation after the fault clears, at least this long (M4 reads it)
 	ScenarioTailMax        time.Duration // 90s tail ends earlier when every target is ACTIVE and affected backlog is drained
 
+	// Fault scenarios (M4)
+	OutageBlip       time.Duration // 10s  provider_blip fast-fail
+	OutageLong       time.Duration // 60s  provider_outage fast-fail
+	OutageProvider   string        // "gcp"
+	SlowProvider     string        // "azure"
+	SlowP50          time.Duration // 400ms slow_kms latency p50
+	SlowP99          time.Duration // 3s    slow_kms latency p99 (against the 500 ms timeout)
+	SlowFor          time.Duration // 60s
+	RevokeTenantRank int           // 3    a high-traffic tenant
+
+	// Charts, p99 and the invariant thresholds (M4 measures; M5 judges)
+	ChartWindow          time.Duration // 2m   ring the page keeps per series
+	P99Window            int           // 10   ticks (5 s) summed for p99
+	BaselineTicks        int           // 20   ticks (10 s) before scenario start; baseline = mean of the tick p99s
+	L1Ratio              float64       // 1.25
+	L1Floor              time.Duration // 25ms L1 compares against L1Ratio × max(baseline, L1Floor) (M4 Decision)
+	L1Grace              time.Duration // 2s   after scenario start before L1 is judged
+	L4CapacityFactor     float64       // 0.9  delivered/s must stay ≥ this × measured capacity while backlogged
+	L4Settle             time.Duration // 2s   backlog must exceed Workers×ClaimBatch this long before L4 is judged
+	TimelineAggregateMin int           // 3    same (provider, from, to) transitions in one tick collapse to one line
+
 	// Lifecycle
 	IdleRebuild time.Duration // 10s  no viewers longer than this → next connection builds a fresh World (M5)
 	StopTimeout time.Duration // 2s   Stop waits at most this long for goroutines
@@ -105,6 +126,10 @@ func Demo() Params {
 		RetryAfter:      RetryAfter{RateLimited: 1, BacklogFull: 5, Overloaded: 5, KeyUnavailable: 1},
 		SurgeTenantRank: 5, TenantSurgeMult: 100, TenantSurgeFor: 60 * time.Second, GlobalSurgeMult: 5, GlobalSurgeFor: 90 * time.Second,
 		GlobalSurgeAffectedTop: 150, ScenarioTailMin: 15 * time.Second, ScenarioTailMax: 90 * time.Second,
+		OutageBlip: 10 * time.Second, OutageLong: 60 * time.Second, OutageProvider: "gcp", SlowProvider: "azure",
+		SlowP50: 400 * time.Millisecond, SlowP99: 3 * time.Second, SlowFor: 60 * time.Second, RevokeTenantRank: 3,
+		ChartWindow: 2 * time.Minute, P99Window: 10, BaselineTicks: 20, L1Ratio: 1.25, L1Floor: 25 * time.Millisecond, L1Grace: 2 * time.Second,
+		L4CapacityFactor: 0.9, L4Settle: 2 * time.Second, TimelineAggregateMin: 3,
 		IdleRebuild: 10 * time.Second, StopTimeout: 2 * time.Second,
 	}
 }
