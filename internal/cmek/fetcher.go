@@ -161,8 +161,8 @@ func (m *Manager) apply(t *tenant, op string, d *dek, r result) {
 		delete(t.pending, d.id)
 		if from := t.state; from != Active {
 			m.setState(t, Active, now, "authorization renewed", 0)
-			if from == Revoked {
-				m.log.Error("tenant restored", "tenant", t.spec.ID) // the end of a revocation episode is worth a line
+			if from == Revoked && m.cfg.Logger != nil {
+				m.cfg.Logger.Info("tenant restored", "tenant", t.spec.ID) // the end of a revocation episode is worth a line
 			}
 		}
 	case Deny:
