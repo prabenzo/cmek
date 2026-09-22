@@ -4,165 +4,320 @@ package cmek
 import (
 	"context"
 	"errors"
-	"fmt"
-	"log/slog"
 	"strconv"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/singleflight"
+
+	"github.com/prabenzo/cmek/internal/logx"
 )
 
-// throttle logs one line per second per message (the core has no logx dependency by the import rule).
-type throttle struct {
-	log  *slog.Logger
-	mu   sync.Mutex
-	last map[string]time.Time
-}
-
-func (t *throttle) Error(msg string, attrs ...any) {
-	if t.log == nil {
-		return
-	}
-	t.mu.Lock()
-	now := time.Now()
-	ok := now.Sub(t.last[msg]) >= time.Second
-	if ok {
-		t.last[msg] = now
-	}
-	t.mu.Unlock()
-	if ok {
-		t.log.Error(msg, attrs...)
-	}
-}
-
-// errStore marks a DEKStore failure: not a KMS outcome, so no audit line, no state change, and EncryptKey returns it
-// unclassified (world.Outcome answers 500 internal, which must stay at 0).
-var errStore = errors.New("cmek: dek store")
-
-// farFuture is the M1 stand-in for a lease: every handle stays valid until M2 installs the real lease.
-func farFuture() time.Time { return time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC) }
-
-// Manager (M1) is a DEK cache without a lease: one fetch per tenant, then cached; nothing purges.
+// Manager is the CMEK core: one lease, DEK cache and key state machine per tenant, each behind its own mutex;
+// one fetcher (provider bulkheads, singleflight) shared by all. It never stores plaintext anywhere but memory,
+// never runs SQL, and never calls a KMS from the delivery path.
 type Manager struct {
-	mu      sync.Mutex
-	tenants map[string]*tenant
-	order   []*tenant
-	sf      singleflight.Group
-	ctx     context.Context
-	cfg     Config
-	log     throttle
+	tenants  map[string]*tenant
+	order    []*tenant                // grid order; fixed at New
+	states   []atomic.Uint32          // the grid array, written under the owning t.mu, read lock-free by States
+	provSem  map[string]chan struct{} // per-provider bulkhead, cap ProviderInflight
+	inflight map[string]*atomic.Int64 // calls inside each provider (the slow-KMS tile)
+	sf       singleflight.Group
+	ctx      context.Context
+	cfg      Config
+	log      logx.Throttle
 }
 
-// New builds a Manager; ctx bounds every fetch.
+// New builds a Manager; ctx bounds every fetch. Zero durations take the spec's demo values.
 func New(ctx context.Context, cfg Config) *Manager {
 	if cfg.Spawn == nil {
 		cfg.Spawn = func(f func()) { go f() }
 	}
-	m := &Manager{tenants: make(map[string]*tenant, len(cfg.Tenants)), ctx: ctx, cfg: cfg, log: throttle{log: cfg.Logger, last: make(map[string]time.Time)}}
+	def := func(d *time.Duration, v time.Duration) {
+		if *d <= 0 {
+			*d = v
+		}
+	}
+	def(&cfg.Lease, 30*time.Second)
+	def(&cfg.SoftTTL, 15*time.Second)
+	def(&cfg.EarlyExpiry, time.Second)
+	def(&cfg.KMSTimeout, 500*time.Millisecond)
+	def(&cfg.BackoffMin, 500*time.Millisecond)
+	def(&cfg.BackoffMax, 8*time.Second)
+	def(&cfg.RevokedReprobe, 5*time.Second)
+	def(&cfg.DEKMaxAge, 10*time.Minute)
+	def(&cfg.SweepInterval, 250*time.Millisecond)
+	if cfg.DEKMaxMessages <= 0 {
+		cfg.DEKMaxMessages = 10000
+	}
+	if cfg.ProviderInflight <= 0 {
+		cfg.ProviderInflight = 32
+	}
+	if cfg.IngestWaiters <= 0 {
+		cfg.IngestWaiters = 4
+	}
+	m := &Manager{tenants: make(map[string]*tenant, len(cfg.Tenants)), states: make([]atomic.Uint32, len(cfg.Tenants)), provSem: make(map[string]chan struct{}), inflight: make(map[string]*atomic.Int64), ctx: ctx, cfg: cfg, log: logx.Throttle{Log: cfg.Logger}}
+	for _, p := range cfg.Providers {
+		m.provider(p)
+	}
 	for i, spec := range cfg.Tenants {
-		t := &tenant{idx: i, spec: spec, deks: make(map[string]*dek)}
+		m.provider(spec.Provider)
+		t := &tenant{idx: i, spec: spec, deks: make(map[string]*dek), pending: make(map[string]time.Time), lease: Lease{TTL: cfg.Lease, SoftTTL: cfg.SoftTTL, Early: cfg.EarlyExpiry}}
 		m.tenants[spec.ID] = t
 		m.order = append(m.order, t)
 	}
 	return m
 }
 
-// EncryptKey returns a handle on the tenant's active DEK, generating one through the KMS on the cold path (singleflight per tenant).
+func (m *Manager) provider(p string) {
+	if _, ok := m.provSem[p]; !ok {
+		m.provSem[p] = make(chan struct{}, m.cfg.ProviderInflight)
+		m.inflight[p] = new(atomic.Int64)
+	}
+}
+
+// exhausted reports whether the active DEK has reached its message or age bound (rotation while ACTIVE).
+func (m *Manager) exhausted(d *dek, now time.Time) bool {
+	return d.msgs >= m.cfg.DEKMaxMessages || now.Sub(d.createdAt) >= m.cfg.DEKMaxAge
+}
+
+// handle copies the active key into a Handle when the tenant may seal now; caller holds t.mu.
+func (m *Manager) handle(t *tenant, now time.Time) (Handle, bool) {
+	d := t.active
+	if d == nil || d.key == nil || !t.lease.Usable(now) || (t.state == Active && m.exhausted(d, now)) {
+		return Handle{}, false
+	}
+	d.msgs++
+	return Handle{DEKID: d.id, ValidUntil: t.lease.SentAt.Add(m.cfg.Lease - m.cfg.EarlyExpiry), key: *d.key}, true
+}
+
+// EncryptKey returns a handle on the tenant's active DEK, fetching synchronously on the cold path; parked tenants
+// get their sentinel without a KMS call. A hot ACTIVE tenant whose lease is soft-due kicks one lazy renewal.
 func (m *Manager) EncryptKey(ctx context.Context, id string) (Handle, error) {
-	m.mu.Lock()
 	t := m.tenants[id]
 	if t == nil {
-		m.mu.Unlock()
 		return Handle{}, ErrKeyUnavailable
 	}
-	if t.active != nil && t.active.key != nil {
-		h := Handle{DEKID: t.active.id, ValidUntil: farFuture(), key: *t.active.key}
-		t.active.msgs++
-		m.mu.Unlock()
+	now := m.cfg.Clock.Now()
+	t.mu.Lock()
+	switch t.state {
+	case Revoked:
+		t.mu.Unlock()
+		return Handle{}, ErrKeyRevoked
+	case KeyUnavailable:
+		t.mu.Unlock()
+		return Handle{}, ErrKeyUnavailable
+	}
+	if h, ok := m.handle(t, now); ok { // hot path
+		kick := t.state == Active && t.lease.SoftDue(now) && !t.probing
+		if kick {
+			t.probing = true
+		}
+		t.mu.Unlock()
+		if kick {
+			m.cfg.Spawn(func() { m.probe(t) })
+		}
 		return h, nil
 	}
-	m.mu.Unlock()
-	_, err, _ := m.sf.Do(id+"/generate", func() (any, error) { return nil, m.generate(t) })
-	if err != nil {
-		if errors.Is(err, errStore) {
-			return Handle{}, err
-		}
+	// cold path: no usable lease, no DEK, or an exhausted active DEK while ACTIVE
+	if t.waiters >= m.cfg.IngestWaiters {
+		t.mu.Unlock()
 		return Handle{}, ErrKeyUnavailable
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if t.active == nil || t.active.key == nil {
-		return Handle{}, ErrKeyUnavailable
+	t.waiters++
+	d := t.active
+	gen := d == nil || (t.state == Active && m.exhausted(d, now))
+	t.mu.Unlock()
+	var err error
+	if gen {
+		_, err, _ = m.sf.Do(id+"/generate", func() (any, error) { _, r := m.generate(t); return nil, r.err })
+	} else {
+		_, err, _ = m.sf.Do(id+"/active", func() (any, error) {
+			r := m.call(t, "unwrap", d)
+			m.apply(t, "unwrap", d, r)
+			return nil, r.err
+		})
 	}
-	t.active.msgs++
-	return Handle{DEKID: t.active.id, ValidUntil: farFuture(), key: *t.active.key}, nil
+	now = m.cfg.Clock.Now()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.waiters--
+	if t.state == Revoked {
+		return Handle{}, ErrKeyRevoked
+	}
+	if h, ok := m.handle(t, now); ok {
+		return h, nil
+	}
+	if errors.Is(err, errStore) {
+		return Handle{}, err // a store failure is not a key-state answer: 500 internal, not 503
+	}
+	return Handle{}, ErrKeyUnavailable
 }
 
-// generate calls GenerateDataKey with a detached deadline, persists the wrapped form, then installs the DEK as active.
-func (m *Manager) generate(t *tenant) error {
-	m.mu.Lock()
-	if t.active != nil && t.active.key != nil {
-		m.mu.Unlock()
-		return nil
-	}
-	t.seq++
-	dekID := t.spec.ID + "/" + strconv.Itoa(t.seq)
-	m.mu.Unlock()
-	ctx, cancel := context.WithTimeout(m.ctx, m.cfg.KMSTimeout)
-	defer cancel()
-	start := m.cfg.Clock.Now()
-	dk, err := m.cfg.Keys.GenerateDataKey(ctx, t.spec.KEKID)
-	latency := m.cfg.Clock.Now().Sub(start)
-	if err != nil {
-		m.cfg.Audit.Audit(Audit{At: m.cfg.Clock.Now(), Tenant: t.spec.ID, Op: "generate", Outcome: "error", Detail: err.Error(), Class: Transient, Latency: latency})
-		m.log.Error("kms generate failed", "tenant", t.spec.ID, "kek", t.spec.KEKID, "latency", latency, "err", err)
-		return err
-	}
-	if err := m.cfg.Store.PutDEK(m.ctx, WrappedDEK{ID: dekID, Tenant: t.spec.ID, KEKID: t.spec.KEKID, KEKVersion: dk.KEKVersion, Wrapped: dk.Wrapped, CreatedAt: m.cfg.Clock.Now()}); err != nil {
-		m.log.Error("dek store write failed", "tenant", t.spec.ID, "dek", dekID, "err", err)
-		return fmt.Errorf("%w: %v", errStore, err)
-	}
-	key := dk.Plaintext
-	m.mu.Lock()
-	d := &dek{id: dekID, wrapped: dk.Wrapped, kekVersion: dk.KEKVersion, key: &key, createdAt: m.cfg.Clock.Now()}
-	t.deks[dekID] = d
-	t.active = d
-	m.mu.Unlock()
-	m.cfg.Audit.Audit(Audit{At: m.cfg.Clock.Now(), Tenant: t.spec.ID, Op: "generate", Outcome: "ok", KEKVersion: dk.KEKVersion, Class: OK, Latency: latency})
-	return nil
-}
-
-// DecryptKey returns a copy of the named DEK; ErrPoison for a dek_id the tenant does not own; it never blocks and never calls a KMS.
+// DecryptKey checks the lease now and returns a copy of the named DEK; ErrPoison for a dek_id the tenant does not
+// own [SC-F8]; it never blocks and never calls a KMS.
 func (m *Manager) DecryptKey(id, dekID string) (Handle, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	t := m.tenants[id]
 	if t == nil {
 		return Handle{}, ErrPoison
 	}
+	now := m.cfg.Clock.Now()
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	d := t.deks[dekID]
 	if d == nil {
 		return Handle{}, ErrPoison
 	}
+	switch t.state {
+	case Revoked:
+		return Handle{}, ErrKeyRevoked
+	case KeyUnavailable:
+		return Handle{}, ErrLeaseExpired
+	}
+	if !t.lease.Usable(now) {
+		return Handle{}, ErrLeaseExpired
+	}
 	if d.key == nil {
 		return Handle{}, ErrDEKCold
 	}
-	return Handle{DEKID: dekID, ValidUntil: farFuture(), key: *d.key}, nil
+	return Handle{DEKID: dekID, ValidUntil: t.lease.SentAt.Add(m.cfg.Lease - m.cfg.EarlyExpiry), key: *d.key}, nil
 }
 
-// Hot reports whether the scheduler may dispatch the tenant now (M1: always).
-func (m *Manager) Hot(id string) bool { return true }
+// Hot reports whether the scheduler may dispatch the tenant now (ACTIVE or RIDING_THROUGH, usable lease, no pending
+// unwrap); an ACTIVE tenant with backlog whose lease is soft-due or lapsed gets one lazy renewal (the L3 kick).
+func (m *Manager) Hot(id string) bool {
+	t := m.tenants[id]
+	if t == nil {
+		return false
+	}
+	now := m.cfg.Clock.Now()
+	t.mu.Lock()
+	usable := t.lease.Usable(now)
+	hot := (t.state == Active || t.state == RidingThrough) && usable && len(t.pending) == 0
+	kick := t.state == Active && !t.probing && (!usable || t.lease.SoftDue(now))
+	if kick {
+		t.probing = true
+	}
+	t.mu.Unlock()
+	if kick {
+		m.cfg.Spawn(func() { m.probe(t) })
+	}
+	return hot
+}
 
-// Warm records that a worker needs a purged DEK (M1: no-op; nothing purges).
-func (m *Manager) Warm(id, dekID string) {}
+// Warm records that a worker needs a purged DEK and, when no probe or warm is running, starts one unwrap; retries
+// follow the backoff schedule from Tick. Hot stays false for the tenant until the unwrap succeeds or is denied [SC-F5].
+func (m *Manager) Warm(id, dekID string) {
+	t := m.tenants[id]
+	if t == nil {
+		return
+	}
+	now := m.cfg.Clock.Now()
+	t.mu.Lock()
+	d := t.deks[dekID]
+	if d == nil {
+		t.mu.Unlock()
+		return
+	}
+	if _, ok := t.pending[dekID]; ok {
+		t.mu.Unlock()
+		return
+	}
+	t.pending[dekID] = now
+	kick := !t.probing && (t.state == Active || t.state == RidingThrough) && t.lease.Usable(now)
+	if kick {
+		t.probing = true
+	}
+	t.mu.Unlock()
+	if kick {
+		m.cfg.Spawn(func() { m.warm(t, d) })
+	}
+}
 
-// Tick runs lease expiry, purges and probes (M1: no-op); the World sweep calls it every SweepInterval.
-func (m *Manager) Tick(now time.Time) {}
+// Tick runs lease expiry, purges, DEK ageing, due probes and due warm retries for every tenant; the World sweep
+// calls it every SweepInterval. It holds one t.mu at a time and spawns that tenant's due work after its unlock.
+func (m *Manager) Tick(now time.Time) {
+	for _, t := range m.order {
+		var due func()
+		t.mu.Lock()
+		// 1. lease lapse: drop every plaintext; RIDING_THROUGH fails closed, ACTIVE stays ACTIVE (idle lapse)
+		if !t.lease.SentAt.IsZero() && !t.lease.Usable(now) && t.hot() > 0 {
+			purged := t.purge()
+			if t.state == RidingThrough {
+				m.setState(t, KeyUnavailable, now, fmtPurged("lease expired", purged), purged)
+			} else {
+				m.audit(Audit{At: now, Tenant: t.spec.ID, Op: "purge", Outcome: "idle", Detail: "lease lapsed with no traffic", Purged: purged})
+			}
+		}
+		// 2. DEK ageing applies only to non-active DEKs [SC-F3]
+		for _, d := range t.deks {
+			if d != t.active && d.key != nil && now.Sub(d.hotSince) >= m.cfg.DEKMaxAge+m.cfg.Lease {
+				*d.key = [32]byte{}
+				d.key = nil
+				m.audit(Audit{At: now, Tenant: t.spec.ID, Op: "purge", Outcome: "aged", Detail: d.id, Purged: 1})
+			}
+		}
+		// 3. due probe (never for an ACTIVE tenant: Q4) or due warm
+		switch {
+		case (t.state == RidingThrough || t.state == KeyUnavailable || t.state == Revoked) && !t.probing && !now.Before(t.nextProbeAt):
+			t.probing = true
+			due = func() { m.probe(t) }
+		case (t.state == Active || t.state == RidingThrough) && t.lease.Usable(now) && !t.probing:
+			for id, at := range t.pending {
+				if d := t.deks[id]; d != nil && !now.Before(at) {
+					t.probing = true
+					due = func() { m.warm(t, d) }
+					break
+				}
+			}
+		}
+		t.mu.Unlock()
+		if due != nil {
+			m.cfg.Spawn(due)
+		}
+	}
+}
 
-// States copies each tenant's State into dst in grid order (M1: every tenant is Active).
+func fmtPurged(why string, n int) string { return why + ", " + strconv.Itoa(n) + " DEKs purged" }
+
+// Info returns the tenant read model.
+func (m *Manager) Info(id string) TenantInfo {
+	t := m.tenants[id]
+	if t == nil {
+		return TenantInfo{}
+	}
+	now := m.cfg.Clock.Now()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	info := TenantInfo{State: t.state, DEKs: len(t.deks), HotDEKs: t.hot(), Pending: len(t.pending), Attempt: t.attempt, Waiters: t.waiters, Probing: t.probing}
+	if !t.lease.SentAt.IsZero() {
+		info.LeaseAge = now.Sub(t.lease.SentAt)
+		if rem := t.lease.Remaining(now); rem > 0 {
+			info.LeaseRemaining = rem
+		}
+	}
+	if t.state != Active && t.nextProbeAt.After(now) {
+		info.NextProbeIn = t.nextProbeAt.Sub(now)
+	}
+	if t.active != nil {
+		info.ActiveDEK = t.active.id
+	}
+	return info
+}
+
+// States copies each tenant's State into dst in grid order without taking any tenant lock.
 func (m *Manager) States(dst []State) {
 	for i := range dst {
-		dst[i] = Active
+		if i < len(m.states) {
+			dst[i] = State(m.states[i].Load())
+		}
 	}
+}
+
+// Inflight returns the KMS calls currently inside a provider (for the slow-KMS tile).
+func (m *Manager) Inflight(provider string) int {
+	if c := m.inflight[provider]; c != nil {
+		return int(c.Load())
+	}
+	return 0
 }
