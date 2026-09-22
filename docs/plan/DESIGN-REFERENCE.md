@@ -21,7 +21,7 @@ The milestone plans (M0.md–M6.md) are written against this reference and amend
 | Scenarios | `ScenarioTailMin/Max` are M3 Params (the tail itself is M4's); `ErrUnknownScenario` (404); the traffic handler rejects `multiplier ≤ 0` (400); `Recovered` uses `DrainSlack = Workers × ClaimBatch` instead of 0 | M3, M4 |
 | Metrics | `Registry.Affected(idx)`, `Timeline(text)`, `SetCleared`/`Recovered`, `DetectedRevokedAt`; p99 with linear interpolation inside the bucket (M4 Decision) | M4, M5 |
 | Checker | `check.Deliveries` gains `Delivered(idx)` (S3 `sinceSeq` initialisation); `check.Config{L1, L4 bool}` judge flags from the new `Params.Lights`; `Capacity` = the plateau measured in M4 × `L4CapacityFactor` | M5 |
-| CI | The no-globals grep is `grep -n '^var ' internal/ \| grep -vi err` (cmek's lowercase `errBusy`); the cmek import check's regex is `[a-z0-9/]+$` | M2, M4 |
+| CI | The no-globals grep is `grep -n '^var ' internal/ \| grep -vi err` (cmek's lowercase `errBusy`); the cmek import check's regex is `[a-z0-9./]+$` (the dot admits go1.26's `crypto/internal/entropy/v1.0.0`; amended in M1) | M2, M4 |
 | Milestone table | M0 ≈ 141 lines; M1 ≈ 1,209 with `Reclaim` deferred to M5 and the tenant-detail cut expected; M2 ≈ 658 with the slow-azure rows and `inflight{}` deferred to M4; M3 ≈ 311; M4 ≈ 834 (+50 conditional); M5 ≈ 336 nominal with L1/L4 expected to land in the buffer | M0–M5 |
 
 ## Package dependency graph
