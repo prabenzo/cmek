@@ -19,7 +19,7 @@ The milestone plans (M0.md–M6.md) are written against this reference and amend
 | Snapshot | `ingest_ps.internal` (must stay 0); `events[]{seq,at,text}`; `inflight{}` built in M4 via `metrics.InflightSource`/`Config.Inflight` | M1, M2, M4 |
 | Measurement | M1 fallback trigger is `insert_mean_us > 300` only (`insert_max_us` is informational: WAL checkpoints dominate it) | M1 |
 | Admission | `Gate.Admit(idx) (within bool, err error)`: the share class comes from the same `Backlog(idx)` read as the shed decision | M3 |
-| Scheduler | `SchedLightTurns` default 32, not 4 (stability bound L > ≈ 18 during the global surge); `Store.Dead` also decrements `backlogged` when a backlog hits 0 | M3 |
+| Scheduler | `SchedLightTurns` default 32, not 4 (stability bound L > ≈ 18 during the global surge); `Store.Dead` also decrements `backlogged` when a backlog hits 0 (landed in M1, TIMELOG) | M3 (M1) |
 | Scenarios | `ScenarioTailMin/Max` are M3 Params (the tail itself is M4's); `ErrUnknownScenario` (404); the traffic handler rejects `multiplier ≤ 0` (400); `Recovered` uses `DrainSlack = Workers × ClaimBatch` instead of 0 | M3, M4 |
 | Metrics | `Registry.Affected(idx)`, `Timeline(text)`, `SetCleared`/`Recovered`, `DetectedRevokedAt`; p99 with linear interpolation inside the bucket (M4 Decision) | M4, M5 |
 | Checker | `check.Deliveries` gains `Delivered(idx)` (S3 `sinceSeq` initialisation); `check.Config{L1, L4 bool}` judge flags from the new `Params.Lights`; `Capacity` = the plateau measured in M4 × `L4CapacityFactor` | M5 |

@@ -23,7 +23,7 @@ These are the build plans for the seven milestones in `docs/SPEC.md › Plan and
 | M0 Skeleton and deploy | 0:00–0:20 | [M0.md](M0.md) | [x] 2026-09-21, PR #1 review | all three as recommended |
 | M1 Data path | 0:20–1:05 (expected ≈ 1:11) | [M1.md](M1.md) | [x] 2026-09-22, chat | Ben reviews the tests only (Claude writes envelope, tests and the load script); every other decision as recommended |
 | M2 CMEK core | 1:05–1:50 | [M2.md](M2.md) | [x] 2026-09-22, chat | Claude writes all the code and tests (Ben reviews at his pickup); Manager locking: per-tenant mutexes; every other decision as recommended |
-| M3 Admission and surges | 1:50–2:20 | [M3.md](M3.md) | [ ] | |
+| M3 Admission and surges | 1:50–2:20 | [M3.md](M3.md) | [x] 2026-09-22, chat | Claude writes all the code (drafts the two-class `Next`, runs both ×10 runs, writes the test lines and the slack item; Ben reviews at his pickup); every decision as recommended |
 | M4 UI and scenarios | 2:20–3:15 | [M4.md](M4.md) | [ ] | |
 | M5 Checker and hardening | 3:15–3:40 | [M5.md](M5.md) | [ ] | |
 | M6 Rationale | 3:40–4:25 | [M6.md](M6.md) | [ ] | |
@@ -40,6 +40,7 @@ These are the build plans for the seven milestones in `docs/SPEC.md › Plan and
 | D9 fallback: one always-on instance, instance-based billing | M0, ARCH-NOTES 1 | taken (viewer count could not be made honest on Cloud Run; ARCH-NOTES 11) | chat, 2026-09-22 |
 | M1: nonce source, DBDir + Deps.ID, measurement trigger, insert strategy, M1 tests, load generator shape, id allocation, audit storage, Retry-After, provider mapping, grid encoding, 202 body id | M1 | all as recommended; "who writes" changed: Claude writes everything, Ben reviews the tests only | chat, 2026-09-22 |
 | M2: cold-fetch edge, M2 split, slow-azure rows, walk extras, tenant/waiter cap full, Manager locking | M2 | Manager locking: per-tenant mutexes (the alternative); M2 split: Claude writes all of `internal/cmek` and every test, Ben reviews at his pickup and writes no tests (so the M5 walk extras' owner is Claude); the rest as recommended | chat, 2026-09-22 |
+| M3: scheduler class (recorded above), global-surge cap visibility, M3 slack use, scenario targets (the surge half), who drafts the two-class `Next` | M3 | all as recommended; Claude writes all of M3 (Ben reviews at his pickup), so "who drafts `Next`" resolves to Claude and the slack use (`Expire`, then `Census`, compiled and unwired) is spent on Claude's lane, there being no Ben lane | chat, 2026-09-22 |
 
 ## Working asynchronously
 
@@ -53,7 +54,7 @@ Ben reviewed the time commitments as fine but will work asynchronously, not to t
 ## Ground rules carried into every plan
 
 - **Budget.** 3:40 build, 0:45 rationale, 0:20 buffer (D5, D8). Each plan stays inside its box, names the minute and the signal at which its cut line is taken, and starts its clock from the actual start time recorded in `docs/TIMELOG.md` (created in M0, one row per box, filled at every boundary).
-- **Ownership.** Ben writes or line-reviews every line of `internal/cmek`, drafts the two-class scheduler pass and the checker's data statements, and reviews the queue's claim/release code, the KMS interface, ingest, holder and world wiring, and the checker's verdict rules. Claude drafts the rest at Ben's direction. Every file header carries its owner.
+- **Ownership.** Ben writes or line-reviews every line of `internal/cmek`, drafts the two-class scheduler pass (M3's approval moves that draft to Claude, with Ben reviewing it, 2026-09-22) and the checker's data statements, and reviews the queue's claim/release code, the KMS interface, ingest, holder and world wiring, and the checker's verdict rules. Claude drafts the rest at Ben's direction. Every file header carries its owner.
 - **Two lanes, one repo.** Claude pushes at fixed minutes; Ben pulls, writes his files and review fixes, and pushes; one writer per file at a time. The plans say `main`; the branch convention during the build is Ben's call (these plans themselves are on `claude/epic-rubin-kgewov`).
 - **Machines.** `go build`, `go vet`, `go test` and curl checks run in the session. `docker build`, `docker push`, `gcloud run deploy`, the browser checks, the recording and the transcript exports are Ben's on his laptop; the planning session had no Docker daemon, no gcloud and no browser.
 - **Toolchain.** `go 1.26` in go.mod and `golang:1.26` in the Dockerfile: the pinned `golang.org/x/sync v0.23.0` and `golang.org/x/time v0.16.0` require it (verified by a build in the session; `modernc.org/sqlite v1.59.0`, SQLite 3.53.4, WAL mode, `RETURNING` and `json_each` all verified too).
