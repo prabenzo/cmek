@@ -1,0 +1,133 @@
+// Owner: Claude (reviewed by Ben)
+package cmek
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"time"
+
+	"github.com/prabenzo/cmek/internal/kms"
+)
+
+// State is a tenant's key state.
+type State uint8
+
+const (
+	Active State = iota
+	RidingThrough
+	KeyUnavailable
+	Revoked
+)
+
+// String returns ACTIVE, RIDING_THROUGH, KEY_UNAVAILABLE or REVOKED.
+func (s State) String() string {
+	switch s {
+	case Active:
+		return "ACTIVE"
+	case RidingThrough:
+		return "RIDING_THROUGH"
+	case KeyUnavailable:
+		return "KEY_UNAVAILABLE"
+	case Revoked:
+		return "REVOKED"
+	}
+	return "UNKNOWN"
+}
+
+// Class sorts a KMS outcome into the four treatments of the down-versus-revoked table.
+type Class uint8
+
+const (
+	OK Class = iota
+	Transient
+	Deny
+	Poison
+)
+
+// Envelope is one message's ciphertext plus what is needed to open it; AAD is derived, never stored.
+type Envelope struct {
+	DEKID      string
+	Nonce      [12]byte
+	Ciphertext []byte
+}
+
+// Handle is a copy of one plaintext DEK, usable until ValidUntil; Zero wipes it.
+type Handle struct {
+	DEKID      string
+	ValidUntil time.Time
+	key        [32]byte
+}
+
+// Zero wipes the key bytes.
+func (h *Handle) Zero() { h.key = [32]byte{} }
+
+// WrappedDEK is what DEKStore persists: wrapped bytes only.
+type WrappedDEK struct {
+	ID, Tenant, KEKID string
+	KEKVersion        int
+	Wrapped           []byte
+	CreatedAt         time.Time
+}
+
+// Audit is one line of the per-tenant audit log and the source of the timeline.
+type Audit struct {
+	At                          time.Time
+	Tenant, Op, Outcome, Detail string
+	KEKVersion                  int
+	Class                       Class
+	From, To                    State
+	Latency                     time.Duration
+	Purged                      int
+}
+
+// TenantInfo is the read model for GET /v1/tenants/{id} and grid hover.
+type TenantInfo struct {
+	State                                    State
+	LeaseAge, LeaseRemaining, NextProbeIn    time.Duration
+	ActiveDEK                                string
+	DEKs, HotDEKs, Pending, Attempt, Waiters int
+	Probing                                  bool
+}
+
+// TenantSpec is the immutable per-tenant wiring, given in grid order.
+type TenantSpec struct {
+	ID, Provider, KEKID string
+}
+
+var ErrKeyUnavailable = errors.New("cmek: key unavailable") // ingest: parked, cold fetch failed transiently, or bulkhead/waiter cap full
+var ErrKeyRevoked = errors.New("cmek: key revoked")         // ingest or decrypt: authoritative deny
+var ErrLeaseExpired = errors.New("cmek: lease expired")     // decrypt: no usable lease now; seal: stale handle
+var ErrDEKCold = errors.New("cmek: dek not cached")         // decrypt: lease usable, plaintext DEK missing
+var ErrPoison = errors.New("cmek: authentication failed")   // open: GCM tag mismatch; decrypt: unknown or foreign dek_id
+
+// DEKStore persists wrapped DEKs; implemented by *queue.Store.
+type DEKStore interface {
+	PutDEK(ctx context.Context, d WrappedDEK) error
+}
+
+// Auditor receives every KMS call, purge and state change; implemented by world's bridge to metrics.
+type Auditor interface{ Audit(e Audit) }
+
+// Clock is the only time source the core reads.
+type Clock interface{ Now() time.Time }
+
+// Jitter is the only randomness the core reads (backoff); nonces come from crypto/rand inside Seal.
+type Jitter interface{ Float64() float64 }
+
+// Config carries the lease parameters and injected dependencies; zero Spawn means go f().
+type Config struct {
+	Tenants   []TenantSpec
+	Providers []string
+	Keys      kms.KMS
+	Store     DEKStore
+	Audit     Auditor
+	Clock     Clock
+	Jitter    Jitter
+	Spawn     func(func()) // tests pass func(f func()) { f() }
+	Logger    *slog.Logger // optional; every KMS and store error is logged (throttled to one line per second per message)
+
+	Lease, SoftTTL, EarlyExpiry, KMSTimeout, BackoffMin, BackoffMax, RevokedReprobe, DEKMaxAge, SweepInterval time.Duration
+	BackoffJitter                                                                                             float64
+	DEKMaxMessages, ProviderInflight, TenantInflight, IngestWaiters                                           int
+}

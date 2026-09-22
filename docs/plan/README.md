@@ -21,8 +21,8 @@ These are the build plans for the seven milestones in `docs/SPEC.md › Plan and
 | Milestone | Clock | Plan | Approved by Ben | Decisions changed |
 | --- | --- | --- | --- | --- |
 | M0 Skeleton and deploy | 0:00–0:20 | [M0.md](M0.md) | [x] 2026-09-21, PR #1 review | all three as recommended |
-| M1 Data path | 0:20–1:05 (expected ≈ 1:11) | [M1.md](M1.md) | [ ] | |
-| M2 CMEK core | 1:05–1:50 | [M2.md](M2.md) | [ ] | |
+| M1 Data path | 0:20–1:05 (expected ≈ 1:11) | [M1.md](M1.md) | [x] 2026-09-22, chat | Ben reviews the tests only (Claude writes envelope, tests and the load script); every other decision as recommended |
+| M2 CMEK core | 1:05–1:50 | [M2.md](M2.md) | [x] 2026-09-22, chat | Claude writes all the code and tests (Ben reviews at his pickup); Manager locking: per-tenant mutexes; every other decision as recommended |
 | M3 Admission and surges | 1:50–2:20 | [M3.md](M3.md) | [ ] | |
 | M4 UI and scenarios | 2:20–3:15 | [M4.md](M4.md) | [ ] | |
 | M5 Checker and hardening | 3:15–3:40 | [M5.md](M5.md) | [ ] | |
@@ -38,6 +38,8 @@ These are the build plans for the seven milestones in `docs/SPEC.md › Plan and
 | Stale-OK guard | ARCHITECTURE.md, M2 | as recommended (keep the guard) | PR #1 review, 2026-09-21 |
 | M0: deploy path, cross-compiling builder stage, tick burn | M0 | all as recommended | PR #1 review, 2026-09-21 |
 | D9 fallback: one always-on instance, instance-based billing | M0, ARCH-NOTES 1 | taken (viewer count could not be made honest on Cloud Run; ARCH-NOTES 11) | chat, 2026-09-22 |
+| M1: nonce source, DBDir + Deps.ID, measurement trigger, insert strategy, M1 tests, load generator shape, id allocation, audit storage, Retry-After, provider mapping, grid encoding, 202 body id | M1 | all as recommended; "who writes" changed: Claude writes everything, Ben reviews the tests only | chat, 2026-09-22 |
+| M2: cold-fetch edge, M2 split, slow-azure rows, walk extras, tenant/waiter cap full, Manager locking | M2 | Manager locking: per-tenant mutexes (the alternative); M2 split: Claude writes all of `internal/cmek` and every test, Ben reviews at his pickup and writes no tests (so the M5 walk extras' owner is Claude); the rest as recommended | chat, 2026-09-22 |
 
 ## Working asynchronously
 
