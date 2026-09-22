@@ -128,11 +128,16 @@ func New(p Params, d Deps) (*World, error) {
 		return nil, err
 	}
 	w.store = store
-	w.keys = cmek.New(ctx, cmek.Config{Tenants: specs, Providers: p.Providers, Keys: w.kms, Store: store, Audit: auditBridge{w}, Clock: d.Clock, Jitter: jitter{w}, Logger: w.log, KMSTimeout: p.KMSTimeout, SweepInterval: p.SweepInterval})
+	w.keys = cmek.New(ctx, cmek.Config{
+		Tenants: specs, Providers: p.Providers, Keys: w.kms, Store: store, Audit: auditBridge{w}, Clock: d.Clock, Jitter: jitter{w}, Logger: w.log,
+		Lease: p.Lease, SoftTTL: p.SoftTTL, EarlyExpiry: p.EarlyExpiry, KMSTimeout: p.KMSTimeout, BackoffMin: p.BackoffMin, BackoffMax: p.BackoffMax,
+		BackoffJitter: p.BackoffJitter, RevokedReprobe: p.RevokedReprobe, DEKMaxAge: p.DEKMaxAge, DEKMaxMessages: p.DEKMaxMessages,
+		ProviderInflight: p.ProviderInflight, TenantInflight: p.TenantInflight, IngestWaiters: p.IngestWaiters, SweepInterval: p.SweepInterval,
+	})
 	w.sink = traffic.NewSink(traffic.SinkConfig{Tenants: w.ids, MinLatency: p.SinkLatencyMin, MaxLatency: p.SinkLatencyMax, Ring: p.SinkRing, CanaryPrefix: p.CanaryPrefix, Clock: d.Clock, Rand: w.rnd, Lock: &w.rndMu})
 	w.gen = traffic.NewGenerator(traffic.GeneratorConfig{Tenants: w.ids, Rates: rates, PayloadBytes: p.PayloadBytes, CanaryPrefix: p.CanaryPrefix, Ingest: w, Clock: d.Clock, Rand: w.rnd, Lock: &w.rndMu})
 	capacity := float64(p.Workers) / ((p.SinkLatencyMin + p.SinkLatencyMax) / 2).Seconds()
-	w.metrics = metrics.New(metrics.Config{Tenants: w.ids, Providers: p.Providers, Grid: &gridAdapter{w: w, buf: make([]cmek.State, n)}, Backlog: store, Offered: w.gen, Watcher: watcher{w}, Clock: d.Clock, Interval: p.SnapshotInterval, AuditRing: p.AuditRing, ViewerQueue: p.ViewerQueue, Capacity: capacity, WorldID: d.ID})
+	w.metrics = metrics.New(metrics.Config{Tenants: w.ids, Providers: p.Providers, Grid: &gridAdapter{w: w, buf: make([]cmek.State, n)}, Backlog: store, Offered: w.gen, Watcher: watcher{w}, Clock: d.Clock, Interval: p.SnapshotInterval, AuditRing: p.AuditRing, TimelineRing: p.TimelineRing, SnapshotEvents: p.SnapshotEvents, ViewerQueue: p.ViewerQueue, Capacity: capacity, WorldID: d.ID})
 	w.sched = queue.NewScheduler(queue.SchedulerConfig{Store: store, Gate: w.keys, Tenants: w.ids})
 	w.workers = queue.NewWorkers(queue.WorkersConfig{Store: store, Sched: w.sched, Keys: w.keys, Sink: w.sink, Recorder: w.metrics, Clock: d.Clock, Tenants: w.ids, Workers: p.Workers, ClaimBatch: p.ClaimBatch, ClaimTimeout: p.ClaimTimeout, IdlePoll: p.IdlePoll, Logger: w.log})
 	attrs := []any{"tenants", n}
@@ -285,7 +290,79 @@ func (w *World) Tenant(id string) (TenantDetail, error) {
 	if !ok {
 		return TenantDetail{}, ErrUnknownTenant
 	}
-	states := make([]cmek.State, w.P.Tenants)
-	w.keys.States(states)
-	return TenantDetail{ID: id, Provider: w.P.Providers[idx*len(w.P.Providers)/w.P.Tenants], State: states[idx].String(), Rank: w.rankOf[idx], Backlog: w.store.Backlog(idx), Ready: w.store.Ready(idx), OfferedPS: w.gen.Offered(idx), Audit: []metrics.Audit{}}, nil
+	info := w.keys.Info(id)
+	return TenantDetail{ID: id, Provider: w.P.Providers[idx*len(w.P.Providers)/w.P.Tenants], State: info.State.String(), Rank: w.rankOf[idx],
+		LeaseAgeMs: info.LeaseAge.Milliseconds(), LeaseRemainingMs: info.LeaseRemaining.Milliseconds(), NextProbeMs: info.NextProbeIn.Milliseconds(),
+		Backlog: w.store.Backlog(idx), Ready: w.store.Ready(idx), OfferedPS: w.gen.Offered(idx), Audit: []metrics.Audit{}}, nil
+}
+
+// FaultRequest is the flat body of POST /v1/faults: one of Provider or Tenant, plus a mode and optional latency
+// and error rate (zero fields inherit). Manual faults never touch the affected set; only scenarios do (M3).
+type FaultRequest struct {
+	Provider     string  `json:"provider,omitempty"`
+	Tenant       string  `json:"tenant,omitempty"`
+	Mode         string  `json:"mode,omitempty"` // "", "ok" or "fast_fail"
+	LatencyP50Ms int     `json:"latency_p50_ms,omitempty"`
+	LatencyP99Ms int     `json:"latency_p99_ms,omitempty"`
+	ErrorRate    float64 `json:"error_rate,omitempty"`
+}
+
+// ErrBadFault is a fault request the World refuses (400).
+var ErrBadFault = errors.New("world: bad fault request")
+
+// Fault validates the request and installs it in the fake KMS; a body with mode "ok" and no latency clears the scope.
+func (w *World) Fault(f FaultRequest) error {
+	var scope kms.Scope
+	switch {
+	case f.Provider != "" && f.Tenant != "":
+		return fmt.Errorf("%w: provider or tenant, not both", ErrBadFault)
+	case f.Provider != "":
+		known := false
+		for _, p := range w.P.Providers {
+			known = known || p == f.Provider
+		}
+		if !known {
+			return fmt.Errorf("%w: unknown provider %q", ErrBadFault, f.Provider)
+		}
+		scope.Provider = f.Provider
+	case f.Tenant != "":
+		if _, ok := w.index[f.Tenant]; !ok {
+			return ErrUnknownTenant
+		}
+		scope.KEKID = "kek-" + f.Tenant
+	default:
+		return fmt.Errorf("%w: provider or tenant required", ErrBadFault)
+	}
+	var fault kms.Fault
+	switch f.Mode {
+	case "", "ok":
+	case "fast_fail":
+		fault.Mode = kms.ModeFastFail
+	default:
+		return fmt.Errorf("%w: unknown mode %q", ErrBadFault, f.Mode)
+	}
+	if f.LatencyP50Ms < 0 || f.LatencyP99Ms < f.LatencyP50Ms || f.ErrorRate < 0 || f.ErrorRate > 1 {
+		return fmt.Errorf("%w: 0 ≤ p50 ≤ p99 and 0 ≤ error_rate ≤ 1", ErrBadFault)
+	}
+	fault.P50, fault.P99, fault.ErrorRate = time.Duration(f.LatencyP50Ms)*time.Millisecond, time.Duration(f.LatencyP99Ms)*time.Millisecond, f.ErrorRate
+	w.kms.SetFault(scope, fault)
+	w.log.Info("fault", "provider", f.Provider, "tenant", f.Tenant, "mode", f.Mode, "p50_ms", f.LatencyP50Ms, "p99_ms", f.LatencyP99Ms, "error_rate", f.ErrorRate)
+	return nil
+}
+
+// SetKey maps "revoke" / "restore" to the fake KMS's Revoke / Restore of the tenant's KEK.
+func (w *World) SetKey(tenant, action string) error {
+	if _, ok := w.index[tenant]; !ok {
+		return ErrUnknownTenant
+	}
+	switch action {
+	case "revoke":
+		w.kms.Revoke("kek-" + tenant)
+	case "restore":
+		w.kms.Restore("kek-" + tenant)
+	default:
+		return fmt.Errorf("%w: unknown action %q", ErrBadFault, action)
+	}
+	w.log.Info("key", "tenant", tenant, "action", action)
+	return nil
 }

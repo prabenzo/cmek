@@ -25,6 +25,53 @@ func (s *server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/stream", s.stream)
 	mux.HandleFunc("POST /v1/events", s.events)
 	mux.HandleFunc("GET /v1/tenants/{id}", s.tenant)
+	mux.HandleFunc("POST /v1/faults", s.faults)
+	mux.HandleFunc("POST /v1/tenants/{id}/key", s.key)
+}
+
+// faults is POST /v1/faults: install or clear a fault on a provider or a tenant (204; 400 bad_request; 404 unknown_tenant).
+func (s *server) faults(rw http.ResponseWriter, r *http.Request) {
+	var req world.FaultRequest
+	if err := json.NewDecoder(http.MaxBytesReader(rw, r.Body, maxBody)).Decode(&req); err != nil {
+		writeJSON(rw, http.StatusBadRequest, errorBody{Error: "bad_request"})
+		return
+	}
+	w, release := s.holder.Ensure()
+	defer release()
+	if w == nil {
+		writeJSON(rw, http.StatusServiceUnavailable, errorBody{Error: "no_world"})
+		return
+	}
+	s.controlOutcome(rw, w.Fault(req), req.Tenant)
+}
+
+// key is POST /v1/tenants/{id}/key {"action":"revoke"|"restore"} (204; 400; 404).
+func (s *server) key(rw http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Action string `json:"action"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(rw, r.Body, maxBody)).Decode(&req); err != nil {
+		writeJSON(rw, http.StatusBadRequest, errorBody{Error: "bad_request"})
+		return
+	}
+	w, release := s.holder.Ensure()
+	defer release()
+	if w == nil {
+		writeJSON(rw, http.StatusServiceUnavailable, errorBody{Error: "no_world"})
+		return
+	}
+	s.controlOutcome(rw, w.SetKey(r.PathValue("id"), req.Action), r.PathValue("id"))
+}
+
+func (s *server) controlOutcome(rw http.ResponseWriter, err error, tenant string) {
+	switch {
+	case err == nil:
+		rw.WriteHeader(http.StatusNoContent)
+	case errors.Is(err, world.ErrUnknownTenant):
+		writeJSON(rw, http.StatusNotFound, errorBody{Error: "unknown_tenant", Tenant: tenant})
+	default:
+		writeJSON(rw, http.StatusBadRequest, errorBody{Error: "bad_request", Tenant: tenant})
+	}
 }
 
 // health is GET /health: liveness plus the tick counter and the M1 insert instrument; it never builds a World.

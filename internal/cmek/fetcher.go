@@ -168,8 +168,8 @@ func (m *Manager) apply(t *tenant, op string, d *dek, r result) {
 	case Deny:
 		m.audit(Audit{At: now, Tenant: t.spec.ID, Op: auditOp, Outcome: "denied", Detail: r.err.Error(), Class: Deny, Latency: r.latency})
 		purged := t.purge()
-		t.deniedAt = now // every deny: the stale-OK guard needs the latest
-		t.lease = Lease{}
+		t.deniedAt = now                              // every deny: the stale-OK guard needs the latest
+		t.lease.SentAt = time.Time{}                  // no lease (the TTLs are configuration and stay)
 		t.nextProbeAt = now.Add(m.cfg.RevokedReprobe) // fixed period, no jitter; attempt untouched
 		if t.state != Revoked {
 			m.setState(t, Revoked, now, fmt.Sprintf("%d DEKs purged", purged), purged)
