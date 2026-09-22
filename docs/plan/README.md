@@ -37,6 +37,7 @@ These are the build plans for the seven milestones in `docs/SPEC.md › Plan and
 | Provider bulkhead full | ARCHITECTURE.md, M2 | as recommended (wait within the call deadline) | PR #1 review, 2026-09-21 |
 | Stale-OK guard | ARCHITECTURE.md, M2 | as recommended (keep the guard) | PR #1 review, 2026-09-21 |
 | M0: deploy path, cross-compiling builder stage, tick burn | M0 | all as recommended | PR #1 review, 2026-09-21 |
+| D9 fallback: one always-on instance, instance-based billing | M0, ARCH-NOTES 1 | taken (viewer count could not be made honest on Cloud Run; ARCH-NOTES 11) | chat, 2026-09-22 |
 
 ## Working asynchronously
 
