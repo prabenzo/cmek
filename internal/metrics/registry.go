@@ -91,12 +91,12 @@ type Registry struct {
 	hub   *hub
 	ticks atomic.Int64
 
-	ingest    [reasonCount]atomic.Int64 // per tick
-	delivered atomic.Int64              // per tick
-	kms       [3]atomic.Int64           // per tick: ok, transient, deny
-	rejWithin atomic.Int64              // per tick: admission rejections of within-share tenants (the L4 split)
-	rejOver   atomic.Int64              // per tick: admission rejections of over-share tenants
-	overWithn atomic.Int64              // cumulative: overloaded rejections of within-share tenants (L4 judges it)
+	ingest     [reasonCount]atomic.Int64 // per tick
+	delivered  atomic.Int64              // per tick
+	kms        [3]atomic.Int64           // per tick: ok, transient, deny
+	rejWithin  atomic.Int64              // per tick: admission rejections of within-share tenants (the L4 split)
+	rejOver    atomic.Int64              // per tick: admission rejections of over-share tenants
+	overWithin atomic.Int64              // cumulative: overloaded rejections of within-share tenants (L4 judges it)
 
 	mu        sync.Mutex
 	audits    [][]Audit // per tenant ring
@@ -194,7 +194,7 @@ func (r *Registry) Ingest(idx int, reason string, withinShare bool) {
 		if withinShare {
 			r.rejWithin.Add(1)
 			if i == reasonOverloaded {
-				r.overWithn.Add(1)
+				r.overWithin.Add(1)
 			}
 		} else {
 			r.rejOver.Add(1)
@@ -203,7 +203,7 @@ func (r *Registry) Ingest(idx int, reason string, withinShare bool) {
 }
 
 // OverloadedWithinShare is the cumulative count of overloaded rejections dealt to within-share tenants (L4: must stay 0).
-func (r *Registry) OverloadedWithinShare() int64 { return r.overWithn.Load() }
+func (r *Registry) OverloadedWithinShare() int64 { return r.overWithin.Load() }
 
 // SetScenario publishes the card countdown; an empty name clears it; a zero endsAt means an open-ended phase.
 func (r *Registry) SetScenario(name, phase string, endsAt time.Time) {

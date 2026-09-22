@@ -77,7 +77,8 @@ func (s *server) scenarioStart(rw http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// scenarioStop is POST /v1/scenarios/{name}/stop: cancels whatever runs and returns 200, also while idle.
+// scenarioStop is POST /v1/scenarios/{name}/stop: cancels whatever runs and returns 200 with the name of the
+// scenario that was actually stopped ("" while idle), whatever the path said.
 func (s *server) scenarioStop(rw http.ResponseWriter, r *http.Request) {
 	w, release := s.holder.Ensure()
 	defer release()
@@ -85,8 +86,7 @@ func (s *server) scenarioStop(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusServiceUnavailable, errorBody{Error: "no_world"})
 		return
 	}
-	w.StopScenario()
-	writeJSON(rw, http.StatusOK, map[string]string{"scenario": r.PathValue("name")})
+	writeJSON(rw, http.StatusOK, map[string]string{"scenario": w.StopScenario()})
 }
 
 // faults is POST /v1/faults: install or clear a fault on a provider or a tenant (204; 400 bad_request; 404 unknown_tenant).

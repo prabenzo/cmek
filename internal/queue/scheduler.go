@@ -31,8 +31,13 @@ type Scheduler struct {
 	cfg     SchedulerConfig
 }
 
-// NewScheduler builds the ring.
-func NewScheduler(cfg SchedulerConfig) *Scheduler { return &Scheduler{cfg: cfg} }
+// NewScheduler builds the ring; TwoClass needs a Share and LightTurns ≥ 1, otherwise the pass is the M1 ring.
+func NewScheduler(cfg SchedulerConfig) *Scheduler {
+	if cfg.Share == nil || cfg.LightTurns < 1 {
+		cfg.TwoClass = false
+	}
+	return &Scheduler{cfg: cfg}
+}
 
 // Next returns the next dispatchable tenant with ready rows, or false after a full miss. With TwoClass the pass is
 // interleaved, not prioritised (Q5): LightTurns consecutive turns prefer cursor A (the first ready tenant whose
@@ -40,14 +45,14 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler { return &Scheduler{cfg: cfg} 
 // ready, hot tenant); a miss on the preferred class falls through to the other, so the ring is work-conserving.
 // Hot, which may kick a renewal, runs only for a candidate of the wanted class, after the cheap ledger reads. A
 // double miss leaves both cursors and the turn unchanged and the worker waits on Wake/IdlePoll. TwoClass = false
-// (or FairShare = false) makes every tenant light, so cursor B never hits: the M1 ring.
+// is one scan over one cursor; FairShare = false makes every tenant light, so cursor B never hits: the M1 ring.
 func (s *Scheduler) Next() (int, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	fs := math.MaxInt
-	if s.cfg.TwoClass && s.cfg.Share != nil {
-		fs = s.cfg.Share.FairShare()
+	if !s.cfg.TwoClass {
+		return s.scan(true, math.MaxInt) // one class, one cursor
 	}
+	fs := s.cfg.Share.FairShare()
 	light := s.turn < s.cfg.LightTurns
 	for _, want := range [2]bool{light, !light} {
 		if i, ok := s.scan(want, fs); ok {

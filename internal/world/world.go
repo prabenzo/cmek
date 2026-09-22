@@ -200,6 +200,7 @@ func (w *World) sweep(ctx context.Context) {
 
 // Stop cancels the context, closes every subscriber channel, waits ≤ StopTimeout for goroutines, then closes and deletes the DB file; a late goroutine is logged, not waited for.
 func (w *World) Stop() {
+	w.scen.stop() // no scenario may start (and wg.Add) once the wait below can begin
 	w.cancel()
 	w.metrics.CloseAll()
 	done := make(chan struct{})
