@@ -62,7 +62,7 @@ type Store struct {
 	w     *sql.Conn
 	mu    sync.Mutex
 
-	insert, putDEK, claim, ack, release, dead, reclaim *sql.Stmt
+	insert, putDEK, claim, ack, release, dead, reclaim, reclaimCount *sql.Stmt
 
 	nextID                                              atomic.Int64
 	accepted, delivered, expired, ready, claimed, deadN []atomic.Int64
@@ -164,7 +164,8 @@ func Open(cfg Config) (*Store, error) {
 		{&s.ack, `DELETE FROM messages WHERE state='claimed' AND id IN (SELECT value FROM json_each(?1))`},
 		{&s.release, `UPDATE messages SET state='ready', claimed_until=NULL WHERE state='claimed' AND id IN (SELECT value FROM json_each(?1))`},
 		{&s.dead, `UPDATE messages SET state='dead', claimed_until=NULL, attempts=attempts+1 WHERE id=?1 AND state='claimed'`},
-		{&s.reclaim, `UPDATE messages SET state='ready', claimed_until=NULL WHERE state='claimed' AND claimed_until < ?1 RETURNING tenant_id`},
+		{&s.reclaim, `UPDATE messages SET state='ready', claimed_until=NULL WHERE state='claimed' AND claimed_until < ?1`},
+		{&s.reclaimCount, `SELECT tenant_id, COUNT(*) FROM messages WHERE state='claimed' AND claimed_until < ?1 GROUP BY tenant_id`},
 	} {
 		if err := prep(x.dst, x.q); err != nil {
 			return fail(err)
@@ -183,7 +184,7 @@ func Open(cfg Config) (*Store, error) {
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, st := range []*sql.Stmt{s.insert, s.putDEK, s.claim, s.ack, s.release, s.dead, s.reclaim} {
+	for _, st := range []*sql.Stmt{s.insert, s.putDEK, s.claim, s.ack, s.release, s.dead, s.reclaim, s.reclaimCount} {
 		if st != nil {
 			st.Close()
 		}
@@ -218,13 +219,18 @@ func (s *Store) signal() {
 	}
 }
 
+// Every ledger-coupled statement runs under the store's own context, never the caller's: a request context
+// cancelled mid-statement could leave the row committed while the ledger never counted it. The ctx parameters
+// stay for the interface; the store ignores them.
+func (s *Store) bg() context.Context { return context.Background() }
+
 // Insert writes one sealed row and updates the ledger in one critical section.
 func (s *Store) Insert(ctx context.Context, idx int, id int64, env cmek.Envelope) error {
 	now := s.cfg.Clock.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	start := s.cfg.Clock.Now()
-	_, err := s.insert.ExecContext(ctx, id, s.cfg.Tenants[idx], env.DEKID, env.Nonce[:], env.Ciphertext, ms(now))
+	_, err := s.insert.ExecContext(s.bg(), id, s.cfg.Tenants[idx], env.DEKID, env.Nonce[:], env.Ciphertext, ms(now))
 	d := s.cfg.Clock.Now().Sub(start).Nanoseconds()
 	s.insN.Add(1)
 	s.insSumNs.Add(d)
@@ -251,7 +257,7 @@ func (s *Store) Insert(ctx context.Context, idx int, id int64, env cmek.Envelope
 func (s *Store) PutDEK(ctx context.Context, d cmek.WrappedDEK) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.putDEK.ExecContext(ctx, d.ID, d.Tenant, d.KEKID, d.KEKVersion, d.Wrapped, ms(d.CreatedAt))
+	_, err := s.putDEK.ExecContext(s.bg(), d.ID, d.Tenant, d.KEKID, d.KEKVersion, d.Wrapped, ms(d.CreatedAt))
 	return err
 }
 
@@ -260,7 +266,7 @@ func (s *Store) Claim(ctx context.Context, idx, n int, until time.Time) (Batch, 
 	b := Batch{Tenant: s.cfg.Tenants[idx], Idx: idx}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rows, err := s.claim.QueryContext(context.Background(), ms(until), b.Tenant, n)
+	rows, err := s.claim.QueryContext(s.bg(), ms(until), b.Tenant, n)
 	if err != nil {
 		return b, err
 	}
@@ -279,10 +285,13 @@ func (s *Store) Claim(ctx context.Context, idx, n int, until time.Time) (Batch, 
 		m.EnqueuedAt = time.UnixMilli(enq)
 		b.Msgs = append(b.Msgs, m)
 	}
+	if err := rows.Err(); err != nil && scanErr == nil {
+		scanErr = err // the cursor stopped early: the UPDATE still applied to every matching row
+	}
 	rows.Close()
 	changed := int64(drained)
 	if scanErr != nil {
-		_ = s.w.QueryRowContext(context.Background(), "SELECT changes()").Scan(&changed)
+		_ = s.w.QueryRowContext(s.bg(), "SELECT changes()").Scan(&changed)
 	}
 	s.ready[idx].Add(-changed)
 	s.claimed[idx].Add(changed)
@@ -301,7 +310,7 @@ func jsonIDs(ids []int64) string {
 func (s *Store) Ack(ctx context.Context, idx int, ids []int64) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	res, err := s.ack.ExecContext(ctx, jsonIDs(ids))
+	res, err := s.ack.ExecContext(s.bg(), jsonIDs(ids))
 	if err != nil {
 		return 0, err
 	}
@@ -319,7 +328,7 @@ func (s *Store) Ack(ctx context.Context, idx int, ids []int64) (int, error) {
 func (s *Store) Release(ctx context.Context, idx int, ids []int64) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	res, err := s.release.ExecContext(ctx, jsonIDs(ids))
+	res, err := s.release.ExecContext(s.bg(), jsonIDs(ids))
 	if err != nil {
 		return 0, err
 	}
@@ -334,7 +343,7 @@ func (s *Store) Release(ctx context.Context, idx int, ids []int64) (int, error) 
 func (s *Store) Dead(ctx context.Context, idx int, id int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	res, err := s.dead.ExecContext(ctx, id)
+	res, err := s.dead.ExecContext(s.bg(), id)
 	if err != nil {
 		return err
 	}
@@ -349,30 +358,51 @@ func (s *Store) Dead(ctx context.Context, idx int, id int64) error {
 }
 
 // Reclaim returns timed-out claims to ready (at-least-once delivery); the sweep calls it every ReclaimInterval.
+// It counts per tenant first and updates second, both under store.mu on the writer connection, so the ledger
+// delta is known before anything changes: a failed or partial read changes nothing, a failed UPDATE changes nothing.
 func (s *Store) Reclaim(ctx context.Context, now time.Time) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rows, err := s.reclaim.QueryContext(context.Background(), ms(now))
+	rows, err := s.reclaimCount.QueryContext(s.bg(), ms(now))
 	if err != nil {
 		return 0, err
 	}
-	n := 0
+	counts := make(map[int]int64)
+	var total int64
 	for rows.Next() {
 		var tenant string
-		if err := rows.Scan(&tenant); err != nil {
-			continue
+		var c int64
+		if err := rows.Scan(&tenant, &c); err != nil {
+			rows.Close()
+			return 0, err
 		}
 		if i, ok := s.index[tenant]; ok {
-			s.claimed[i].Add(-1)
-			s.ready[i].Add(1)
-			n++
+			counts[i] += c
+			total += c
 		}
 	}
+	err = rows.Err()
 	rows.Close()
-	if n > 0 {
-		s.signal()
+	if err != nil {
+		return 0, err
 	}
-	return n, nil
+	if total == 0 {
+		return 0, nil
+	}
+	res, err := s.reclaim.ExecContext(s.bg(), ms(now))
+	if err != nil {
+		return 0, err
+	}
+	ra, _ := res.RowsAffected()
+	if ra != total {
+		return 0, fmt.Errorf("reclaim: counted %d rows, updated %d", total, ra) // cannot happen under store.mu
+	}
+	for i, c := range counts {
+		s.claimed[i].Add(-c)
+		s.ready[i].Add(c)
+	}
+	s.signal()
+	return int(total), nil
 }
 
 // Stats returns the insert timing instrument.

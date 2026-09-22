@@ -55,13 +55,22 @@ func main() {
 	s.routes(mux)
 	routeUI(mux)
 	srv := &http.Server{Addr: ":" + port, Handler: mux, ReadHeaderTimeout: 10 * time.Second, WriteTimeout: 0}
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		<-ctx.Done()
+		// Shutdown refuses new connections at once and waits for handlers; Stop runs alongside it because open
+		// /v1/stream handlers return only when Stop closes their channel. main waits for both before exiting,
+		// so the World always closes and deletes its database files.
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
+		shut := make(chan error, 1)
+		go func() { shut <- srv.Shutdown(shutdownCtx) }()
 		if cur := holder.Current(); cur != nil {
 			cur.Stop()
+		}
+		if err := <-shut; err != nil {
+			logger.Error("shutdown", "err", err)
 		}
 	}()
 	logger.Info("killswitch listening", "port", port, "world", w.ID, "base_rate", p.BaseRate)
@@ -69,4 +78,5 @@ func main() {
 		logger.Error("listen", "err", err)
 		os.Exit(1)
 	}
+	<-done
 }

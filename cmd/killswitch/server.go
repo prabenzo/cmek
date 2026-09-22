@@ -3,6 +3,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -51,7 +52,12 @@ func (s *server) events(rw http.ResponseWriter, r *http.Request) {
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(rw, r.Body, maxBody))
 	if err != nil {
-		writeJSON(rw, http.StatusRequestEntityTooLarge, errorBody{Error: "bad_request", Tenant: tenant})
+		status := http.StatusBadRequest // an aborted or malformed body
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		writeJSON(rw, status, errorBody{Error: "bad_request", Tenant: tenant})
 		return
 	}
 	w, release := s.holder.Ensure()

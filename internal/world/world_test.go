@@ -58,7 +58,11 @@ func TestTwoWorlds(t *testing.T) {
 		return sum
 	}
 	deadline := time.Now().Add(10 * time.Second)
-	for (delivered(a) < 50 || delivered(b) < 30) && time.Now().Before(deadline) {
+	// The sink counts a delivery before the worker acks it, so wait for the acks (Total == 0) as well.
+	settled := func() bool {
+		return delivered(a) >= 50 && delivered(b) >= 30 && a.store.Total() == 0 && b.store.Total() == 0
+	}
+	for !settled() && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	for _, x := range []struct {
@@ -93,4 +97,17 @@ func TestTwoWorlds(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestSmallPopulation: New must accept fewer than five tenants (the ranks log line used to index rank 5).
+func TestSmallPopulation(t *testing.T) {
+	p := Small()
+	p.Tenants = 2
+	p.DBDir = t.TempDir()
+	w, err := New(p, Deps{ID: "tiny", Clock: &testClock{now: time.Now()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Start()
+	w.Stop()
 }

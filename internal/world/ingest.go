@@ -19,16 +19,13 @@ func (w *World) Ingest(ctx context.Context, tenant string, payload []byte) error
 	return err
 }
 
+// reasonFor is the metrics reason for an Ingest outcome, derived from Outcome so the two never disagree.
 func reasonFor(err error) string {
-	switch {
-	case err == nil:
+	_, reason, _ := Outcome(err, RetryAfter{})
+	if reason == "" {
 		return "accepted"
-	case errors.Is(err, cmek.ErrKeyRevoked):
-		return "key_revoked"
-	case errors.Is(err, cmek.ErrKeyUnavailable), errors.Is(err, cmek.ErrLeaseExpired):
-		return "key_unavailable"
 	}
-	return "internal"
+	return reason
 }
 
 // IngestID is Ingest plus the allocated message id for the 202 body: key, seal, insert, count the outcome (admission is inserted ahead of the key in M3).
@@ -50,8 +47,9 @@ func (w *World) IngestID(ctx context.Context, tenant string, payload []byte) (in
 		return 0, err
 	}
 	if err := w.store.Insert(ctx, idx, id, env); err != nil {
-		w.metrics.Ingest(idx, "internal", true)
-		return 0, fmt.Errorf("world: insert: %w", err)
+		err = fmt.Errorf("world: insert: %w", err)
+		w.metrics.Ingest(idx, reasonFor(err), true)
+		return 0, err
 	}
 	w.metrics.Ingest(idx, "accepted", true)
 	return id, nil

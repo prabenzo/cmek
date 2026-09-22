@@ -130,10 +130,14 @@ func New(p Params, d Deps) (*World, error) {
 	w.sink = traffic.NewSink(traffic.SinkConfig{Tenants: w.ids, MinLatency: p.SinkLatencyMin, MaxLatency: p.SinkLatencyMax, Ring: p.SinkRing, CanaryPrefix: p.CanaryPrefix, Clock: d.Clock, Rand: w.rnd, Lock: &w.rndMu})
 	w.gen = traffic.NewGenerator(traffic.GeneratorConfig{Tenants: w.ids, Rates: rates, PayloadBytes: p.PayloadBytes, CanaryPrefix: p.CanaryPrefix, Ingest: w, Clock: d.Clock, Rand: w.rnd, Lock: &w.rndMu})
 	capacity := float64(p.Workers) / ((p.SinkLatencyMin + p.SinkLatencyMax) / 2).Seconds()
-	w.metrics = metrics.New(metrics.Config{Tenants: w.ids, Providers: p.Providers, Grid: gridAdapter{w}, Backlog: store, Offered: w.gen, Watcher: watcher{w}, Clock: d.Clock, Interval: p.SnapshotInterval, AuditRing: p.AuditRing, ViewerQueue: p.ViewerQueue, Capacity: capacity, WorldID: d.ID})
+	w.metrics = metrics.New(metrics.Config{Tenants: w.ids, Providers: p.Providers, Grid: &gridAdapter{w: w, buf: make([]cmek.State, n)}, Backlog: store, Offered: w.gen, Watcher: watcher{w}, Clock: d.Clock, Interval: p.SnapshotInterval, AuditRing: p.AuditRing, ViewerQueue: p.ViewerQueue, Capacity: capacity, WorldID: d.ID})
 	w.sched = queue.NewScheduler(queue.SchedulerConfig{Store: store, Gate: w.keys, Tenants: w.ids})
-	w.workers = queue.NewWorkers(queue.WorkersConfig{Store: store, Sched: w.sched, Keys: w.keys, Sink: w.sink, Recorder: w.metrics, Clock: d.Clock, Tenants: w.ids, Workers: p.Workers, ClaimBatch: p.ClaimBatch, ClaimTimeout: p.ClaimTimeout, IdlePoll: p.IdlePoll})
-	w.log.Info("world built", "tenants", n, "rank1", w.ids[w.byRank[0]], "rank2", w.ids[w.byRank[1]], "rank3", w.ids[w.byRank[2]], "rank5", w.ids[w.byRank[4]], "capacity_ps", capacity)
+	w.workers = queue.NewWorkers(queue.WorkersConfig{Store: store, Sched: w.sched, Keys: w.keys, Sink: w.sink, Recorder: w.metrics, Clock: d.Clock, Tenants: w.ids, Workers: p.Workers, ClaimBatch: p.ClaimBatch, ClaimTimeout: p.ClaimTimeout, IdlePoll: p.IdlePoll, Logger: w.log})
+	attrs := []any{"tenants", n}
+	for r := 0; r < n && r < 5; r++ { // the top ranks (the scenarios' revoke target is rank 3)
+		attrs = append(attrs, fmt.Sprintf("rank%d", r+1), w.ids[w.byRank[r]])
+	}
+	w.log.Info("world built", append(attrs, "capacity_ps", capacity)...)
 	return w, nil
 }
 
@@ -223,13 +227,15 @@ func (v watcher) Viewers(n int) {
 	v.w.idleSince.Store(0)
 }
 
-// gridAdapter adapts cmek.Manager.States to metrics.GridSource.
-type gridAdapter struct{ w *World }
+// gridAdapter adapts cmek.Manager.States to metrics.GridSource; buf is reused by the single metrics tick goroutine.
+type gridAdapter struct {
+	w   *World
+	buf []cmek.State
+}
 
-func (g gridAdapter) States(dst []uint8) {
-	states := make([]cmek.State, len(dst))
-	g.w.keys.States(states)
-	for i, s := range states {
+func (g *gridAdapter) States(dst []uint8) {
+	g.w.keys.States(g.buf)
+	for i, s := range g.buf[:len(dst)] {
 		dst[i] = uint8(s)
 	}
 }

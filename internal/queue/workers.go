@@ -4,7 +4,9 @@ package queue
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prabenzo/cmek/internal/cmek"
@@ -45,13 +47,38 @@ type WorkersConfig struct {
 	ClaimBatch   int
 	ClaimTimeout time.Duration
 	IdlePoll     time.Duration
+	Logger       *slog.Logger // optional; Claim errors are logged at most once per second
 }
 
 // Workers is the fixed pool; Run blocks until ctx ends.
-type Workers struct{ cfg WorkersConfig }
+type Workers struct {
+	cfg     WorkersConfig
+	lastLog atomic.Int64 // unix ms of the last Claim error logged
+}
 
 // NewWorkers builds the pool.
 func NewWorkers(cfg WorkersConfig) *Workers { return &Workers{cfg: cfg} }
+
+// wait blocks until a row is inserted or released, IdlePoll elapses, or ctx ends; false means ctx ended.
+func (w *Workers) wait(ctx context.Context) bool {
+	select {
+	case <-w.cfg.Store.Wake():
+	case <-w.cfg.Clock.After(w.cfg.IdlePoll):
+	case <-ctx.Done():
+		return false
+	}
+	return true
+}
+
+func (w *Workers) logClaimErr(err error) {
+	if w.cfg.Logger == nil {
+		return
+	}
+	now := w.cfg.Clock.Now().UnixMilli()
+	if last := w.lastLog.Load(); now-last >= 1000 && w.lastLog.CompareAndSwap(last, now) {
+		w.cfg.Logger.Error("claim", "err", err)
+	}
+}
 
 // Run starts cfg.Workers goroutines and returns when every one has stopped.
 func (w *Workers) Run(ctx context.Context) {
@@ -81,16 +108,22 @@ func (w *Workers) loop(ctx context.Context) {
 	for ctx.Err() == nil {
 		idx, ok := c.Sched.Next()
 		if !ok {
-			select {
-			case <-c.Store.Wake():
-			case <-c.Clock.After(c.IdlePoll):
-			case <-ctx.Done():
+			if !w.wait(ctx) {
 				return
 			}
 			continue
 		}
 		batch, err := c.Store.Claim(ctx, idx, c.ClaimBatch, c.Clock.Now().Add(c.ClaimTimeout))
 		if err != nil || len(batch.Msgs) == 0 {
+			// A persistent Claim error (busy past busy_timeout, I/O, a closed store) must not hot-spin the pool:
+			// wait as the idle branch does. An empty batch means the ledger and the table disagree or another
+			// worker took the rows; same wait.
+			if err != nil && ctx.Err() == nil {
+				w.logClaimErr(err)
+			}
+			if !w.wait(ctx) {
+				return
+			}
 			continue
 		}
 		var acked []int64

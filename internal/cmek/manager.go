@@ -3,12 +3,18 @@ package cmek
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strconv"
 	"sync"
 	"time"
 
 	"golang.org/x/sync/singleflight"
 )
+
+// errStore marks a DEKStore failure: not a KMS outcome, so no audit line, no state change, and EncryptKey returns it
+// unclassified (world.Outcome answers 500 internal, which must stay at 0).
+var errStore = errors.New("cmek: dek store")
 
 // farFuture is the M1 stand-in for a lease: every handle stays valid until M2 installs the real lease.
 func farFuture() time.Time { return time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC) }
@@ -54,6 +60,9 @@ func (m *Manager) EncryptKey(ctx context.Context, id string) (Handle, error) {
 	m.mu.Unlock()
 	_, err, _ := m.sf.Do(id+"/generate", func() (any, error) { return nil, m.generate(t) })
 	if err != nil {
+		if errors.Is(err, errStore) {
+			return Handle{}, err
+		}
 		return Handle{}, ErrKeyUnavailable
 	}
 	m.mu.Lock()
@@ -85,7 +94,7 @@ func (m *Manager) generate(t *tenant) error {
 		return err
 	}
 	if err := m.cfg.Store.PutDEK(m.ctx, WrappedDEK{ID: dekID, Tenant: t.spec.ID, KEKID: t.spec.KEKID, KEKVersion: dk.KEKVersion, Wrapped: dk.Wrapped, CreatedAt: m.cfg.Clock.Now()}); err != nil {
-		return err
+		return fmt.Errorf("%w: %v", errStore, err)
 	}
 	key := dk.Plaintext
 	m.mu.Lock()

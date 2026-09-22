@@ -25,7 +25,9 @@ func (h *hub) notify(n int) {
 	}
 }
 
-// subscribe adds a viewer; the callback runs after hub.mu is released.
+// subscribe adds a viewer. The watcher callback runs under hub.mu so viewer counts reach it in the order they
+// happened (a cancel/subscribe pair must never deliver 0 after 1); the watcher touches only the generator gate
+// and an atomic, so the only lock taken inside is gen.mu.
 func (h *hub) subscribe() (<-chan []byte, func()) {
 	ch := make(chan []byte, h.depth)
 	h.mu.Lock()
@@ -35,22 +37,19 @@ func (h *hub) subscribe() (<-chan []byte, func()) {
 		return ch, func() {}
 	}
 	h.subs[ch] = struct{}{}
-	n := len(h.subs)
+	h.notify(len(h.subs))
 	h.mu.Unlock()
-	h.notify(n)
 	var once sync.Once
 	cancel := func() {
 		once.Do(func() {
 			h.mu.Lock()
+			defer h.mu.Unlock()
 			if _, ok := h.subs[ch]; ok {
 				delete(h.subs, ch)
 				close(ch)
 			}
-			n := len(h.subs)
-			closed := h.closed
-			h.mu.Unlock()
-			if !closed {
-				h.notify(n)
+			if !h.closed {
+				h.notify(len(h.subs))
 			}
 		})
 	}
@@ -72,12 +71,12 @@ func (h *hub) broadcast(b []byte) {
 // closeAll ends every subscription (World.Stop).
 func (h *hub) closeAll() {
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.closed = true
 	for ch := range h.subs {
 		delete(h.subs, ch)
 		close(ch)
 	}
-	h.mu.Unlock()
 	h.notify(0)
 }
 

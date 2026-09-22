@@ -14,6 +14,7 @@ The milestone plans (M0.md–M6.md) are written against this reference and amend
 | M0 ticker | `KS_TICK_BURN_MS` (default 50) busy-burn per tick so the Cloud Run check discriminates; `World.Health(now, viewers)` in M0 only | M0 |
 | World | `Deps{ID, Clock, Logger}` (the Holder passes `w-<seq>`); `Params.DBPath` becomes the directory `DBDir` (file `<DBDir>/killswitch-<pid>-<ID>.db`); `Params.SyncMode`, `WALAutocheckpoint` (env `KS_SYNC`, `KS_WAL_AUTOCHECKPOINT`); `NewHolder(p Params, d Deps)`; `World.IngestID` returns the message id for the 202 body; `Holder.Current()` returns `(w, release)` | M1, M5 |
 | cmek | `Config.Nonce` deleted: `Seal` reads `crypto/rand.Reader` directly | M1 |
+| M1 review (PR #5) | `ViewerWatcher` runs under `hub.mu` (ordering); every ledger-coupled store statement runs under the store's own context, never the request's; `Reclaim` counts per tenant then updates (no `RETURNING`); `Claim` treats `rows.Err()` like a scan error; a `PutDEK` failure reaches Ingest unclassified (500 `internal`, no audit); a `Claim` error or empty batch waits like the idle branch; `main` awaits `World.Stop`, run alongside `Shutdown` | M1 |
 | cmek locking | Per-tenant `tenant.mu` instead of one `m.mu` (Ben's call, 2026-09-22): a method locks one tenant at a time, never two; `Tick` holds one `t.mu` per tenant and spawns after its unlock; `apply` and every `Auditor.Audit` run under `t.mu`; `States` stays lock-free; the lock table's `m.mu` row and the order `sched.mu` → `m.mu` → `reg.mu` read `t.mu` (M2 › Interfaces › Per-tenant locking) | M2 |
 | Snapshot | `ingest_ps.internal` (must stay 0); `events[]{seq,at,text}`; `inflight{}` built in M4 via `metrics.InflightSource`/`Config.Inflight` | M1, M2, M4 |
 | Measurement | M1 fallback trigger is `insert_mean_us > 300` only (`insert_max_us` is informational: WAL checkpoints dominate it) | M1 |
@@ -260,7 +261,7 @@ func (h *Holder) Current() *World
 func (h *Holder) Reset() *World
 ```
 
-- **Viewer count.** `metrics.Hub` owns it. 1→0: `ViewerWatcher.Viewers(0)` → World stamps `idleSince`, `gen.SetRunning(false)`. 0→1: `gen.SetRunning(true)`, `idleSince = 0`. The callback is invoked after `hub.mu` is released and may touch only `gen` and the atomic; it never calls `metrics` `[SC-F4]`. Workers, sweeps, checker and the metrics tick keep running (idle-cheap; on Cloud Run they get no CPU without an in-flight request anyway).
+- **Viewer count.** `metrics.Hub` owns it. 1→0: `ViewerWatcher.Viewers(0)` → World stamps `idleSince`, `gen.SetRunning(false)`. 0→1: `gen.SetRunning(true)`, `idleSince = 0`. The callback is invoked under `hub.mu` (so a cancel/subscribe pair can never deliver 0 after 1; M1 review) and may touch only `gen` and the atomic; it never calls `metrics` `[SC-F4]`. Workers, sweeps, checker and the metrics tick keep running (idle-cheap; on Cloud Run they get no CPU without an in-flight request anyway).
 - **Idle rebuild.** No timer. `Holder.Acquire` applies the rule on the next stream connect; `Reset` is unconditional. Rebuild = `old.Stop(); new = New(); new.Start()` under `holder.mu` (< 50 ms plus ≤ `StopTimeout` if a handler is still inside the old World).
 - **Handler refcount.** Every handler that touches a World goes through `Acquire`/`Ensure` and defers `release`; `Stop` first cancels the context and closes subscriber channels (so SSE loops exit), then waits on the refcount, so a `POST /v1/events` in flight during Reset finishes against the old store instead of hitting a closed DB `[SC-F11]`.
 
@@ -488,7 +489,7 @@ metrics tick (500 ms):
   5. encode grid[i] = '0' + states[i] + (affected[i] ? 4 : 0); scenario recovery bookkeeping (every target ACTIVE? affected backlog 0?) [SF-F7]
   6. flush the per-tick transition buffer into timeline lines (aggregated when ≥ TimelineAggregateMin share (from,to))
   7. build Snapshot, json.Marshal once → []byte; unlock reg.mu
-  8. hub.broadcast(b): under hub.mu, for each viewer: select { ch <- b: default: /* drop; slow viewer */ }; hub.mu released before any ViewerWatcher callback
+  8. hub.broadcast(b): under hub.mu, for each viewer: select { ch <- b: default: /* drop; slow viewer */ }; ViewerWatcher runs under hub.mu from subscribe/cancel only; broadcast never calls it
 cmd /v1/stream handler:
   w, ch, release := holder.Acquire(); defer release()
   write "retry: 1000\n\n"
@@ -1128,7 +1129,7 @@ Acceptance signals that exist at each box (so no box waits on a later one's inst
 | `truth.mu` | kms.Truth | key events | µs |
 | `sink.mu` | traffic.Sink | per-tenant rings and counts | µs |
 | `reg.mu` | metrics.Registry | histograms, rings, timeline, targets, verdicts, transition buffer, scenario/recovery state; per-tick counters are atomics | µs; tick ≈ 100 µs; **leaf**: nothing is called out of `metrics` while it is held (grid and backlog are read before locking) |
-| `hub.mu` | metrics hub | subscriber set | µs; **leaf**: `ViewerWatcher.Viewers` is called after release |
+| `hub.mu` | metrics hub | subscriber set | µs; `ViewerWatcher.Viewers` runs under it so counts arrive in order (M1 review); the watcher takes only `gen.mu` (a leaf) and an atomic |
 | `holder.mu` | world.Holder | the current World pointer, rebuild | rebuild (< 50 ms) + ≤ `StopTimeout` |
 | `lockedRand.mu` | world | the seeded `*rand.Rand` shared by traffic, sink, fake latency and jitter | ns |
 
