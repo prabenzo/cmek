@@ -3,7 +3,7 @@ package web
 
 import "embed"
 
-// Files holds the UI served at the root URL. M4 extends the pattern with app.js and the uPlot files.
+// Files holds the UI served at the root URL: the page, its script and the vendored uPlot files.
 //
-//go:embed index.html
+//go:embed index.html app.js uplot.min.js uplot.min.css
 var Files embed.FS

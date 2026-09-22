@@ -1,0 +1,305 @@
+// Owner: Claude. The page reads one snapshot per tick from /v1/stream and paints everything from it; no state
+// lives here beyond the chart rings, the timeline dedupe cursor and the pinned tenant.
+'use strict';
+
+const COLORS = ['#2ecc71', '#f1c40f', '#e67e22', '#9b59b6']; // ACTIVE, RIDING_THROUGH, KEY_UNAVAILABLE, REVOKED
+const STATES = ['ACTIVE', 'RIDING_THROUGH', 'KEY_UNAVAILABLE', 'REVOKED'];
+const PROVIDERS = ['aws', 'gcp', 'azure'];
+const COLS = 40, CELL = 20, N = 1000;
+const RING = 240; // ChartWindow 2 min at 2 Hz
+const $ = id => document.getElementById(id);
+
+let es = null, connected = false, world = null, lastSeq = 0, snap = null;
+let hoverTimer = null, hoverIdx = -1, pinIdx = -1, pinTimer = null;
+const charts = {};
+
+// ---- connection -------------------------------------------------------------------------------------------------
+
+function banner(text) { $('banner').textContent = text; }
+
+function connect() {
+  if (es) es.close();
+  es = new EventSource('/v1/stream');
+  es.onopen = () => { connected = true; banner(world ? 'live · ' + world : 'waiting for the first snapshot…'); };
+  es.onmessage = e => onSnapshot(JSON.parse(e.data));
+  es.addEventListener('reconnect', () => { es.close(); connect(); }); // the server ends a stream before Cloud Run's cut
+  es.onerror = () => { connected = false; banner('reconnecting…'); renderCards(snap); };
+}
+
+function onSnapshot(s) {
+  if (s.world !== world) {
+    world = s.world;
+    resetRings();
+    $('timeline').innerHTML = '';
+    lastSeq = 0;
+    banner('fresh world ' + s.world);
+    setTimeout(() => { if (connected) banner('live · ' + world); }, 4000);
+  }
+  connected = true;
+  snap = s;
+  paintGrid(s.grid);
+  renderTiles(s);
+  renderPanel(s.invariants);
+  renderCards(s);
+  pushCharts(s);
+  renderTimeline(s.events);
+}
+
+// ---- grid ---------------------------------------------------------------------------------------------------------
+
+const ctx = $('grid').getContext('2d');
+
+function paintGrid(str) {
+  ctx.fillStyle = '#0b0d11';
+  ctx.fillRect(0, 0, COLS * CELL, (N / COLS) * CELL);
+  for (let i = 0; i < N; i++) {
+    const code = str ? str.charCodeAt(i) - 48 : -1;
+    const x = (i % COLS) * CELL, y = Math.floor(i / COLS) * CELL;
+    ctx.fillStyle = code < 0 ? '#2a2f3a' : COLORS[code & 3];
+    ctx.fillRect(x + 1, y + 1, CELL - 2, CELL - 2);
+    if (code >= 0 && (code & 4)) { // scenario target
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(x + 3, y + 3, CELL - 6, CELL - 6);
+    }
+  }
+}
+
+function drawBands() {
+  const el = $('bands');
+  el.innerHTML = '';
+  PROVIDERS.forEach((p, k) => {
+    const start = Math.ceil(k * N / PROVIDERS.length);
+    const d = document.createElement('div');
+    d.textContent = p;
+    d.style.top = (Math.floor(start / COLS) * CELL + 2) + 'px';
+    el.appendChild(d);
+  });
+}
+
+function tenantId(i) { return 't-' + String(i).padStart(4, '0'); }
+function providerOf(i) { return PROVIDERS[Math.floor(i * PROVIDERS.length / N)]; }
+function cellAt(ev) {
+  const r = $('grid').getBoundingClientRect();
+  const x = Math.floor((ev.clientX - r.left) / CELL), y = Math.floor((ev.clientY - r.top) / CELL);
+  if (x < 0 || x >= COLS || y < 0) return -1;
+  const i = y * COLS + x;
+  return i < N ? i : -1;
+}
+
+// ---- tiles and panel ------------------------------------------------------------------------------------------------
+
+const fmt = (v, d = 0) => v == null ? '—' : Number(v).toFixed(d);
+
+function renderTiles(s) {
+  $('t-delivered').textContent = fmt(s.tiles.delivered_ps) + ' / ' + fmt(s.tiles.capacity_ps);
+  $('l4-split').textContent = 'rejected: within share ' + fmt(s.l4.rejected_within_share_ps) + '/s · over share ' + fmt(s.l4.rejected_over_share_ps) + '/s';
+  $('t-offered').textContent = 'offered ' + fmt(s.tiles.offered_ps) + '/s · accepted ' + fmt(s.ingest_ps.accepted) + '/s';
+  $('t-p99').textContent = s.p99_ms.healthy ? fmt(s.p99_ms.healthy, 1) : '—';
+  $('t-baseline').textContent = 'baseline ' + (s.p99_ms.baseline ? fmt(s.p99_ms.baseline, 1) + ' ms' : '—') + (s.p99_ms.affected ? ' · affected ' + fmt(s.p99_ms.affected, 1) + ' ms' : '');
+  $('t-kms').textContent = fmt(s.tiles.kms_calls_ps, 1);
+  const inf = s.inflight || {};
+  $('inflight').textContent = 'in flight: ' + PROVIDERS.map(p => p + ' ' + (inf[p] == null ? '—' : inf[p])).join(' · ');
+  const b = s.tiles.by_state;
+  $('t-states').innerHTML = b.map((n, k) => '<span style="color:' + COLORS[k] + '">' + n + '</span>').join(' <span style="color:#4a5160">·</span> ');
+  $('t-backlog').textContent = 'backlog ' + s.backlog.total + (s.backlog.affected ? ' · affected ' + s.backlog.affected : '');
+}
+
+function renderPanel(inv) {
+  document.querySelectorAll('#panel .light').forEach(el => {
+    const k = el.dataset.k, v = inv && inv[k];
+    el.classList.remove('ok', 'bad');
+    if (!v || v.ok == null) { el.querySelector('span').textContent = 'pending'; return; } // M5's keys light up with no web change
+    el.classList.add(v.ok ? 'ok' : 'bad');
+    el.querySelector('span').textContent = (v.n == null ? '' : v.n + ' · ') + (v.at ? clock(v.at) : '') + (v.detail ? ' · ' + v.detail : '');
+  });
+}
+
+// ---- cards ----------------------------------------------------------------------------------------------------------
+
+function renderCards(s) {
+  const running = s ? s.scenario.name : '';
+  document.querySelectorAll('.card').forEach(card => {
+    const mine = running && card.dataset.scenario.split(' ').includes(running);
+    card.classList.toggle('running', !!mine);
+    card.querySelectorAll('[data-start]').forEach(b => { b.disabled = !connected || !!running; });
+    card.querySelectorAll('[data-stop]').forEach(b => { b.disabled = !connected || !mine; });
+    const st = card.querySelector('.status');
+    if (!mine) { st.textContent = ''; return; }
+    const sc = s.scenario;
+    let text = sc.phase;
+    if (sc.ends_at == null) text += ' · waiting for Restore';
+    else text += ' · ' + Math.max(0, (sc.ends_at - s.t) / 1000).toFixed(0) + ' s';
+    if (sc.recovery_s != null) text += ' · recovered in ' + sc.recovery_s.toFixed(1) + ' s';
+    if (sc.drain_s != null) text += ' · drained in ' + sc.drain_s.toFixed(1) + ' s';
+    st.textContent = text;
+  });
+  $('restore').disabled = !(connected && s && s.scenario.name === 'key_revocation' && s.scenario.phase === 'revoked');
+}
+
+async function post(url, body) {
+  const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body == null ? undefined : JSON.stringify(body) });
+  if (r.status === 409) toast('busy: a scenario is already running');
+  else if (r.status === 404) toast('unknown scenario or tenant');
+  else if (r.status >= 400) toast('request failed: ' + r.status);
+  return r;
+}
+
+function targetTenant() { // the ringed cell of the running scenario (code & 4)
+  if (!snap) return null;
+  for (let i = 0; i < N; i++) if ((snap.grid.charCodeAt(i) - 48) & 4) return tenantId(i);
+  return null;
+}
+
+function bindCards() {
+  document.querySelectorAll('[data-start]').forEach(b => b.onclick = () => post('/v1/scenarios/' + b.dataset.start + '/start'));
+  document.querySelectorAll('[data-stop]').forEach(b => b.onclick = () => post('/v1/scenarios/x/stop'));
+  $('restore').onclick = () => { const id = targetTenant(); if (id) post('/v1/tenants/' + id + '/key', { action: 'restore' }); };
+  $('reset').onclick = onReset;
+}
+
+function onReset() { post('/v1/reset'); } // the world-id change on the next snapshot resets the page; the button stays disabled until M5
+
+let toastTimer = null;
+function toast(text) {
+  const t = $('toast');
+  t.textContent = text;
+  t.style.display = 'block';
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.style.display = 'none'; }, 3000);
+}
+
+// ---- charts ---------------------------------------------------------------------------------------------------------
+
+function ring() { return new Array(RING).fill(null); }
+function push(arr, v) { arr.push(v); arr.shift(); }
+
+const SERIES = {
+  ingest: [['accepted', '#2ecc71'], ['rate_limited', '#f1c40f'], ['backlog_full', '#e67e22'], ['overloaded', '#e74c3c'], ['key_unavailable', '#3498db'], ['key_revoked', '#9b59b6']],
+  p99: [['healthy', '#2ecc71'], ['affected', '#e74c3c'], ['baseline', '#9aa3b2', [4, 4]]],
+  kms: [['ok', '#2ecc71'], ['transient', '#f1c40f'], ['deny', '#9b59b6'], ['events/s', '#3498db', [4, 4]]],
+  backlog: [['total', '#3498db'], ['affected', '#e74c3c']],
+};
+
+function mkChart(name, el, log) {
+  const data = [ring(), ...SERIES[name].map(ring)];
+  const axis = { stroke: '#9aa3b2', grid: { stroke: '#2a2f3a', width: 1 }, ticks: { stroke: '#2a2f3a' } };
+  const opts = {
+    width: el.clientWidth || 390, height: 170,
+    cursor: { show: true, y: false }, legend: { show: true },
+    scales: { x: { time: true }, y: log ? { distr: 3, range: (u, min, max) => [min > 0 ? min / 1.5 : 1, max > 0 ? max * 1.5 : 100] } : { range: (u, min, max) => [0, max > 0 ? max * 1.1 : 1] } },
+    axes: [{ ...axis, space: 60 }, { ...axis, size: 52 }],
+    series: [{ label: 'time' }, ...SERIES[name].map(([label, stroke, dash]) => ({ label, stroke, width: 1.5, dash, spanGaps: false }))],
+  };
+  charts[name] = { u: new uPlot(opts, data, el), data };
+}
+
+function resetRings() {
+  for (const c of Object.values(charts)) { c.data.forEach((arr, i) => { c.data[i] = ring(); }); c.u.setData(c.data); }
+}
+
+function pushCharts(s) {
+  const t = s.t / 1000, nz = v => v > 0 ? v : null; // 0 samples plot as a gap on the log axis
+  const rows = {
+    ingest: [s.ingest_ps.accepted, s.ingest_ps.rate_limited, s.ingest_ps.backlog_full, s.ingest_ps.overloaded, s.ingest_ps.key_unavailable, s.ingest_ps.key_revoked],
+    p99: [nz(s.p99_ms.healthy), nz(s.p99_ms.affected), nz(s.p99_ms.baseline)],
+    kms: [s.kms_ps.ok, s.kms_ps.transient, s.kms_ps.deny, s.kms_ps.events_ps],
+    backlog: [s.backlog.total, s.backlog.affected],
+  };
+  for (const [name, vals] of Object.entries(rows)) {
+    const c = charts[name];
+    if (!c) continue;
+    push(c.data[0], t);
+    vals.forEach((v, i) => push(c.data[i + 1], v));
+    c.u.setData(c.data);
+  }
+}
+
+function initCharts() {
+  mkChart('ingest', $('c-ingest'), false);
+  mkChart('p99', $('c-p99'), true);
+  mkChart('kms', $('c-kms'), false);
+  mkChart('backlog', $('c-backlog'), false);
+  window.addEventListener('resize', () => { for (const [name, c] of Object.entries(charts)) c.u.setSize({ width: $('c-' + name).clientWidth, height: 170 }); });
+}
+
+// ---- timeline -------------------------------------------------------------------------------------------------------
+
+function clock(ms) { return new Date(ms).toLocaleTimeString([], { hour12: false }); }
+
+function renderTimeline(evs) {
+  if (!evs) return;
+  const ol = $('timeline');
+  for (let i = evs.length - 1; i >= 0; i--) { // newest-first in the snapshot; prepend oldest-first so order holds
+    const e = evs[i];
+    if (e.seq <= lastSeq) continue;
+    lastSeq = e.seq;
+    const li = document.createElement('li');
+    li.textContent = clock(e.at) + ' ' + e.text;
+    if (/^scenario |restored|not restored/.test(e.text)) li.className = 'mark';
+    ol.prepend(li);
+  }
+  while (ol.children.length > 200) ol.removeChild(ol.lastChild);
+}
+
+// ---- hover and pin --------------------------------------------------------------------------------------------------
+
+function tipText(i, d) {
+  const code = snap ? snap.grid.charCodeAt(i) - 48 : -1;
+  let t = tenantId(i) + ' · ' + providerOf(i) + (code >= 0 ? ' · ' + STATES[code & 3] : '') + (code >= 0 && (code & 4) ? ' · target' : '');
+  if (d) t += '\nrank ' + d.rank + ' · lease ' + (d.lease_remaining_ms / 1000).toFixed(1) + ' s left · backlog ' + d.backlog + ' · ' + d.offered_ps.toFixed(1) + ' ev/s · ' + d.kms_calls_per_min + ' KMS calls/min';
+  return t;
+}
+
+async function fetchTenant(i) {
+  const r = await fetch('/v1/tenants/' + tenantId(i));
+  return r.ok ? r.json() : null;
+}
+
+function bindGrid() {
+  const g = $('grid'), tip = $('tip');
+  g.onmousemove = ev => {
+    const i = cellAt(ev);
+    if (i < 0) { tip.style.display = 'none'; hoverIdx = -1; return; }
+    tip.style.display = 'block';
+    tip.style.left = (ev.clientX - g.getBoundingClientRect().left + 24) + 'px';
+    tip.style.top = (ev.clientY - g.getBoundingClientRect().top + 4) + 'px';
+    if (i !== hoverIdx) {
+      hoverIdx = i;
+      tip.textContent = tipText(i);
+      clearTimeout(hoverTimer);
+      hoverTimer = setTimeout(async () => { const d = await fetchTenant(i); if (d && hoverIdx === i) tip.textContent = tipText(i, d); }, 150);
+    }
+  };
+  g.onmouseleave = () => { tip.style.display = 'none'; hoverIdx = -1; };
+  g.onclick = ev => { const i = cellAt(ev); if (i >= 0) pin(i === pinIdx ? -1 : i); };
+}
+
+function pin(i) {
+  clearInterval(pinTimer);
+  pinIdx = i;
+  const el = $('pin');
+  if (i < 0) { el.style.display = 'none'; el.innerHTML = ''; return; }
+  el.style.display = 'block';
+  const refresh = async () => {
+    const d = await fetchTenant(i);
+    if (!d || pinIdx !== i) return;
+    const audit = (d.audit || []).map(a => '<li>' + clock(Date.parse(a.At)) + ' ' + a.Op + ' ' + a.Outcome + (a.Detail ? ' (' + a.Detail + ')' : '') + (a.Latency ? ' ' + (a.Latency / 1e6).toFixed(0) + ' ms' : '') + '</li>').join('');
+    el.innerHTML = '<b>' + d.id + '</b> · ' + d.provider + ' · ' + d.state + ' · rank ' + d.rank + ' · lease age ' + (d.lease_age_ms / 1000).toFixed(1) + ' s, ' + (d.lease_remaining_ms / 1000).toFixed(1) + ' s left' +
+      (d.next_probe_ms > 0 ? ' · next probe in ' + (d.next_probe_ms / 1000).toFixed(1) + ' s' : '') + ' · backlog ' + d.backlog + ' (ready ' + d.ready + ') · offered ' + d.offered_ps.toFixed(1) + '/s · KMS ' + d.kms_calls_per_min + '/min' +
+      (d.affected ? ' · <span style="color:#e74c3c">affected</span>' : '') + ' <button id="unpin" style="float:right;padding:1px 6px">unpin</button><ol>' + (audit || '<li>no audit entries yet</li>') + '</ol>';
+    $('unpin').onclick = () => pin(-1);
+  };
+  refresh();
+  pinTimer = setInterval(refresh, 2000);
+}
+
+// ---- boot -----------------------------------------------------------------------------------------------------------
+
+paintGrid(null);
+drawBands();
+initCharts();
+bindCards();
+bindGrid();
+renderCards(null);
+connect();
