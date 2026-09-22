@@ -4,7 +4,7 @@ Working minutes per lane, per milestone (docs/plan/README.md › Working asynchr
 
 | Milestone | Planned | Actual [C] | Actual [B] | Started | Ended | Notes (cuts, fallbacks, decisions, parameter changes) |
 | --- | --- | --- | --- | --- | --- | --- |
-| M0 Skeleton and deploy | 20 | | | | | |
+| M0 Skeleton and deploy | 20 | | | | 7:39pm|7:59pm |
 | M1 Data path | 45 | | | | | |
 | M2 CMEK core | 45 | | | | | |
 | M3 Admission and surges | 30 | | | | | |
