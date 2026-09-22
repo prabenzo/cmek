@@ -23,9 +23,13 @@ func (l *Lease) Renew(sentAt time.Time) bool {
 	return true
 }
 
-// Usable reports SentAt != 0 && now < SentAt + TTL − Early (29 s of use from the send instant).
+// Until is the instant the lease stops being usable: SentAt + TTL − Early. Every ValidUntil a Handle carries
+// comes from here, so Seal/Open and Usable can never disagree.
+func (l Lease) Until() time.Time { return l.SentAt.Add(l.TTL - l.Early) }
+
+// Usable reports SentAt != 0 && now < Until() (29 s of use from the send instant).
 func (l Lease) Usable(now time.Time) bool {
-	return !l.SentAt.IsZero() && now.Before(l.SentAt.Add(l.TTL-l.Early))
+	return !l.SentAt.IsZero() && now.Before(l.Until())
 }
 
 // SoftDue reports now ≥ SentAt + SoftTTL (lazy renewal may start).
@@ -38,7 +42,7 @@ func (l Lease) Remaining(now time.Time) time.Duration {
 	if l.SentAt.IsZero() {
 		return 0
 	}
-	return l.SentAt.Add(l.TTL - l.Early).Sub(now)
+	return l.Until().Sub(now)
 }
 
 // Backoff returns min(min×2^(n−1), max) × (1 + jitter × (2u − 1)) for attempt n ≥ 1 and u ∈ [0,1).

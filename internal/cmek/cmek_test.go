@@ -451,3 +451,169 @@ func TestManagerWalk(t *testing.T) {
 	}
 	expect("row 11", m.Hot(rigTenant), "Hot = false")
 }
+
+// TestManagerExtras: the rows M2 › Tests had carried to M5, pulled in at review (PR #6): DEK rotation on the encrypt
+// path, ageing of a non-active DEK and the warm path with its backoff cadence, the per-tenant in-flight cap, and the
+// stale-OK guard. White-box where the row says so (package cmek).
+func TestManagerExtras(t *testing.T) {
+	r := newRig(t)
+	m, clk := r.m, r.clk
+	ctx := context.Background()
+	tt := m.tenants[rigTenant]
+	expect := func(row string, cond bool, msg string, args ...any) {
+		t.Helper()
+		if !cond {
+			t.Errorf("%s: "+msg, append([]any{row}, args...)...)
+		}
+	}
+
+	// rotation: with DEKMaxMessages 3 the fourth seal handle comes from a fresh DEK "<t>/2"; the old one stays hot
+	m.cfg.DEKMaxMessages = 3
+	var h Handle
+	for i := 0; i < 3; i++ {
+		var err error
+		if h, err = m.EncryptKey(ctx, rigTenant); err != nil {
+			t.Fatalf("rotation: EncryptKey %d: %v", i, err)
+		}
+	}
+	old := h.DEKID
+	expect("rotation", old == rigTenant+"/1" && r.calls() == 1, "first DEK %q after %d calls", old, r.calls())
+	h, err := m.EncryptKey(ctx, rigTenant)
+	if err != nil {
+		t.Fatalf("rotation: fourth EncryptKey: %v", err)
+	}
+	expect("rotation", h.DEKID == rigTenant+"/2", "fourth handle DEK = %q, want %s/2", h.DEKID, rigTenant)
+	expect("rotation", r.calls() == 2 && len(r.store.puts) == 2, "calls %d, puts %d, want 2 and 2", r.calls(), len(r.store.puts))
+	if _, err := m.DecryptKey(rigTenant, old); err != nil {
+		t.Errorf("rotation: old DEK not decryptable after rotation: %v", err)
+	}
+	expect("rotation", m.Info(rigTenant).DEKs == 2 && m.Info(rigTenant).HotDEKs == 2, "info = %+v", m.Info(rigTenant))
+
+	// ageing: a non-active DEK's plaintext is dropped at hotSince + DEKMaxAge + Lease; the active one never by age
+	tt.mu.Lock()
+	tt.deks[old].hotSince = clk.Now().Add(-(m.cfg.DEKMaxAge + m.cfg.Lease))
+	tt.mu.Unlock()
+	m.Tick(clk.Now())
+	expect("ageing", r.rec.count("purge", "aged") == 1, "aged purges = %d", r.rec.count("purge", "aged"))
+	if _, err := m.DecryptKey(rigTenant, old); !errors.Is(err, ErrDEKCold) {
+		t.Errorf("ageing: DecryptKey(old) err = %v, want ErrDEKCold", err)
+	}
+	if _, err := m.DecryptKey(rigTenant, h.DEKID); err != nil {
+		t.Errorf("ageing: active DEK dropped: %v", err)
+	}
+
+	// warm, healthy: Warm makes Hot false until the inline unwrap lands, then the old DEK decrypts again
+	calls := r.calls()
+	m.Warm(rigTenant, old)
+	expect("warm", r.calls() == calls+1, "calls = %d, want %d", r.calls(), calls+1)
+	expect("warm", m.Hot(rigTenant) && m.Info(rigTenant).Pending == 0, "Hot = %v, pending = %d after a warm", m.Hot(rigTenant), m.Info(rigTenant).Pending)
+	if _, err := m.DecryptKey(rigTenant, old); err != nil {
+		t.Errorf("warm: DecryptKey(old) err = %v", err)
+	}
+	m.Warm(rigTenant, "other/9") // unknown dek id: ignored
+	expect("warm", m.Info(rigTenant).Pending == 0, "unknown dek id was recorded as pending")
+
+	// warm under fast-fail: one call per backoff interval, driven by Tick, Hot false throughout [SC-F5]
+	tt.mu.Lock()
+	tt.deks[old].hotSince = clk.Now().Add(-(m.cfg.DEKMaxAge + m.cfg.Lease))
+	tt.mu.Unlock()
+	m.Tick(clk.Now())
+	r.fake.SetFault(kms.Scope{Provider: "gcp"}, kms.Fault{Mode: kms.ModeFastFail})
+	calls = r.calls()
+	m.Warm(rigTenant, old)
+	T := clk.Now()
+	expect("warm/fault", r.calls() == calls+1, "calls = %d, want %d (the first warm attempt)", r.calls(), calls+1)
+	expect("warm/fault", !m.Hot(rigTenant) && m.Info(rigTenant).Pending == 1, "Hot = %v, pending = %d", m.Hot(rigTenant), m.Info(rigTenant).Pending)
+	expect("warm/fault", r.state() == RidingThrough, "state = %v (a failed warm counts as a failed renewal)", r.state())
+	// while RIDING_THROUGH, Tick probes the active DEK on the backoff schedule (T+0.5, T+1.5, then T+3.5) and the
+	// pending warm waits: the probe heals the state, the warm follows on the next sweep once ACTIVE again
+	retryAt := map[time.Duration]bool{500 * time.Millisecond: true, 1500 * time.Millisecond: true}
+	want := r.calls()
+	for i := 1; i <= 6; i++ { // through T+1.5 s
+		clk.Advance(250 * time.Millisecond)
+		m.Tick(clk.Now())
+		if retryAt[clk.Now().Sub(T)] {
+			want++
+		}
+		expect("warm/fault", r.calls() == want, "at T+%v calls = %d, want %d", clk.Now().Sub(T), r.calls(), want)
+		expect("warm/fault", !m.Hot(rigTenant), "Hot = true at T+%v while the DEK is pending", clk.Now().Sub(T))
+	}
+	r.fake.SetFault(kms.Scope{Provider: "gcp"}, kms.Fault{})
+	for clk.Now().Sub(T) < 3500*time.Millisecond { // the probe at T+3.5 s succeeds: ACTIVE again
+		clk.Advance(250 * time.Millisecond)
+		m.Tick(clk.Now())
+	}
+	expect("warm/fault", r.calls() == want+1 && r.state() == Active, "at T+3.5 s calls = %d (want %d), state = %v", r.calls(), want+1, r.state())
+	expect("warm/fault", !m.Hot(rigTenant) && m.Info(rigTenant).Pending == 1, "Hot = %v, pending = %d before the warm retry", m.Hot(rigTenant), m.Info(rigTenant).Pending)
+	clk.Advance(250 * time.Millisecond)
+	m.Tick(clk.Now()) // the due warm runs now that the tenant is ACTIVE
+	expect("warm/fault", r.calls() == want+2, "calls = %d, want %d", r.calls(), want+2)
+	expect("warm/fault", m.Hot(rigTenant) && m.Info(rigTenant).Pending == 0 && r.state() == Active, "Hot = %v, pending = %d, state = %v", m.Hot(rigTenant), m.Info(rigTenant).Pending, r.state())
+	if _, err := m.DecryptKey(rigTenant, old); err != nil {
+		t.Errorf("warm/fault: DecryptKey(old) err = %v", err)
+	}
+
+	// in-flight cap: a third concurrent call is errBusy, unclassified, never audited, never a KMS call
+	audits, calls := r.rec.len(), r.calls()
+	tt.mu.Lock()
+	tt.inflight = m.cfg.TenantInflight
+	tt.mu.Unlock()
+	res := m.call(tt, "unwrap", tt.active)
+	tt.mu.Lock()
+	tt.inflight = 0
+	tt.mu.Unlock()
+	expect("inflight", errors.Is(res.err, errBusy), "err = %v, want errBusy", res.err)
+	expect("inflight", r.rec.len() == audits && r.calls() == calls, "audits %d→%d, calls %d→%d", audits, r.rec.len(), calls, r.calls())
+	m.apply(tt, "warm", tt.deks[old], res) // the errBusy row: no state change, pending re-armed for the next sweep
+	expect("inflight", r.rec.len() == audits && r.state() == Active && m.Info(rigTenant).Pending == 1, "after apply: audits %d, state %v, pending %d", r.rec.len(), r.state(), m.Info(rigTenant).Pending)
+	tt.mu.Lock()
+	delete(tt.pending, old)
+	tt.mu.Unlock()
+
+	// stale OK: an OK sent before the latest deny must not un-park a revoked tenant
+	r.fake.Revoke(rigKEK)
+	clk.Advance(16 * time.Second)
+	if _, err := m.EncryptKey(ctx, rigTenant); err != nil { // handle copied, then the kicked probe is denied
+		t.Fatalf("stale: EncryptKey: %v", err)
+	}
+	expect("stale", r.state() == Revoked, "state = %v", r.state())
+	tt.mu.Lock()
+	deniedAt, active := tt.deniedAt, tt.active
+	tt.mu.Unlock()
+	m.apply(tt, "unwrap", active, result{sentAt: deniedAt.Add(-time.Second), class: OK})
+	expect("stale", r.state() == Revoked && r.rec.count("unwrap", "stale ok ignored") == 1, "state = %v, stale audits = %d", r.state(), r.rec.count("unwrap", "stale ok ignored"))
+	expect("stale", m.Info(rigTenant).HotDEKs == 0, "a stale OK installed plaintext")
+}
+
+// TestConcurrentColdCallers runs fifty cold-path callers and scheduler visits against one tenant with real
+// goroutines: exactly one DEK is generated, and no kicked probe leaves probing set (a joined singleflight call
+// clears it after sf.Do returns, not inside the flight).
+func TestConcurrentColdCallers(t *testing.T) {
+	r := newRig(t)
+	r.m.cfg.Spawn = func(f func()) { go f() }
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = r.m.EncryptKey(ctx, rigTenant)
+			r.m.Hot(rigTenant)
+		}()
+	}
+	wg.Wait()
+	deadline := time.Now().Add(2 * time.Second)
+	for r.m.Info(rigTenant).Probing && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	info := r.m.Info(rigTenant)
+	if info.Probing {
+		t.Error("probing still set after every kicked probe returned")
+	}
+	if info.DEKs != 1 || r.calls() != 1 || len(r.store.puts) != 1 {
+		t.Errorf("DEKs %d, calls %d, puts %d; want exactly one generate", info.DEKs, r.calls(), len(r.store.puts))
+	}
+	if !r.m.Hot(rigTenant) || info.State != Active {
+		t.Errorf("Hot = %v, state = %v", r.m.Hot(rigTenant), info.State)
+	}
+}

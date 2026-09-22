@@ -68,30 +68,83 @@ func (m *Manager) call(t *tenant, op string, d *dek) result {
 	return r
 }
 
-// probe renews the tenant's authorization: Unwrap of the active DEK (singleflight "<t>/active") or, when the tenant
-// has no DEK at all, a GenerateDataKey ("<t>/generate"); then apply. [SC-F2]
-func (m *Manager) probe(t *tenant) {
+// renew runs one authorization call for the tenant behind singleflight: a GenerateDataKey when the tenant has no
+// DEK (or, on the cold path, an exhausted active one), else an Unwrap of the active DEK; then apply. Inside the
+// flight it rechecks under t.mu whether the call is still needed, because a concurrent flight may have landed
+// between the caller's decision and this one: two cold callers never generate two DEKs, and two probes never
+// unwrap twice for one need. cold means the caller needs a usable handle now; a probe needs a renewal. [SC-F2]
+func (m *Manager) renew(t *tenant, cold bool) error {
+	now := m.cfg.Clock.Now()
 	t.mu.Lock()
 	d := t.active
+	gen := d == nil || (cold && t.state == Active && m.exhausted(d, now))
 	t.mu.Unlock()
-	if d == nil {
-		m.sf.Do(t.spec.ID+"/generate", func() (any, error) { _, r := m.generate(t); return nil, r.err })
-		return
+	key := t.spec.ID + "/active"
+	if gen {
+		key = t.spec.ID + "/generate"
 	}
-	m.sf.Do(t.spec.ID+"/active", func() (any, error) {
+	_, err, _ := m.sf.Do(key, func() (any, error) {
+		if m.satisfied(t, cold) {
+			return nil, nil
+		}
+		if gen {
+			_, r := m.generate(t)
+			return nil, r.err
+		}
 		r := m.call(t, "unwrap", d)
 		m.apply(t, "unwrap", d, r)
 		return nil, r.err
 	})
+	return err
 }
 
-// warm unwraps one non-active DEK a worker asked for (singleflight "<t>/<dekID>"), then apply.
+// satisfied reports, under t.mu, that the need behind a renew has already been met: a cold caller can seal now;
+// a probe's renewal has already happened (an ACTIVE tenant with a usable lease that is not yet soft-due). A tenant
+// in any other state needs a successful call to heal, so its probe is never skipped.
+func (m *Manager) satisfied(t *tenant, cold bool) bool {
+	now := m.cfg.Clock.Now()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	d := t.active
+	fresh := d != nil && d.key != nil && t.lease.Usable(now) && !(t.state == Active && m.exhausted(d, now))
+	if cold {
+		return fresh
+	}
+	return t.state == Active && fresh && !t.lease.SoftDue(now)
+}
+
+// probe is the kicked renewal (EncryptKey hot path, Hot, Tick). probing is cleared here, in the kicker's own
+// goroutine after sf.Do has returned, never inside the flight: a probe that joined an already-finished flight
+// (singleflight drops its key only after the function returns) would otherwise leave the flag set forever.
+func (m *Manager) probe(t *tenant) {
+	m.renew(t, false)
+	m.clearProbing(t)
+}
+
+// warm unwraps one non-active DEK a worker asked for (singleflight "<t>/<dekID>"), then apply; probing is
+// cleared after the flight as in probe. A DEK that another flight has already warmed is not unwrapped again.
 func (m *Manager) warm(t *tenant, d *dek) {
 	m.sf.Do(t.spec.ID+"/"+d.id, func() (any, error) {
+		t.mu.Lock()
+		hot := d.key != nil
+		if hot {
+			delete(t.pending, d.id)
+		}
+		t.mu.Unlock()
+		if hot {
+			return nil, nil
+		}
 		r := m.call(t, "unwrap", d)
 		m.apply(t, "warm", d, r)
 		return nil, r.err
 	})
+	m.clearProbing(t)
+}
+
+func (m *Manager) clearProbing(t *tenant) {
+	t.mu.Lock()
+	t.probing = false
+	t.mu.Unlock()
 }
 
 // generate calls GenerateDataKey, allocates "<t>/<seq+1>" on success, persists the wrapped form BEFORE apply, then
@@ -119,14 +172,14 @@ func (m *Manager) generate(t *tenant) (*dek, result) {
 }
 
 // apply is the only state mutator, always under t.mu. Rows exactly as ARCH › (c) apply table: OK / Transient / Deny,
-// plus errBusy and a store error (no change, no audit). It clears probing (probe and warm completions), writes
-// states[idx], and emits the audit lines: the unwrap/generate line first, then a state line if the state changed.
-// So Auditor.Audit is always called under t.mu and the order is deterministic (PutDEK → apply → audits).
+// plus errBusy and a store error (no change, no audit). It writes states[idx] and emits the audit lines: the
+// unwrap/generate line first, then a state line if the state changed. So Auditor.Audit is always called under
+// t.mu and the order is deterministic (PutDEK → apply → audits). Every failed call is also logged, one line per
+// second per message, so an outage is visible in the service log and not only in the audit ring.
 func (m *Manager) apply(t *tenant, op string, d *dek, r result) {
 	now := m.cfg.Clock.Now()
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.probing = false
 	if errors.Is(r.err, errBusy) || errors.Is(r.err, errStore) {
 		if op == "warm" && d != nil {
 			t.pending[d.id] = now.Add(m.cfg.SweepInterval)
@@ -167,19 +220,21 @@ func (m *Manager) apply(t *tenant, op string, d *dek, r result) {
 		}
 	case Deny:
 		m.audit(Audit{At: now, Tenant: t.spec.ID, Op: auditOp, Outcome: "denied", Detail: r.err.Error(), Class: Deny, Latency: r.latency})
+		m.log.Error("kms call denied", "tenant", t.spec.ID, "op", auditOp, "state", t.state.String(), "err", r.err)
 		purged := t.purge()
 		t.deniedAt = now                              // every deny: the stale-OK guard needs the latest
 		t.lease.SentAt = time.Time{}                  // no lease (the TTLs are configuration and stay)
 		t.nextProbeAt = now.Add(m.cfg.RevokedReprobe) // fixed period, no jitter; attempt untouched
 		if t.state != Revoked {
-			m.setState(t, Revoked, now, fmt.Sprintf("%d DEKs purged", purged), purged)
+			m.setState(t, Revoked, now, fmtPurged("key revoked", purged), purged)
 		}
 	default: // Transient (and Poison, which no KMS call produces: treated as an unanswered call)
 		m.audit(Audit{At: now, Tenant: t.spec.ID, Op: auditOp, Outcome: "error", Detail: r.err.Error(), Class: r.class, Latency: r.latency})
+		m.log.Error("kms call failed", "tenant", t.spec.ID, "op", auditOp, "class", r.class.String(), "state", t.state.String(), "attempt", t.attempt+1, "err", r.err)
 		t.attempt++
 		t.nextProbeAt = now.Add(m.backoff(t.attempt))
-		if op == "warm" && d != nil {
-			t.pending[d.id] = t.nextProbeAt
+		for id := range t.pending { // every pending warm waits for the same next slot: one KMS call per interval [SC-F5]
+			t.pending[id] = t.nextProbeAt
 		}
 		usable := t.lease.Usable(now)
 		switch {
@@ -190,7 +245,7 @@ func (m *Manager) apply(t *tenant, op string, d *dek, r result) {
 			m.setState(t, KeyUnavailable, now, "cold fetch failed", purged)
 		case t.state == RidingThrough && !usable:
 			purged := t.purge()
-			m.setState(t, KeyUnavailable, now, fmt.Sprintf("lease expired, %d DEKs purged", purged), purged)
+			m.setState(t, KeyUnavailable, now, fmtPurged("lease expired", purged), purged)
 		}
 	}
 }

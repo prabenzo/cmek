@@ -88,7 +88,7 @@ func (m *Manager) handle(t *tenant, now time.Time) (Handle, bool) {
 		return Handle{}, false
 	}
 	d.msgs++
-	return Handle{DEKID: d.id, ValidUntil: t.lease.SentAt.Add(m.cfg.Lease - m.cfg.EarlyExpiry), key: *d.key}, true
+	return Handle{DEKID: d.id, ValidUntil: t.lease.Until(), key: *d.key}, true
 }
 
 // EncryptKey returns a handle on the tenant's active DEK, fetching synchronously on the cold path; parked tenants
@@ -125,19 +125,8 @@ func (m *Manager) EncryptKey(ctx context.Context, id string) (Handle, error) {
 		return Handle{}, ErrKeyUnavailable
 	}
 	t.waiters++
-	d := t.active
-	gen := d == nil || (t.state == Active && m.exhausted(d, now))
 	t.mu.Unlock()
-	var err error
-	if gen {
-		_, err, _ = m.sf.Do(id+"/generate", func() (any, error) { _, r := m.generate(t); return nil, r.err })
-	} else {
-		_, err, _ = m.sf.Do(id+"/active", func() (any, error) {
-			r := m.call(t, "unwrap", d)
-			m.apply(t, "unwrap", d, r)
-			return nil, r.err
-		})
-	}
+	err := m.renew(t, true)
 	now = m.cfg.Clock.Now()
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -180,7 +169,7 @@ func (m *Manager) DecryptKey(id, dekID string) (Handle, error) {
 	if d.key == nil {
 		return Handle{}, ErrDEKCold
 	}
-	return Handle{DEKID: dekID, ValidUntil: t.lease.SentAt.Add(m.cfg.Lease - m.cfg.EarlyExpiry), key: *d.key}, nil
+	return Handle{DEKID: dekID, ValidUntil: t.lease.Until(), key: *d.key}, nil
 }
 
 // Hot reports whether the scheduler may dispatch the tenant now (ACTIVE or RIDING_THROUGH, usable lease, no pending

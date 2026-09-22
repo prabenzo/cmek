@@ -55,8 +55,9 @@ type World struct {
 
 	ids    []string
 	index  map[string]int
-	rankOf []int // grid index → Zipf rank (1 = heaviest)
-	byRank []int // rank-1 → grid index
+	specs  []cmek.TenantSpec // per-tenant wiring incl. the KEK id; Fault and SetKey read it rather than rebuild it
+	rankOf []int             // grid index → Zipf rank (1 = heaviest)
+	byRank []int             // rank-1 → grid index
 
 	kms     *kms.Fake
 	keys    *cmek.Manager
@@ -107,6 +108,7 @@ func New(p Params, d Deps) (*World, error) {
 		specs[i] = cmek.TenantSpec{ID: id, Provider: prov, KEKID: "kek-" + id}
 		keks[i] = kms.KEKSpec{ID: "kek-" + id, Provider: prov, Idx: i}
 	}
+	w.specs = specs
 	w.byRank = w.rnd.Perm(n) // rank r (1-based) lives at grid index byRank[r-1]
 	w.rankOf = make([]int, n)
 	for r, idx := range w.byRank {
@@ -326,10 +328,11 @@ func (w *World) Fault(f FaultRequest) error {
 		}
 		scope.Provider = f.Provider
 	case f.Tenant != "":
-		if _, ok := w.index[f.Tenant]; !ok {
+		idx, ok := w.index[f.Tenant]
+		if !ok {
 			return ErrUnknownTenant
 		}
-		scope.KEKID = "kek-" + f.Tenant
+		scope.KEKID = w.specs[idx].KEKID
 	default:
 		return fmt.Errorf("%w: provider or tenant required", ErrBadFault)
 	}
@@ -341,8 +344,19 @@ func (w *World) Fault(f FaultRequest) error {
 	default:
 		return fmt.Errorf("%w: unknown mode %q", ErrBadFault, f.Mode)
 	}
-	if f.LatencyP50Ms < 0 || f.LatencyP99Ms < f.LatencyP50Ms || f.ErrorRate < 0 || f.ErrorRate > 1 {
-		return fmt.Errorf("%w: 0 ≤ p50 ≤ p99 and 0 ≤ error_rate ≤ 1", ErrBadFault)
+	// Latency: the fake gates on p50 and draws σ from p99 ≥ p50, so a p50-only body means "no spread" and a
+	// p99-only body would be a silent no-op, which is refused rather than installed.
+	if f.LatencyP50Ms < 0 || f.LatencyP99Ms < 0 || f.ErrorRate < 0 || f.ErrorRate > 1 {
+		return fmt.Errorf("%w: latencies ≥ 0 and 0 ≤ error_rate ≤ 1", ErrBadFault)
+	}
+	if f.LatencyP99Ms > 0 && f.LatencyP50Ms == 0 {
+		return fmt.Errorf("%w: latency_p99_ms needs latency_p50_ms", ErrBadFault)
+	}
+	if f.LatencyP50Ms > 0 && f.LatencyP99Ms == 0 {
+		f.LatencyP99Ms = f.LatencyP50Ms
+	}
+	if f.LatencyP99Ms < f.LatencyP50Ms {
+		return fmt.Errorf("%w: latency_p99_ms < latency_p50_ms", ErrBadFault)
 	}
 	fault.P50, fault.P99, fault.ErrorRate = time.Duration(f.LatencyP50Ms)*time.Millisecond, time.Duration(f.LatencyP99Ms)*time.Millisecond, f.ErrorRate
 	w.kms.SetFault(scope, fault)
@@ -352,14 +366,15 @@ func (w *World) Fault(f FaultRequest) error {
 
 // SetKey maps "revoke" / "restore" to the fake KMS's Revoke / Restore of the tenant's KEK.
 func (w *World) SetKey(tenant, action string) error {
-	if _, ok := w.index[tenant]; !ok {
+	idx, ok := w.index[tenant]
+	if !ok {
 		return ErrUnknownTenant
 	}
 	switch action {
 	case "revoke":
-		w.kms.Revoke("kek-" + tenant)
+		w.kms.Revoke(w.specs[idx].KEKID)
 	case "restore":
-		w.kms.Restore("kek-" + tenant)
+		w.kms.Restore(w.specs[idx].KEKID)
 	default:
 		return fmt.Errorf("%w: unknown action %q", ErrBadFault, action)
 	}
