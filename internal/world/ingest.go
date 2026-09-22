@@ -28,6 +28,16 @@ func reasonFor(err error) string {
 	return reason
 }
 
+// reject counts a failed ingest by reason; an internal error (not a key-state answer) is also logged, throttled.
+func (w *World) reject(idx int, step string, err error) error {
+	reason := reasonFor(err)
+	w.metrics.Ingest(idx, reason, true)
+	if reason == "internal" {
+		w.errLog.Error("ingest failed", "step", step, "tenant", w.ids[idx], "err", err)
+	}
+	return err
+}
+
 // IngestID is Ingest plus the allocated message id for the 202 body: key, seal, insert, count the outcome (admission is inserted ahead of the key in M3).
 func (w *World) IngestID(ctx context.Context, tenant string, payload []byte) (int64, error) {
 	idx, ok := w.index[tenant]
@@ -36,20 +46,16 @@ func (w *World) IngestID(ctx context.Context, tenant string, payload []byte) (in
 	}
 	h, err := w.keys.EncryptKey(ctx, tenant)
 	if err != nil {
-		w.metrics.Ingest(idx, reasonFor(err), true)
-		return 0, err
+		return 0, w.reject(idx, "encrypt key", err)
 	}
 	id := w.store.NextID()
 	env, err := cmek.Seal(h, w.clock.Now(), tenant, id, payload)
 	h.Zero()
 	if err != nil {
-		w.metrics.Ingest(idx, reasonFor(err), true)
-		return 0, err
+		return 0, w.reject(idx, "seal", err)
 	}
 	if err := w.store.Insert(ctx, idx, id, env); err != nil {
-		err = fmt.Errorf("world: insert: %w", err)
-		w.metrics.Ingest(idx, reasonFor(err), true)
-		return 0, err
+		return 0, w.reject(idx, "insert", fmt.Errorf("world: insert: %w", err))
 	}
 	w.metrics.Ingest(idx, "accepted", true)
 	return id, nil

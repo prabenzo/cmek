@@ -52,7 +52,7 @@ func Open(h Handle, now time.Time, tenant string, msgID int64, env Envelope) ([]
 		return nil, ErrLeaseExpired
 	}
 	if h.DEKID != env.DEKID {
-		return nil, ErrPoison
+		return nil, fmt.Errorf("%w: handle %q, envelope %q", ErrPoison, h.DEKID, env.DEKID)
 	}
 	g, err := gcm(&h.key)
 	if err != nil {
@@ -60,7 +60,7 @@ func Open(h Handle, now time.Time, tenant string, msgID int64, env Envelope) ([]
 	}
 	pt, err := g.Open(nil, env.Nonce[:], env.Ciphertext, aad(tenant, msgID, env.DEKID))
 	if err != nil {
-		return nil, ErrPoison
+		return nil, fmt.Errorf("%w: %v", ErrPoison, err) // tag or AAD mismatch; the worker logs and dead-letters
 	}
 	return pt, nil
 }

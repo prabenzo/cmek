@@ -6,10 +6,10 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/prabenzo/cmek/internal/cmek"
+	"github.com/prabenzo/cmek/internal/logx"
 )
 
 // Keys is what workers need from the core.
@@ -47,17 +47,19 @@ type WorkersConfig struct {
 	ClaimBatch   int
 	ClaimTimeout time.Duration
 	IdlePoll     time.Duration
-	Logger       *slog.Logger // optional; Claim errors are logged at most once per second
+	Logger       *slog.Logger // optional; every error branch logs, throttled to one line per second per message
 }
 
 // Workers is the fixed pool; Run blocks until ctx ends.
 type Workers struct {
-	cfg     WorkersConfig
-	lastLog atomic.Int64 // unix ms of the last Claim error logged
+	cfg WorkersConfig
+	log logx.Throttle
 }
 
 // NewWorkers builds the pool.
-func NewWorkers(cfg WorkersConfig) *Workers { return &Workers{cfg: cfg} }
+func NewWorkers(cfg WorkersConfig) *Workers {
+	return &Workers{cfg: cfg, log: logx.Throttle{Log: cfg.Logger}}
+}
 
 // wait blocks until a row is inserted or released, IdlePoll elapses, or ctx ends; false means ctx ended.
 func (w *Workers) wait(ctx context.Context) bool {
@@ -70,13 +72,21 @@ func (w *Workers) wait(ctx context.Context) bool {
 	return true
 }
 
-func (w *Workers) logClaimErr(err error) {
-	if w.cfg.Logger == nil {
-		return
+// dead dead-letters one row and logs why (poison at decrypt, or the sink refused it).
+func (w *Workers) dead(ctx context.Context, b Batch, id int64, why string, cause error) {
+	w.log.Error("message dead-lettered", "why", why, "tenant", b.Tenant, "id", id, "err", cause)
+	if err := w.cfg.Store.Dead(ctx, b.Idx, id); err != nil {
+		w.log.Error("dead-letter failed", "tenant", b.Tenant, "id", id, "err", err)
 	}
-	now := w.cfg.Clock.Now().UnixMilli()
-	if last := w.lastLog.Load(); now-last >= 1000 && w.lastLog.CompareAndSwap(last, now) {
-		w.cfg.Logger.Error("claim", "err", err)
+}
+
+// release returns the unprocessed rest of a batch untouched (S4) and logs the reason.
+func (w *Workers) release(ctx context.Context, b Batch, rest []Message, why string, cause error) {
+	if ctx.Err() == nil { // a stopping worker releases silently
+		w.log.Error("batch released", "why", why, "tenant", b.Tenant, "rows", len(rest), "err", cause)
+	}
+	if _, err := w.cfg.Store.Release(ctx, b.Idx, ids(rest)); err != nil && ctx.Err() == nil {
+		w.log.Error("release failed", "tenant", b.Tenant, "rows", len(rest), "err", err)
 	}
 }
 
@@ -119,7 +129,7 @@ func (w *Workers) loop(ctx context.Context) {
 			// wait as the idle branch does. An empty batch means the ledger and the table disagree or another
 			// worker took the rows; same wait.
 			if err != nil && ctx.Err() == nil {
-				w.logClaimErr(err)
+				w.log.Error("claim failed", "tenant", c.Tenants[idx], "err", err)
 			}
 			if !w.wait(ctx) {
 				return
@@ -131,39 +141,41 @@ func (w *Workers) loop(ctx context.Context) {
 			h, err := c.Keys.DecryptKey(batch.Tenant, m.DEKID)
 			if err != nil {
 				if errors.Is(err, cmek.ErrPoison) {
-					_ = c.Store.Dead(ctx, idx, m.ID)
+					w.dead(ctx, batch, m.ID, "foreign dek id", err)
 					continue
 				}
 				if errors.Is(err, cmek.ErrDEKCold) {
 					c.Keys.Warm(batch.Tenant, m.DEKID)
 				}
-				_, _ = c.Store.Release(ctx, idx, ids(batch.Msgs[i:]))
+				w.release(ctx, batch, batch.Msgs[i:], "key not usable", err)
 				break
 			}
 			pt, err := cmek.Open(h, c.Clock.Now(), batch.Tenant, m.ID, cmek.Envelope{DEKID: m.DEKID, Nonce: m.Nonce, Ciphertext: m.Ciphertext})
 			h.Zero()
 			if err != nil {
 				if errors.Is(err, cmek.ErrPoison) {
-					_ = c.Store.Dead(ctx, idx, m.ID)
+					w.dead(ctx, batch, m.ID, "envelope does not open", err)
 					continue
 				}
-				_, _ = c.Store.Release(ctx, idx, ids(batch.Msgs[i:]))
+				w.release(ctx, batch, batch.Msgs[i:], "lease lapsed at decrypt", err)
 				break
 			}
 			deliveredAt, err := c.Sink.Deliver(ctx, batch.Tenant, idx, m.ID, pt)
 			if err != nil {
 				if ctx.Err() != nil {
-					_, _ = c.Store.Release(ctx, idx, ids(batch.Msgs[i:]))
+					w.release(ctx, batch, batch.Msgs[i:], "stopping", err)
 					break
 				}
-				_ = c.Store.Dead(ctx, idx, m.ID) // the sink saw another tenant's canary: S2 witness
+				w.dead(ctx, batch, m.ID, "sink refused delivery", err) // the sink saw another tenant's canary: S2 witness
 				continue
 			}
 			c.Recorder.Delivered(idx, deliveredAt.Sub(m.EnqueuedAt))
 			acked = append(acked, m.ID)
 		}
 		if len(acked) > 0 {
-			_, _ = c.Store.Ack(ctx, idx, acked)
+			if _, err := c.Store.Ack(ctx, idx, acked); err != nil && ctx.Err() == nil {
+				w.log.Error("ack failed", "tenant", batch.Tenant, "rows", len(acked), "err", err)
+			}
 		}
 	}
 }

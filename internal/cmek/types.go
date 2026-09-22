@@ -4,6 +4,7 @@ package cmek
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"time"
 
 	"github.com/prabenzo/cmek/internal/kms"
@@ -124,6 +125,7 @@ type Config struct {
 	Clock     Clock
 	Jitter    Jitter
 	Spawn     func(func()) // tests pass func(f func()) { f() }
+	Logger    *slog.Logger // optional; every KMS and store error is logged (throttled to one line per second per message)
 
 	Lease, SoftTTL, EarlyExpiry, KMSTimeout, BackoffMin, BackoffMax, RevokedReprobe, DEKMaxAge, SweepInterval time.Duration
 	BackoffJitter                                                                                             float64

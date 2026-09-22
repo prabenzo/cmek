@@ -15,6 +15,7 @@ import (
 
 	"github.com/prabenzo/cmek/internal/cmek"
 	"github.com/prabenzo/cmek/internal/kms"
+	"github.com/prabenzo/cmek/internal/logx"
 	"github.com/prabenzo/cmek/internal/metrics"
 	"github.com/prabenzo/cmek/internal/queue"
 	"github.com/prabenzo/cmek/internal/traffic"
@@ -48,6 +49,7 @@ type World struct {
 	wg     sync.WaitGroup
 	clock  Clock
 	log    *slog.Logger
+	errLog logx.Throttle // internal ingest errors, one line per second per message
 	rnd    *rand.Rand
 	rndMu  sync.Mutex
 
@@ -92,7 +94,7 @@ func New(p Params, d Deps) (*World, error) {
 		d.Logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	w := &World{ID: d.ID, P: p, ctx: ctx, cancel: cancel, clock: d.Clock, log: d.Logger.With("world", d.ID), rnd: rand.New(rand.NewSource(p.Seed)), started: d.Clock.Now()}
+	w := &World{ID: d.ID, P: p, ctx: ctx, cancel: cancel, clock: d.Clock, log: d.Logger.With("world", d.ID), errLog: logx.Throttle{Log: d.Logger.With("world", d.ID)}, rnd: rand.New(rand.NewSource(p.Seed)), started: d.Clock.Now()}
 	n := p.Tenants
 	w.ids = make([]string, n)
 	w.index = make(map[string]int, n)
@@ -126,7 +128,7 @@ func New(p Params, d Deps) (*World, error) {
 		return nil, err
 	}
 	w.store = store
-	w.keys = cmek.New(ctx, cmek.Config{Tenants: specs, Providers: p.Providers, Keys: w.kms, Store: store, Audit: auditBridge{w}, Clock: d.Clock, Jitter: jitter{w}, KMSTimeout: p.KMSTimeout, SweepInterval: p.SweepInterval})
+	w.keys = cmek.New(ctx, cmek.Config{Tenants: specs, Providers: p.Providers, Keys: w.kms, Store: store, Audit: auditBridge{w}, Clock: d.Clock, Jitter: jitter{w}, Logger: w.log, KMSTimeout: p.KMSTimeout, SweepInterval: p.SweepInterval})
 	w.sink = traffic.NewSink(traffic.SinkConfig{Tenants: w.ids, MinLatency: p.SinkLatencyMin, MaxLatency: p.SinkLatencyMax, Ring: p.SinkRing, CanaryPrefix: p.CanaryPrefix, Clock: d.Clock, Rand: w.rnd, Lock: &w.rndMu})
 	w.gen = traffic.NewGenerator(traffic.GeneratorConfig{Tenants: w.ids, Rates: rates, PayloadBytes: p.PayloadBytes, CanaryPrefix: p.CanaryPrefix, Ingest: w, Clock: d.Clock, Rand: w.rnd, Lock: &w.rndMu})
 	capacity := float64(p.Workers) / ((p.SinkLatencyMin + p.SinkLatencyMax) / 2).Seconds()

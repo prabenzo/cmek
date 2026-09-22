@@ -108,7 +108,9 @@ func Open(cfg Config) (*Store, error) {
 		cfg.Logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	}
 	for _, suffix := range []string{"", "-wal", "-shm"} {
-		_ = os.Remove(cfg.Path + suffix)
+		if err := os.Remove(cfg.Path + suffix); err != nil && !errors.Is(err, os.ErrNotExist) {
+			cfg.Logger.Error("stale database file not removed", "path", cfg.Path+suffix, "err", err)
+		}
 	}
 	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(wal)&_pragma=synchronous(%s)&_pragma=busy_timeout(5000)", cfg.Path, cfg.SyncMode)
 	wdb, err := sql.Open("sqlite", dsn)
@@ -142,9 +144,14 @@ func Open(cfg Config) (*Store, error) {
 		return fail(fmt.Errorf("schema: %w", err))
 	}
 	var jm, sy, ac string
-	_ = w.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&jm)
-	_ = w.QueryRowContext(ctx, "PRAGMA synchronous").Scan(&sy)
-	_ = w.QueryRowContext(ctx, "PRAGMA wal_autocheckpoint").Scan(&ac)
+	for _, x := range []struct {
+		name string
+		dst  *string
+	}{{"journal_mode", &jm}, {"synchronous", &sy}, {"wal_autocheckpoint", &ac}} {
+		if err := w.QueryRowContext(ctx, "PRAGMA "+x.name).Scan(x.dst); err != nil {
+			return fail(fmt.Errorf("pragma %s: %w", x.name, err))
+		}
+	}
 	cfg.Logger.Info("sqlite open", "path", cfg.Path, "journal_mode", jm, "synchronous", sy, "wal_autocheckpoint", ac)
 	prep := func(dst **sql.Stmt, q string) error {
 		st, err := w.PrepareContext(ctx, q)
@@ -200,7 +207,10 @@ func (s *Store) Close() error {
 		err = errors.Join(err, s.rdb.Close())
 	}
 	for _, suffix := range []string{"", "-wal", "-shm"} {
-		_ = os.Remove(s.cfg.Path + suffix)
+		if rmErr := os.Remove(s.cfg.Path + suffix); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			s.cfg.Logger.Error("database file not removed", "path", s.cfg.Path+suffix, "err", rmErr)
+			err = errors.Join(err, rmErr)
+		}
 	}
 	return err
 }
@@ -291,7 +301,11 @@ func (s *Store) Claim(ctx context.Context, idx, n int, until time.Time) (Batch, 
 	rows.Close()
 	changed := int64(drained)
 	if scanErr != nil {
-		_ = s.w.QueryRowContext(s.bg(), "SELECT changes()").Scan(&changed)
+		s.cfg.Logger.Error("claim cursor failed; ledger moved by changes()", "tenant", b.Tenant, "err", scanErr)
+		if err := s.w.QueryRowContext(s.bg(), "SELECT changes()").Scan(&changed); err != nil {
+			s.cfg.Logger.Error("changes() failed after claim; ledger moved by rows drained", "tenant", b.Tenant, "drained", drained, "err", err)
+			changed = int64(drained)
+		}
 	}
 	s.ready[idx].Add(-changed)
 	s.claimed[idx].Add(changed)

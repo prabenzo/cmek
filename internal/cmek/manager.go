@@ -5,12 +5,36 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"sync"
 	"time"
 
 	"golang.org/x/sync/singleflight"
 )
+
+// throttle logs one line per second per message (the core has no logx dependency by the import rule).
+type throttle struct {
+	log  *slog.Logger
+	mu   sync.Mutex
+	last map[string]time.Time
+}
+
+func (t *throttle) Error(msg string, attrs ...any) {
+	if t.log == nil {
+		return
+	}
+	t.mu.Lock()
+	now := time.Now()
+	ok := now.Sub(t.last[msg]) >= time.Second
+	if ok {
+		t.last[msg] = now
+	}
+	t.mu.Unlock()
+	if ok {
+		t.log.Error(msg, attrs...)
+	}
+}
 
 // errStore marks a DEKStore failure: not a KMS outcome, so no audit line, no state change, and EncryptKey returns it
 // unclassified (world.Outcome answers 500 internal, which must stay at 0).
@@ -27,6 +51,7 @@ type Manager struct {
 	sf      singleflight.Group
 	ctx     context.Context
 	cfg     Config
+	log     throttle
 }
 
 // New builds a Manager; ctx bounds every fetch.
@@ -34,7 +59,7 @@ func New(ctx context.Context, cfg Config) *Manager {
 	if cfg.Spawn == nil {
 		cfg.Spawn = func(f func()) { go f() }
 	}
-	m := &Manager{tenants: make(map[string]*tenant, len(cfg.Tenants)), ctx: ctx, cfg: cfg}
+	m := &Manager{tenants: make(map[string]*tenant, len(cfg.Tenants)), ctx: ctx, cfg: cfg, log: throttle{log: cfg.Logger, last: make(map[string]time.Time)}}
 	for i, spec := range cfg.Tenants {
 		t := &tenant{idx: i, spec: spec, deks: make(map[string]*dek)}
 		m.tenants[spec.ID] = t
@@ -91,9 +116,11 @@ func (m *Manager) generate(t *tenant) error {
 	latency := m.cfg.Clock.Now().Sub(start)
 	if err != nil {
 		m.cfg.Audit.Audit(Audit{At: m.cfg.Clock.Now(), Tenant: t.spec.ID, Op: "generate", Outcome: "error", Detail: err.Error(), Class: Transient, Latency: latency})
+		m.log.Error("kms generate failed", "tenant", t.spec.ID, "kek", t.spec.KEKID, "latency", latency, "err", err)
 		return err
 	}
 	if err := m.cfg.Store.PutDEK(m.ctx, WrappedDEK{ID: dekID, Tenant: t.spec.ID, KEKID: t.spec.KEKID, KEKVersion: dk.KEKVersion, Wrapped: dk.Wrapped, CreatedAt: m.cfg.Clock.Now()}); err != nil {
+		m.log.Error("dek store write failed", "tenant", t.spec.ID, "dek", dekID, "err", err)
 		return fmt.Errorf("%w: %v", errStore, err)
 	}
 	key := dk.Plaintext
