@@ -116,8 +116,18 @@ func (g *Generator) Run(ctx context.Context) {
 	wg.Wait()
 }
 
+// loop is one tenant's open-loop Poisson source. Arrivals sit on an absolute
+// schedule (next = previous scheduled arrival + an exponential gap), so time spent
+// inside Ingest and late timer wakeups do not lower the achieved rate: a late loop
+// sends at once and its following gaps come from the schedule, not from the send
+// time. The schedule restarts at now on the first send, after a pause and after a
+// rate of zero (never a catch-up burst for time the loop was not running), and
+// when the loop is more than a second behind (a stall). The wait is capped at the
+// drawn gap, so a clock whose Now stands still (tests) degrades to sleep-then-send
+// instead of ever-growing waits.
 func (g *Generator) loop(ctx context.Context, idx int) {
 	tenant := g.cfg.Tenants[idx]
+	var next time.Time // zero: restart the schedule at now
 	for {
 		select {
 		case <-g.runningCh():
@@ -125,25 +135,34 @@ func (g *Generator) loop(ctx context.Context, idx int) {
 			return
 		}
 		r := g.rate(idx)
-		var wait time.Duration
 		if r <= 0 {
-			wait = time.Second
-		} else {
-			wait = time.Duration(g.exp() / r * float64(time.Second))
-		}
-		select {
-		case <-g.cfg.Clock.After(wait):
-		case <-ctx.Done():
-			return
-		}
-		if r <= 0 {
+			select {
+			case <-g.cfg.Clock.After(time.Second):
+			case <-ctx.Done():
+				return
+			}
+			next = time.Time{}
 			continue
+		}
+		now := g.cfg.Clock.Now()
+		if next.IsZero() || next.Before(now.Add(-time.Second)) {
+			next = now
+		}
+		gap := time.Duration(g.exp() / r * float64(time.Second))
+		next = next.Add(gap)
+		if wait := min(next.Sub(now), gap); wait > 0 {
+			select {
+			case <-g.cfg.Clock.After(wait):
+			case <-ctx.Done():
+				return
+			}
 		}
 		g.mu.Lock()
 		on := g.on
 		g.mu.Unlock()
 		if !on {
-			continue // paused during the wait: do not send after resume
+			next = time.Time{} // paused during the wait: no send now, fresh schedule on resume
+			continue
 		}
 		_ = g.cfg.Ingest.Ingest(ctx, tenant, Payload(tenant, g.next(idx), g.cfg.PayloadBytes, g.cfg.CanaryPrefix))
 	}
