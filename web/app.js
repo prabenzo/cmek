@@ -318,6 +318,25 @@ function pin(i) {
   pinTimer = setInterval(refresh, 2000);
 }
 
+// ---- hover text -------------------------------------------------------------------------------------------------------
+
+// bindHelp shows an element's data-tip in #help as soon as the pointer enters it (native title tooltips need a
+// second of rest and are easy to miss), below the element and kept inside the viewport.
+function bindHelp() {
+  const help = $('help');
+  document.querySelectorAll('[data-tip]').forEach(el => {
+    el.addEventListener('mouseenter', () => {
+      help.textContent = el.dataset.tip;
+      help.style.display = 'block';
+      const r = el.getBoundingClientRect();
+      const w = help.offsetWidth, h = help.offsetHeight;
+      help.style.left = Math.max(8, Math.min(r.left, window.innerWidth - w - 8)) + 'px';
+      help.style.top = (r.bottom + 6 + h > window.innerHeight ? r.top - h - 6 : r.bottom + 6) + 'px';
+    });
+    el.addEventListener('mouseleave', () => { help.style.display = 'none'; });
+  });
+}
+
 // ---- boot -----------------------------------------------------------------------------------------------------------
 
 paintGrid(null);
@@ -325,5 +344,6 @@ drawBands();
 initCharts();
 bindCards();
 bindGrid();
+bindHelp();
 renderCards(null);
 connect();

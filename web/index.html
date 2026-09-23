@@ -55,7 +55,8 @@
   .light.ok i { background:var(--green); } .light.bad i { background:var(--red); }
   .light b { flex:none; }
   .light span { color:var(--dim); flex:1; min-width:0; }
-  .light b[title], #legend span[title] { cursor:help; border-bottom:1px dotted var(--dim); }
+  [data-tip] { cursor:help; border-bottom:1px dotted var(--dim); }
+  #help { position:fixed; display:none; max-width:380px; background:#000e; border:1px solid var(--line); border-radius:4px; padding:8px 10px; font-size:12.5px; line-height:1.4; color:var(--fg); pointer-events:none; z-index:9; }
   #tl { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:8px 12px; }
   #timeline { margin:0; padding-left:0; list-style:none; font-family:ui-monospace, Menlo, monospace; font-size:11.5px; max-height:640px; overflow:auto; }
   #timeline li { padding:2px 0; border-bottom:1px solid #1f232c; color:var(--dim); }
@@ -109,7 +110,7 @@
       <canvas id="grid" width="800" height="500"></canvas>
       <div id="bands"></div>
       <div id="tip"></div>
-      <div id="legend"><span title="ACTIVE: the tenant's key lease is valid and its data key is cached; events are sealed and delivered normally."><i style="background:var(--green)"></i>ACTIVE</span><span title="RIDING_THROUGH: a lease renewal failed (timeout or 5xx from the KMS) but the 30 s lease is still valid, so the tenant keeps sealing and delivering on the cached key while probes retry with backoff. No customer impact."><i style="background:var(--yellow)"></i>RIDING_THROUGH</span><span title="KEY_UNAVAILABLE: the lease expired with no successful renewal, so the cached keys were purged; ingest answers 503 key_unavailable with Retry-After and delivery is parked until a probe succeeds. Nothing is lost."><i style="background:var(--orange)"></i>KEY_UNAVAILABLE</span><span title="REVOKED: the KMS answered an authoritative deny (key disabled or access denied); keys were purged at once, ingest answers 403 key_revoked and nothing of this tenant's is decrypted until the key is restored."><i style="background:var(--purple)"></i>REVOKED</span><span title="A white ring marks the tenants the running scenario targets: one tenant for a revocation or a tenant surge, a provider's third of the grid for a blip, an outage or slow KMS, everyone for the global surge."><i style="border:2px solid #fff;background:none"></i>scenario target</span><span>hover: tenant · click: pin</span></div>
+      <div id="legend"><span data-tip="ACTIVE: the tenant's key lease is valid and its data key is cached; events are sealed and delivered normally."><i style="background:var(--green)"></i>ACTIVE</span><span data-tip="RIDING_THROUGH: a lease renewal failed (timeout or 5xx from the KMS) but the 30 s lease is still valid, so the tenant keeps sealing and delivering on the cached key while probes retry with backoff. No customer impact."><i style="background:var(--yellow)"></i>RIDING_THROUGH</span><span data-tip="KEY_UNAVAILABLE: the lease expired with no successful renewal, so the cached keys were purged; ingest answers 503 key_unavailable with Retry-After and delivery is parked until a probe succeeds. Nothing is lost."><i style="background:var(--orange)"></i>KEY_UNAVAILABLE</span><span data-tip="REVOKED: the KMS answered an authoritative deny (key disabled or access denied); keys were purged at once, ingest answers 403 key_revoked and nothing of this tenant's is decrypted until the key is restored."><i style="background:var(--purple)"></i>REVOKED</span><span data-tip="A white ring marks the tenants the running scenario targets: one tenant for a revocation or a tenant surge, a provider's third of the grid for a blip, an outage or slow KMS, everyone for the global surge."><i style="border:2px solid #fff;background:none"></i>scenario target</span><span>hover: tenant · click: pin</span></div>
     </div>
     <div id="pin"></div>
     <div id="tiles">
@@ -128,17 +129,18 @@
   <section id="right">
     <div id="panel">
       <h3>Invariants</h3>
-      <div class="light" data-k="S1"><i></i><b title="S1 No plaintext at rest. A payload that can't be encrypted under its tenant's key is rejected: there is no fallback key and no plaintext write. Live check: every payload carries a canary string and the checker scans the stored rows for it; the count must be 0.">No plaintext at rest</b><span>pending</span></div>
-      <div class="light" data-k="S2"><i></i><b title="S2 Tenant key isolation. A payload is only ever encrypted under a DEK wrapped by its own tenant's KEK. Live check: the AAD binds tenant, message and DEK ids, and the sink verifies that the payload's tenant equals the envelope's tenant.">Tenant key isolation</b><span>pending</span></div>
-      <div class="light" data-k="S3"><i></i><b title="S3 Bounded revocation. After a key is revoked at time t, none of that tenant's payloads is decrypted after t + lease (30 s here); an authoritative deny purges the keys at once. Live check: the checker counts decrypts later than the ground-truth t + lease; the count must be 0, and the detection latency is displayed.">Bounded revocation</b><span>pending</span></div>
-      <div class="light" data-k="S4"><i></i><b title="S4 No loss from key unavailability. A transient key failure never drops a message, dead-letters it or burns its retry budget. Live check: conservation per tenant, accepted = delivered + queued + expired + dead.">No loss from key unavailability</b><span>pending</span></div>
-      <div class="light" data-k="L1"><i></i><b title="L1 Blast radius. During a fault or surge on some tenants, unaffected tenants keep their p99 end-to-end latency within 1.25x of baseline and a rejection rate of 0. Live check: the healthy-versus-affected p99 chart and this light.">Blast radius</b><span>pending</span></div>
-      <div class="light" data-k="L4"><i></i><b title="L4 Overload. When offered load exceeds delivery capacity, delivered throughput holds at capacity and the backlog stays bounded; the excess is rejected at ingest, heaviest tenants first, and tenants within their fair share see no rejections. Live check: the delivered-against-capacity tile, the backlog chart and the rejections split by tenants within and over their share.">Overload</b><span>pending</span></div>
+      <div class="light" data-k="S1"><i></i><b data-tip="S1 No plaintext at rest. A payload that can't be encrypted under its tenant's key is rejected: there is no fallback key and no plaintext write. Live check: every payload carries a canary string and the checker scans the stored rows for it; the count must be 0.">No plaintext at rest</b><span>pending</span></div>
+      <div class="light" data-k="S2"><i></i><b data-tip="S2 Tenant key isolation. A payload is only ever encrypted under a DEK wrapped by its own tenant's KEK. Live check: the AAD binds tenant, message and DEK ids, and the sink verifies that the payload's tenant equals the envelope's tenant.">Tenant key isolation</b><span>pending</span></div>
+      <div class="light" data-k="S3"><i></i><b data-tip="S3 Bounded revocation. After a key is revoked at time t, none of that tenant's payloads is decrypted after t + lease (30 s here); an authoritative deny purges the keys at once. Live check: the checker counts decrypts later than the ground-truth t + lease; the count must be 0, and the detection latency is displayed.">Bounded revocation</b><span>pending</span></div>
+      <div class="light" data-k="S4"><i></i><b data-tip="S4 No loss from key unavailability. A transient key failure never drops a message, dead-letters it or burns its retry budget. Live check: conservation per tenant, accepted = delivered + queued + expired + dead.">No loss from key unavailability</b><span>pending</span></div>
+      <div class="light" data-k="L1"><i></i><b data-tip="L1 Blast radius. During a fault or surge on some tenants, unaffected tenants keep their p99 end-to-end latency within 1.25x of baseline and a rejection rate of 0. Live check: the healthy-versus-affected p99 chart and this light.">Blast radius</b><span>pending</span></div>
+      <div class="light" data-k="L4"><i></i><b data-tip="L4 Overload. When offered load exceeds delivery capacity, delivered throughput holds at capacity and the backlog stays bounded; the excess is rejected at ingest, heaviest tenants first, and tenants within their fair share see no rejections. Live check: the delivered-against-capacity tile, the backlog chart and the rejections split by tenants within and over their share.">Overload</b><span>pending</span></div>
     </div>
     <div id="tl"><h3>Timeline</h3><ol id="timeline"></ol></div>
   </section>
 </main>
 <div id="toast"></div>
+<div id="help"></div>
 <script src="/uplot.min.js"></script>
 <script src="/app.js"></script>
 </body>
