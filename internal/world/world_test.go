@@ -447,3 +447,144 @@ func TestNoCacheScenarios(t *testing.T) {
 		t.Errorf("cache not back after a stopped run: hot %d", got)
 	}
 }
+
+// snapshotLines returns the timeline texts of the next snapshot on a fresh subscription.
+func snapshotLines(t *testing.T, w *World) []string {
+	t.Helper()
+	ch, cancel := w.Subscribe()
+	defer cancel()
+	var s struct {
+		Events []struct{ Text string } `json:"events"`
+	}
+	select {
+	case b := <-ch:
+		if err := json.Unmarshal(b, &s); err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no snapshot")
+	}
+	out := make([]string, 0, len(s.Events))
+	for _, e := range s.Events {
+		out = append(out, e.Text)
+	}
+	return out
+}
+
+// TestHolderIdleRule: Acquire keeps a World that was watched less than IdleRebuild ago, rebuilds one idle for
+// longer (and the old database file is gone), and Reset waits for a held handler before it can stop the old World.
+func TestHolderIdleRule(t *testing.T) {
+	dir := t.TempDir()
+	p := Small()
+	p.DBDir = dir
+	clk := &testClock{now: time.Date(2026, 9, 23, 0, 0, 0, 0, time.UTC)}
+	advance := func(d time.Duration) {
+		clk.mu.Lock()
+		clk.now = clk.now.Add(d)
+		clk.mu.Unlock()
+	}
+	h := NewHolder(p, Deps{Clock: clk})
+	w1, ch, rel := h.Acquire()
+	if w1 == nil || w1.ID != "w-1" || ch == nil || w1.Viewers() != 1 {
+		t.Fatalf("first acquire: %v", w1)
+	}
+	rel()
+	if w1.Viewers() != 0 {
+		t.Fatalf("viewers after release: %d", w1.Viewers())
+	}
+	advance(9 * time.Second)
+	w, _, rel2 := h.Acquire()
+	if w != w1 {
+		t.Errorf("acquire after 9 s idle rebuilt: %s", w.ID)
+	}
+	rel2()
+	advance(11 * time.Second)
+	w2, _, rel3 := h.Acquire()
+	if w2 == w1 || w2.ID != "w-2" {
+		t.Fatalf("acquire after 20 s idle kept the World: %v", w2)
+	}
+	if _, err := os.Stat(filepath.Join(dir, fmt.Sprintf("killswitch-%d-w-1.db", os.Getpid()))); err == nil {
+		t.Error("w-1's database file still exists after the rebuild")
+	}
+	rel3()
+	// Reset waits for a held handler (Ensure's release) before it can stop the old World
+	held, release := h.Ensure()
+	if held != w2 {
+		t.Fatalf("Ensure returned %v, want w-2", held)
+	}
+	done := make(chan *World, 1)
+	go func() { done <- h.Reset() }()
+	select {
+	case w := <-done:
+		t.Fatalf("Reset returned %s while a handler held the World", w.ID)
+	case <-time.After(100 * time.Millisecond):
+	}
+	release()
+	select {
+	case w := <-done:
+		if w == nil || w.ID != "w-3" {
+			t.Errorf("Reset built %v, want w-3", w)
+		}
+		defer w.Stop()
+	case <-time.After(p.StopTimeout + 100*time.Millisecond):
+		t.Fatal("Reset did not return after the handler released")
+	}
+	cur, relCur := h.Current()
+	relCur()
+	if cur == nil || cur.ID != "w-3" {
+		t.Errorf("Current after Reset: %v", cur)
+	}
+}
+
+// TestFastFailStormRace [SC-F4]: a provider-wide fast-fail storm across 333 warmed tenants, concurrent with the
+// metrics tick, the checker and the sweep, under the race detector; only monotone facts are asserted (ticks
+// advanced, a ride-through or key-unavailable line posted, Stop within StopTimeout).
+func TestFastFailStormRace(t *testing.T) {
+	p := Demo()
+	p.DBDir = t.TempDir()
+	p.BaseRate = 100
+	clk := &testClock{now: time.Date(2026, 9, 23, 0, 0, 0, 0, time.UTC)}
+	advance := func(d time.Duration) {
+		clk.mu.Lock()
+		clk.now = clk.now.Add(d)
+		clk.mu.Unlock()
+	}
+	h := NewHolder(p, Deps{Clock: clk})
+	w, _, rel := h.Acquire() // a viewer: traffic and the tick run
+	if w == nil {
+		t.Fatal("no world")
+	}
+	defer rel()
+	ctx := context.Background()
+	for _, idx := range w.band(p.OutageProvider) { // warm every gcp tenant so leases exist before the fault
+		id := w.ids[idx]
+		if err := w.Ingest(ctx, id, []byte(fmt.Sprintf(`{"canary":"%s%s"}`, p.CanaryPrefix, id))); err != nil {
+			t.Fatalf("warm %s: %v", id, err)
+		}
+	}
+	ticks := w.metrics.Ticks()
+	if err := w.Fault(FaultRequest{Provider: p.OutageProvider, Mode: "fast_fail"}); err != nil {
+		t.Fatal(err)
+	}
+	advance(16 * time.Second) // every warmed lease is soft-due: the next seal or scheduler visit kicks a renewal
+	for i := 0; i < 12; i++ {
+		advance(250 * time.Millisecond)
+		time.Sleep(250 * time.Millisecond)
+	}
+	if w.metrics.Ticks() <= ticks {
+		t.Error("the metrics tick did not advance during the storm")
+	}
+	seen := false
+	for _, l := range snapshotLines(t, w) {
+		seen = seen || strings.Contains(l, "RIDING_THROUGH") || strings.Contains(l, "KEY_UNAVAILABLE")
+	}
+	if !seen {
+		t.Error("no ride-through or key-unavailable line during the storm")
+	}
+	start := time.Now()
+	rel()
+	w.Stop()
+	if d := time.Since(start); d > p.StopTimeout+100*time.Millisecond {
+		t.Errorf("Stop took %v", d)
+	}
+}

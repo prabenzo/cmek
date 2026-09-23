@@ -30,6 +30,19 @@ func (s *server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/traffic", s.traffic)
 	mux.HandleFunc("POST /v1/scenarios/{name}/start", s.scenarioStart)
 	mux.HandleFunc("POST /v1/scenarios/{name}/stop", s.scenarioStop)
+	mux.HandleFunc("POST /v1/reset", s.reset)
+}
+
+// reset is POST /v1/reset: stop the current World and build a fresh one; 200 {"world":"w-n"}. It is the one
+// handler that does not go through Ensure: holding a release while asking for the reset would deadlock by
+// construction (Reset's Stop waits for released handlers).
+func (s *server) reset(rw http.ResponseWriter, r *http.Request) {
+	w := s.holder.Reset()
+	if w == nil {
+		writeJSON(rw, http.StatusServiceUnavailable, errorBody{Error: "no_world"})
+		return
+	}
+	writeJSON(rw, http.StatusOK, map[string]string{"world": w.ID})
 }
 
 // traffic is POST /v1/traffic {"tenant":"t-0042"|"","multiplier":5}: one tenant's or everyone's offered rate
@@ -136,7 +149,8 @@ func (s *server) controlOutcome(rw http.ResponseWriter, err error, tenant string
 
 // health is GET /health: liveness plus the tick counter and the M1 insert instrument; it never builds a World.
 func (s *server) health(rw http.ResponseWriter, r *http.Request) {
-	w := s.holder.Current()
+	w, release := s.holder.Current()
+	defer release()
 	if w == nil {
 		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "no_world"})
 		return
@@ -187,7 +201,8 @@ func (s *server) events(rw http.ResponseWriter, r *http.Request) {
 
 // tenant is GET /v1/tenants/{id}: the tenant read model (M1: state, rank, backlog, offered rate; M4 fills the rest).
 func (s *server) tenant(rw http.ResponseWriter, r *http.Request) {
-	w := s.holder.Current()
+	w, release := s.holder.Current()
+	defer release()
 	if w == nil {
 		writeJSON(rw, http.StatusServiceUnavailable, errorBody{Error: "no_world"})
 		return

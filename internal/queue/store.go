@@ -468,6 +468,76 @@ func (s *Store) Expire(ctx context.Context, before time.Time, limit int) (int, e
 	return int(total), nil
 }
 
+// Census is one consistent per-tenant ledger plus SQL row counts taken in one critical section (Q1): the checker's
+// S4 evidence. Accepted, Delivered and Expired are the ledger's counters; Ready, Claimed and Dead are the rows'
+// own GROUP BY counts, taken on the writer inside store.mu so no write interleaves.
+type Census struct {
+	Accepted, Delivered, Expired, Ready, Claimed, Dead []int64
+	Total, Backlogged                                  int
+	At                                                 time.Time
+}
+
+// Census runs the GROUP BY on the writer inside the lock, copies the ledger, and calls under() in the same hold
+// (the checker samples the sink's totals there); its duration feeds /health's census_max_us.
+func (s *Store) Census(ctx context.Context, under func()) (Census, error) {
+	n := len(s.cfg.Tenants)
+	c := Census{Accepted: make([]int64, n), Delivered: make([]int64, n), Expired: make([]int64, n), Ready: make([]int64, n), Claimed: make([]int64, n), Dead: make([]int64, n)}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	start := s.cfg.Clock.Now()
+	rows, err := s.w.QueryContext(s.bg(), `SELECT tenant_id, state, COUNT(*) FROM messages GROUP BY tenant_id, state`)
+	if err != nil {
+		return Census{}, err
+	}
+	for rows.Next() {
+		var tenant, state string
+		var count int64
+		if err := rows.Scan(&tenant, &state, &count); err != nil {
+			rows.Close()
+			return Census{}, err
+		}
+		i, ok := s.index[tenant]
+		if !ok {
+			continue
+		}
+		switch state {
+		case "ready":
+			c.Ready[i] = count
+		case "claimed":
+			c.Claimed[i] = count
+		case "dead":
+			c.Dead[i] = count
+		}
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return Census{}, err
+	}
+	for i := 0; i < n; i++ {
+		c.Accepted[i], c.Delivered[i], c.Expired[i] = s.accepted[i].Load(), s.delivered[i].Load(), s.expired[i].Load()
+	}
+	c.Total, c.Backlogged, c.At = int(s.total.Load()), int(s.backlogged.Load()), s.cfg.Clock.Now()
+	if under != nil {
+		under()
+	}
+	d := s.cfg.Clock.Now().Sub(start).Nanoseconds()
+	for {
+		m := s.censusMaxNs.Load()
+		if d <= m || s.censusMaxNs.CompareAndSwap(m, d) {
+			break
+		}
+	}
+	return c, nil
+}
+
+// CanaryFull counts stored ciphertext rows containing needle (S1), one instr() scan on the reader connection.
+func (s *Store) CanaryFull(ctx context.Context, needle []byte) (int, error) {
+	var hits int
+	err := s.rdb.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages WHERE instr(ciphertext, ?1) > 0`, needle).Scan(&hits)
+	return hits, err
+}
+
 // Stats returns the insert timing instrument.
 func (s *Store) Stats() InsertStats {
 	n := s.insN.Load()

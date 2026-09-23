@@ -132,6 +132,75 @@ type Registry struct {
 	rtFlushed time.Time
 	last      Reading // the last tick's tiles, for scenario summary lines
 	peak      Reading // per-field maxima since ResetPeaks, for the same lines
+
+	verdicts    map[string]verdict // the checker's lights (M5), the snapshot's "invariants" key
+	detected    []detection        // per tenant: the first REVOKED audit of the current episode (S3's detection line)
+	lastHealthy time.Duration      // the last tick's windowed healthy p99 (L1's current value)
+	delRing     []int64            // the last P99Window ticks' delivered counts (L4's DeliveredPS)
+	delHead     int
+	healthyRej  atomic.Int64 // rejections dealt to unaffected tenants since SetTargets (L1)
+}
+
+// verdict is one invariant light as the snapshot carries it (the page reads ok, n, at, detail).
+type verdict struct {
+	OK     bool   `json:"ok"`
+	N      int64  `json:"n"`
+	At     int64  `json:"at"`
+	Detail string `json:"detail"`
+}
+
+// detection is the service's first REVOKED transition of one revocation episode; the episode ends on the
+// transition out of REVOKED, and the next REVOKED starts a new one.
+type detection struct {
+	at     time.Time
+	purged int
+	open   bool
+	ok     bool
+}
+
+// Report stores a verdict (check.Reporter); the next snapshot carries it under "invariants".
+func (r *Registry) Report(id string, ok bool, count int64, at time.Time, detail string) {
+	r.mu.Lock()
+	if r.verdicts == nil {
+		r.verdicts = make(map[string]verdict)
+	}
+	r.verdicts[id] = verdict{OK: ok, N: count, At: at.UnixMilli(), Detail: detail}
+	r.mu.Unlock()
+}
+
+// DetectedRevokedAt is the service's first REVOKED audit of the tenant's current or last revocation episode (the
+// checker pairs it with ground truth for the "detected in x s" line).
+func (r *Registry) DetectedRevokedAt(idx int) (at time.Time, purged int, ok bool) {
+	if idx < 0 || idx >= len(r.detected) {
+		return time.Time{}, 0, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	d := r.detected[idx]
+	return d.at, d.purged, d.ok
+}
+
+// HealthyP99 is L1's pair: the last tick's windowed healthy p99 (M4's interpolated read) and the baseline frozen at
+// SetTargets; ok while a scenario runs with a frozen baseline.
+func (r *Registry) HealthyP99() (current, baseline time.Duration, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.lastHealthy, r.baseline, r.scen.name != "" && r.baseline > 0
+}
+
+// HealthyRejections counts every non-accepted ingest outcome dealt to a tenant outside the affected set since the
+// last SetTargets (L1: unaffected tenants see no rejections).
+func (r *Registry) HealthyRejections() int64 { return r.healthyRej.Load() }
+
+// DeliveredPS is the delivery rate over the last P99Window ticks (L4 reads it instead of one tick's value).
+func (r *Registry) DeliveredPS() float64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var sum int64
+	for _, v := range r.delRing {
+		sum += v
+	}
+	return float64(sum) / (float64(len(r.delRing)) * r.cfg.Interval.Seconds())
 }
 
 // Reading is the last tick's headline numbers as a scenario's summary line reads them.
@@ -218,7 +287,7 @@ func New(cfg Config) *Registry {
 		cfg.AggregateMin = 3
 	}
 	n := len(cfg.Tenants)
-	r := &Registry{cfg: cfg, hub: newHub(cfg.ViewerQueue, cfg.Watcher), ln15: 0.4054651081081644, audits: make([][]Audit, n), auditHead: make([]int, n), auditN: make([]int, n), states: make([]uint8, n), grid: make([]byte, n), timeline: make([]event, cfg.TimelineRing), affected: make([]atomic.Bool, n), p99Ring: make([]time.Duration, cfg.BaselineTicks), rt: make([]rtCount, len(cfg.Providers)), kmsProv: make([]atomic.Int64, len(cfg.Providers))}
+	r := &Registry{cfg: cfg, hub: newHub(cfg.ViewerQueue, cfg.Watcher), ln15: 0.4054651081081644, audits: make([][]Audit, n), auditHead: make([]int, n), auditN: make([]int, n), states: make([]uint8, n), grid: make([]byte, n), timeline: make([]event, cfg.TimelineRing), affected: make([]atomic.Bool, n), p99Ring: make([]time.Duration, cfg.BaselineTicks), rt: make([]rtCount, len(cfg.Providers)), kmsProv: make([]atomic.Int64, len(cfg.Providers)), detected: make([]detection, n), delRing: make([]int64, cfg.P99Window)}
 	for c := range r.hists {
 		r.hists[c] = make([]hist, cfg.P99Window)
 	}
@@ -282,6 +351,9 @@ func stateName(s uint8) string {
 func (r *Registry) Ingest(idx int, reason string, withinShare bool) {
 	i := reasonIndex(reason)
 	r.ingest[i].Add(1)
+	if i != reasonAccepted && idx >= 0 && idx < len(r.affected) && !r.affected[idx].Load() {
+		r.healthyRej.Add(1)
+	}
 	switch i {
 	case reasonRateLimited, reasonBacklogFull, reasonOverloaded:
 		if withinShare {
@@ -342,6 +414,7 @@ func (r *Registry) SetTargets(idx []int) {
 	if r.p99N > 0 {
 		r.baseline = sum / time.Duration(r.p99N)
 	}
+	r.healthyRej.Store(0)
 	r.scen.clearedAt, r.scen.recoveredAt, r.scen.drainedAt = time.Time{}, time.Time{}, time.Time{}
 }
 
@@ -411,6 +484,12 @@ func (r *Registry) Audit(e Audit) {
 	}
 	r.mu.Lock()
 	if e.Op == "state" {
+		d := &r.detected[e.Idx]
+		if e.To == 3 && !d.open {
+			*d = detection{at: e.At, purged: e.Purged, open: true, ok: true}
+		} else if e.From == 3 && e.To != 3 {
+			d.open = false
+		}
 		switch {
 		case e.To == 3:
 			r.post(e.At, fmt.Sprintf("%s REVOKED, %d DEKs purged", r.cfg.Tenants[e.Idx], e.Purged))
@@ -571,8 +650,9 @@ type snapshot struct {
 		RecoveryS *float64 `json:"recovery_s"`
 		DrainS    *float64 `json:"drain_s"`
 	} `json:"scenario"`
-	Grid   string  `json:"grid"`
-	Events []event `json:"events"`
+	Grid       string             `json:"grid"`
+	Events     []event            `json:"events"`
+	Invariants map[string]verdict `json:"invariants,omitempty"`
 }
 
 func ms(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
@@ -655,6 +735,9 @@ func (r *Registry) tick() {
 		r.p99N++
 	}
 	s.P99Ms.Healthy, s.P99Ms.Affected, s.P99Ms.Baseline = ms(healthy), ms(affected), ms(r.baseline)
+	r.lastHealthy = healthy
+	r.delRing[r.delHead] = del
+	r.delHead = (r.delHead + 1) % len(r.delRing)
 	// step 5: recovery bookkeeping from the locals
 	if !r.scen.clearedAt.IsZero() {
 		if r.scen.recoveredAt.IsZero() && allActive {
@@ -704,6 +787,9 @@ func (r *Registry) tick() {
 	r.flushTransitions(now)
 	s.Grid = string(r.grid)
 	s.Events = r.events(r.cfg.SnapshotEvents)
+	if len(r.verdicts) > 0 {
+		s.Invariants = maps.Clone(r.verdicts)
+	}
 	b, err := json.Marshal(&s)
 	if err != nil {
 		return

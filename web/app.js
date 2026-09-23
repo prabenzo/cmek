@@ -22,6 +22,7 @@ function connect() {
   es = new EventSource('/v1/stream');
   es.onopen = () => { connected = true; banner(world ? 'live · ' + world : 'waiting for the first snapshot…'); };
   es.onmessage = e => onSnapshot(JSON.parse(e.data));
+  es.addEventListener('reconnect', () => { es.close(); connect(); }); // the server ends a stream at StreamMaxAge, before Cloud Run's cut
   es.onerror = () => { connected = false; banner('reconnecting…'); renderCards(snap); };
 }
 
@@ -155,9 +156,38 @@ function bindCards() {
   document.querySelectorAll('[data-stop]').forEach(b => b.onclick = () => post('/v1/scenarios/x/stop'));
   $('restore').onclick = () => { const id = targetTenant(); if (id) post('/v1/tenants/' + id + '/key', { action: 'restore' }); };
   $('reset').onclick = onReset;
+  $('cardtoggle').onclick = () => setCards(document.body.classList.contains('nocards'));
+  document.querySelectorAll('.card .hide').forEach(b => b.onclick = () => hideCard(b.closest('.card').dataset.scenario, true));
+  document.querySelector('#hiddencards a').onclick = () => document.querySelectorAll('.card.hidden').forEach(c => hideCard(c.dataset.scenario, false));
+  let show = true, hidden = [];
+  try {
+    show = localStorage.getItem('cards') !== 'hidden';
+    hidden = JSON.parse(localStorage.getItem('cards.hidden') || '[]');
+  } catch (e) { /* storage blocked: every card stays shown */ }
+  setCards(show);
+  document.querySelectorAll('.card').forEach(c => hideCard(c.dataset.scenario, hidden.includes(c.dataset.scenario)));
 }
 
-function onReset() { post('/v1/reset'); } // the world-id change on the next snapshot resets the page; the button stays disabled until M5
+// setCards shows or hides the whole scenario column (a per-viewer preference, remembered in this browser only).
+function setCards(show) {
+  document.body.classList.toggle('nocards', !show);
+  $('cardtoggle').textContent = show ? 'Hide cards' : 'Show cards';
+  try { localStorage.setItem('cards', show ? 'shown' : 'hidden'); } catch (e) { /* storage blocked */ }
+}
+
+// hideCard hides or shows one card (keyed by its data-scenario), remembers the set and keeps the "n hidden · show
+// all cards" line current.
+function hideCard(key, hide) {
+  const card = document.querySelector('.card[data-scenario="' + key + '"]');
+  if (card) card.classList.toggle('hidden', hide);
+  const hidden = [...document.querySelectorAll('.card.hidden')];
+  const line = $('hiddencards');
+  line.classList.toggle('on', hidden.length > 0);
+  line.querySelector('span').textContent = hidden.length + (hidden.length === 1 ? ' card hidden' : ' cards hidden');
+  try { localStorage.setItem('cards.hidden', JSON.stringify(hidden.map(c => c.dataset.scenario))); } catch (e) { /* storage blocked */ }
+}
+
+function onReset() { post('/v1/reset'); } // the stream ends with the old World; the reconnect's first snapshot carries the new id and resets the page
 
 let toastTimer = null;
 function toast(text) {
