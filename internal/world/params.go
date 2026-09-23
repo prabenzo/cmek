@@ -84,6 +84,17 @@ type Params struct {
 	SlowFor          time.Duration // 60s
 	RevokeTenantRank int           // 3    a high-traffic tenant
 
+	// No key cache (NOCACHE.md): two runs at a realistic KMS latency on every provider
+	NoCacheProvider   string        // "gcp" the band that loses the cache in the one-band run
+	NoCacheFor        time.Duration // 30s  cache off before the blip
+	NoCacheBlip       time.Duration // 10s  the provider's fast-fail inside the run
+	NoCacheAfter      time.Duration // 15s  cache still off after the blip clears
+	NoCacheKMSP50     time.Duration // 20ms latency every provider gets for the run
+	NoCacheKMSP99     time.Duration // 80ms
+	NoCacheSurgeLead  time.Duration // 15s  everyone without the cache before the surge
+	NoCacheSurgeFor   time.Duration // 60s  the global surge (GlobalSurgeMult) without the cache
+	NoCacheSurgeAfter time.Duration // 15s  cache still off after the surge ends
+
 	// Charts, p99 and the invariant thresholds (M4 measures; M5 judges)
 	ChartWindow          time.Duration // 2m   ring the page keeps per series
 	P99Window            int           // 10   ticks (5 s) summed for p99
@@ -128,6 +139,9 @@ func Demo() Params {
 		GlobalSurgeAffectedTop: 150, ScenarioTailMin: 15 * time.Second, ScenarioTailMax: 90 * time.Second,
 		OutageBlip: 10 * time.Second, OutageLong: 60 * time.Second, OutageProvider: "gcp", SlowProvider: "azure",
 		SlowP50: 400 * time.Millisecond, SlowP99: 3 * time.Second, SlowFor: 60 * time.Second, RevokeTenantRank: 3,
+		NoCacheProvider: "gcp", NoCacheFor: 30 * time.Second, NoCacheBlip: 10 * time.Second, NoCacheAfter: 15 * time.Second,
+		NoCacheKMSP50: 20 * time.Millisecond, NoCacheKMSP99: 80 * time.Millisecond,
+		NoCacheSurgeLead: 15 * time.Second, NoCacheSurgeFor: 60 * time.Second, NoCacheSurgeAfter: 15 * time.Second,
 		ChartWindow: 2 * time.Minute, P99Window: 10, BaselineTicks: 20, L1Ratio: 1.25, L1Floor: 25 * time.Millisecond, L1Grace: 2 * time.Second,
 		L4CapacityFactor: 0.9, L4Settle: 2 * time.Second, TimelineAggregateMin: 3,
 		IdleRebuild: 10 * time.Second, StopTimeout: 2 * time.Second,

@@ -5,11 +5,13 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -285,5 +287,163 @@ func TestNoPlaintextAtRest(t *testing.T) {
 	var deks int
 	if err := db.QueryRow(`SELECT count(*) FROM deks WHERE length(wrapped_dek) > 64`).Scan(&deks); err != nil || deks < 1 {
 		t.Errorf("wrapped deks = %d (%v), want at least one keyset-sized blob", deks, err)
+	}
+}
+
+// TestNoCacheScenarios: the one-band run switches the cache off for its band only and the global run for everyone;
+// both restore the cache on exit (a later ingest fills it again), the surge phase scales the generator and the
+// exit resets it, and each run posts its summary line.
+func TestNoCacheScenarios(t *testing.T) {
+	p := Small()
+	p.DBDir = t.TempDir()
+	p.SnapshotInterval = 20 * time.Millisecond
+	p.ScenarioTailMin, p.ScenarioTailMax = 100*time.Millisecond, 2*time.Second
+	p.NoCacheFor, p.NoCacheBlip, p.NoCacheAfter = 60*time.Millisecond, 40*time.Millisecond, 60*time.Millisecond
+	p.NoCacheSurgeLead, p.NoCacheSurgeFor, p.NoCacheSurgeAfter = 60*time.Millisecond, 80*time.Millisecond, 60*time.Millisecond
+	w, err := New(p, Deps{ID: "nc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Start()
+	defer w.Stop()
+	ctx := context.Background()
+	band := w.band(p.NoCacheProvider)
+	outside := 0
+	for w.P.Providers[outside*len(w.P.Providers)/w.P.Tenants] == p.NoCacheProvider {
+		outside++
+	}
+	in, out := w.ids[band[0]], w.ids[outside]
+	payload := func(id string) []byte { return []byte(fmt.Sprintf(`{"canary":"%s%s"}`, p.CanaryPrefix, id)) }
+	for _, id := range []string{in, out} {
+		if err := w.Ingest(ctx, id, payload(id)); err != nil {
+			t.Fatal(err)
+		}
+		if w.keys.Info(id).HotDEKs != 1 {
+			t.Fatalf("%s: hot DEKs %d before the run", id, w.keys.Info(id).HotDEKs)
+		}
+	}
+	waitIdle := func(what string) {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, running, _ := w.metrics.Scenario(); !running {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.Fatalf("%s still running after 3 s", what)
+	}
+	lines := func() []string {
+		ch, cancel := w.Subscribe()
+		defer cancel()
+		var s struct {
+			Events []struct{ Text string } `json:"events"`
+		}
+		select {
+		case b := <-ch:
+			if err := json.Unmarshal(b, &s); err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("no snapshot")
+		}
+		out := make([]string, 0, len(s.Events))
+		for _, e := range s.Events {
+			out = append(out, e.Text)
+		}
+		return out
+	}
+	// one band + blip
+	if err := w.StartScenario("no_cache"); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.keys.Info(in).HotDEKs; got != 0 {
+		t.Errorf("band tenant keeps %d hot DEKs with the cache off", got)
+	}
+	if got := w.keys.Info(out).HotDEKs; got != 1 {
+		t.Errorf("tenant outside the band lost its cache: hot %d", got)
+	}
+	if !w.metrics.Affected(band[0]) || w.metrics.Affected(outside) {
+		t.Error("affected set is not the band")
+	}
+	if err := w.Ingest(ctx, in, payload(in)); err != nil { // a per-request call, accepted
+		t.Errorf("ingest without the cache: %v", err)
+	}
+	waitIdle("no_cache")
+	if err := w.Ingest(ctx, in, payload(in)); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.keys.Info(in).HotDEKs; got != 1 {
+		t.Errorf("cache not back after the run: hot %d", got)
+	}
+	found := false
+	for _, l := range lines() {
+		found = found || strings.HasPrefix(l, "no cache ("+p.NoCacheProvider)
+	}
+	if !found {
+		t.Error("the one-band summary line was not posted")
+	}
+	// everyone + surge
+	rank1 := w.byRank[0]
+	base := w.gen.Offered(rank1)
+	if err := w.StartScenario("no_cache_surge"); err != nil {
+		t.Fatal(err)
+	}
+	if w.keys.Info(in).HotDEKs != 0 || w.keys.Info(out).HotDEKs != 0 {
+		t.Errorf("global run left a cache: in %d, out %d", w.keys.Info(in).HotDEKs, w.keys.Info(out).HotDEKs)
+	}
+	if !w.metrics.Affected(rank1) {
+		t.Error("the heaviest tenant is not in the declared affected set")
+	}
+	surged := false
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && !surged {
+		surged = math.Abs(w.gen.Offered(rank1)-base*p.GlobalSurgeMult) < 1e-9
+		time.Sleep(2 * time.Millisecond)
+	}
+	if !surged {
+		t.Error("the surge phase never scaled the generator")
+	}
+	waitIdle("no_cache_surge")
+	if got := w.gen.Offered(rank1); got != base {
+		t.Errorf("after the run: offered %v, want %v", got, base)
+	}
+	if err := w.Ingest(ctx, out, payload(out)); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.keys.Info(out).HotDEKs; got != 1 {
+		t.Errorf("cache not back after the global run: hot %d", got)
+	}
+	found = false
+	for _, l := range lines() {
+		found = found || strings.HasPrefix(l, "no cache (everyone, ")
+	}
+	if !found {
+		t.Error("the global summary line was not posted")
+	}
+	// a stopped run restores everything but posts no summary line
+	count := func(prefix string) int {
+		n := 0
+		for _, l := range lines() {
+			if strings.HasPrefix(l, prefix) {
+				n++
+			}
+		}
+		return n
+	}
+	before := count("no cache (" + p.NoCacheProvider)
+	if err := w.StartScenario("no_cache"); err != nil {
+		t.Fatal(err)
+	}
+	if name := w.StopScenario(); name != "no_cache" {
+		t.Errorf("stop returned %q", name)
+	}
+	if got := count("no cache (" + p.NoCacheProvider); got != before {
+		t.Errorf("a stopped run posted a summary line (%d → %d)", before, got)
+	}
+	if err := w.Ingest(ctx, in, payload(in)); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.keys.Info(in).HotDEKs; got != 1 {
+		t.Errorf("cache not back after a stopped run: hot %d", got)
 	}
 }

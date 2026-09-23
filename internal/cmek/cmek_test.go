@@ -754,3 +754,135 @@ func TestConcurrentColdCallers(t *testing.T) {
 		t.Errorf("Hot = %v, state = %v", r.m.Hot(rigTenant), info.State)
 	}
 }
+
+// TestPassThrough: the no-cache demo. With pass-through on, every EncryptKey and DecryptKey is one KMS call and the
+// cache stays empty; a failed call parks the tenant at once (KEY_UNAVAILABLE, never RIDING_THROUGH) with the
+// no-cache detail; recovery and revocation follow the normal probe schedule; switching pass-through off lets the
+// cache serve again with no call.
+func TestPassThrough(t *testing.T) {
+	r := newRig(t)
+	m, clk := r.m, r.clk
+	ctx := context.Background()
+	pt := []byte("payload")
+	if _, err := m.EncryptKey(ctx, rigTenant); err != nil { // the cached design: one generate, one hot DEK
+		t.Fatal(err)
+	}
+	if r.calls() != 1 || m.Info(rigTenant).HotDEKs != 1 {
+		t.Fatalf("warm-up: calls %d, hot %d", r.calls(), m.Info(rigTenant).HotDEKs)
+	}
+	m.SetPassThrough(rigTenant, true)
+	m.SetPassThrough(rigTenant, true) // idempotent
+	if r.rec.count("purge", "cache off") != 1 || m.Info(rigTenant).HotDEKs != 0 {
+		t.Fatalf("entering pass-through: purge audits %d, hot %d", r.rec.count("purge", "cache off"), m.Info(rigTenant).HotDEKs)
+	}
+	var env Envelope
+	for i := int64(1); i <= 3; i++ { // three seals, three calls, nothing cached
+		h, err := m.EncryptKey(ctx, rigTenant)
+		if err != nil {
+			t.Fatalf("seal %d: %v", i, err)
+		}
+		e, err := Seal(h, clk.Now(), rigTenant, i, pt)
+		if err != nil {
+			t.Fatalf("seal %d: %v", i, err)
+		}
+		env = e
+		if r.calls() != 1+i {
+			t.Errorf("seal %d: calls = %d, want %d", i, r.calls(), 1+i)
+		}
+	}
+	if m.Info(rigTenant).HotDEKs != 0 || r.rec.count("unwrap", "ok") != 3 {
+		t.Errorf("after three seals: hot %d, unwrap ok audits %d", m.Info(rigTenant).HotDEKs, r.rec.count("unwrap", "ok"))
+	}
+	h, err := m.DecryptKey(rigTenant, env.DEKID) // one call per open
+	if err != nil || r.calls() != 5 {
+		t.Fatalf("decrypt: err %v, calls %d", err, r.calls())
+	}
+	if got, err := Open(h, clk.Now(), rigTenant, 3, env); err != nil || !bytes.Equal(got, pt) {
+		t.Errorf("open through pass-through: %q, %v", got, err)
+	}
+	// a transient failure parks the tenant at once: no lease to ride through on
+	r.fake.SetFault(kms.Scope{Provider: "gcp"}, kms.Fault{Mode: kms.ModeFastFail})
+	if _, err := m.EncryptKey(ctx, rigTenant); !errors.Is(err, ErrKeyUnavailable) {
+		t.Errorf("fast-fail seal: err = %v, want ErrKeyUnavailable", err)
+	}
+	if r.state() != KeyUnavailable || len(r.rec.states(RidingThrough)) != 0 {
+		t.Errorf("after the failed call: state %v, ride-through lines %d", r.state(), len(r.rec.states(RidingThrough)))
+	}
+	if st := r.rec.states(KeyUnavailable); len(st) != 1 || st[0].Detail != "no cache: call failed" {
+		t.Errorf("KEY_UNAVAILABLE line = %+v", st)
+	}
+	c := r.calls() // parked: no call per request while parked
+	if _, err := m.EncryptKey(ctx, rigTenant); !errors.Is(err, ErrKeyUnavailable) || r.calls() != c {
+		t.Errorf("parked seal: err %v, calls %d → %d", err, c, r.calls())
+	}
+	if _, err := m.DecryptKey(rigTenant, env.DEKID); !errors.Is(err, ErrLeaseExpired) || r.calls() != c {
+		t.Errorf("parked open: err %v, calls %d → %d", err, c, r.calls())
+	}
+	if m.Hot(rigTenant) {
+		t.Error("a parked pass-through tenant is Hot")
+	}
+	// the fault clears: the backoff probe (0.5 s) restores ACTIVE with the cache still empty
+	r.fake.SetFault(kms.Scope{Provider: "gcp"}, kms.Fault{})
+	m.Tick(clk.Now())
+	if r.state() != KeyUnavailable {
+		t.Error("probed before the backoff")
+	}
+	clk.Advance(time.Second)
+	m.Tick(clk.Now())
+	if r.state() != Active || m.Info(rigTenant).HotDEKs != 0 || r.calls() != c+1 {
+		t.Errorf("after the probe: state %v, hot %d, calls %d (want %d)", r.state(), m.Info(rigTenant).HotDEKs, r.calls(), c+1)
+	}
+	if !m.Hot(rigTenant) {
+		t.Error("an ACTIVE pass-through tenant is not Hot")
+	}
+	// a deny is a deny: REVOKED at once, nothing to purge, the Revoke reprobe restores
+	r.fake.Revoke(rigKEK)
+	if _, err := m.EncryptKey(ctx, rigTenant); !errors.Is(err, ErrKeyRevoked) {
+		t.Errorf("revoked seal: err = %v, want ErrKeyRevoked", err)
+	}
+	if st := r.rec.states(Revoked); len(st) != 1 || st[0].Purged != 0 || r.state() != Revoked {
+		t.Errorf("REVOKED: lines %+v, state %v", st, r.state())
+	}
+	r.fake.Restore(rigKEK)
+	clk.Advance(5 * time.Second)
+	m.Tick(clk.Now())
+	if r.state() != Active {
+		t.Errorf("after restore and reprobe: state %v", r.state())
+	}
+	// pass-through off: the next seal fills the cache with one call, the one after is served without a call
+	m.SetPassThrough(rigTenant, false)
+	c = r.calls()
+	if _, err := m.EncryptKey(ctx, rigTenant); err != nil || r.calls() != c+1 || m.Info(rigTenant).HotDEKs != 1 {
+		t.Errorf("first seal with the cache back: err %v, calls %d (want %d), hot %d", err, r.calls(), c+1, m.Info(rigTenant).HotDEKs)
+	}
+	if _, err := m.EncryptKey(ctx, rigTenant); err != nil || r.calls() != c+1 {
+		t.Errorf("second seal with the cache back: err %v, calls %d (want %d)", err, r.calls(), c+1)
+	}
+	// concurrent first events on a DEK-less pass-through tenant generate one DEK (the generate flight), and every
+	// caller seals with it
+	r2 := newRig(t)
+	r2.m.SetPassThrough(rigTenant, true)
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int64) {
+			defer wg.Done()
+			h, err := r2.m.EncryptKey(ctx, rigTenant)
+			if err == nil {
+				_, err = Seal(h, r2.clk.Now(), rigTenant, i, pt)
+			}
+			errs <- err
+		}(int64(i))
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent first event: %v", err)
+		}
+	}
+	if len(r2.store.puts) != 1 || r2.rec.count("generate", "ok") != 1 || r2.m.Info(rigTenant).DEKs != 1 {
+		t.Errorf("concurrent first events: puts %d, generate audits %d, DEKs %d; want one of each", len(r2.store.puts), r2.rec.count("generate", "ok"), r2.m.Info(rigTenant).DEKs)
+	}
+}

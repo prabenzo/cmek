@@ -242,7 +242,9 @@ func (m *Manager) apply(t *tenant, op string, d *dek, r result) {
 			t.deks[d.id] = d
 			t.active = d
 		}
-		d.prim = r.prim
+		if !t.passThrough { // the no-cache demo never fills the cache: the caller uses r.prim once
+			d.prim = r.prim
+		}
 		d.hotSince = now
 		t.attempt = 0
 		delete(t.pending, d.id)
@@ -270,13 +272,17 @@ func (m *Manager) apply(t *tenant, op string, d *dek, r result) {
 		for id := range t.pending { // every pending warm waits for the same next slot: one KMS call per interval [SC-F5]
 			t.pending[id] = t.nextProbeAt
 		}
-		usable := t.lease.Usable(now)
+		usable := t.lease.Usable(now) && !t.passThrough // no cache: nothing to ride through on
 		switch {
 		case t.state == Active && usable:
 			m.setState(t, RidingThrough, now, "renewal failed", 0)
 		case t.state == Active && !usable: // a cold tenant: the two spec edges compose in one call (Q3)
 			purged := t.purge()
-			m.setState(t, KeyUnavailable, now, "cold fetch failed", purged)
+			why := "cold fetch failed"
+			if t.passThrough {
+				why = "no cache: call failed"
+			}
+			m.setState(t, KeyUnavailable, now, why, purged)
 		case t.state == RidingThrough && !usable:
 			purged := t.purge()
 			m.setState(t, KeyUnavailable, now, fmtPurged("lease expired", purged), purged)

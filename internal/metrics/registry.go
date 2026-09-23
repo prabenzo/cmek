@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -101,6 +102,7 @@ type Registry struct {
 	ingest     [reasonCount]atomic.Int64 // per tick
 	delivered  atomic.Int64              // per tick
 	kms        [3]atomic.Int64           // per tick: ok, transient, deny
+	kmsProv    []atomic.Int64            // per tick, per provider: every unwrap/generate (the no-cache summary lines)
 	rejWithin  atomic.Int64              // per tick: admission rejections of within-share tenants (the L4 split)
 	rejOver    atomic.Int64              // per tick: admission rejections of over-share tenants
 	overWithin atomic.Int64              // cumulative: overloaded rejections of within-share tenants (L4 judges it)
@@ -128,6 +130,53 @@ type Registry struct {
 	pendTrans []Audit       // state transitions other than ACTIVE↔RIDING_THROUGH and REVOKED, flushed per tick
 	rt        []rtCount     // per provider ACTIVE↔RIDING_THROUGH counts, flushed once per second
 	rtFlushed time.Time
+	last      Reading // the last tick's tiles, for scenario summary lines
+	peak      Reading // per-field maxima since ResetPeaks, for the same lines
+}
+
+// Reading is the last tick's headline numbers as a scenario's summary line reads them.
+type Reading struct {
+	DeliveredPS, KMSCallsPS, AcceptedPS float64
+	HealthyP99Ms, AffectedP99Ms         float64
+	Inflight                            map[string]int
+	ByState                             [4]int
+	Backlog                             int
+	ProviderCallsPS                     map[string]float64
+}
+
+// ResetPeaks starts a new peak window (a scenario phase); Peaks returns the per-field maxima since (Inflight and
+// ProviderCallsPS hold each key's maximum, not one tick's).
+func (r *Registry) ResetPeaks() {
+	r.mu.Lock()
+	r.peak = Reading{Inflight: map[string]int{}, ProviderCallsPS: map[string]float64{}}
+	r.mu.Unlock()
+}
+
+// Peaks returns the maxima since ResetPeaks.
+func (r *Registry) Peaks() Reading {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := r.peak
+	out.Inflight = maps.Clone(r.peak.Inflight)
+	out.ProviderCallsPS = maps.Clone(r.peak.ProviderCallsPS)
+	return out
+}
+
+// Last returns the last tick's Reading (zero before the first tick).
+func (r *Registry) Last() Reading {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := r.last
+	out.Inflight = maps.Clone(r.last.Inflight)
+	out.ProviderCallsPS = maps.Clone(r.last.ProviderCallsPS)
+	return out
+}
+
+// ProviderCallsPS is the last tick's KMS calls per second made for one provider's tenants (all classes).
+func (r *Registry) ProviderCallsPS(provider string) float64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.last.ProviderCallsPS[provider]
 }
 
 // rtCount buffers the ride-through churn of one provider.
@@ -169,7 +218,7 @@ func New(cfg Config) *Registry {
 		cfg.AggregateMin = 3
 	}
 	n := len(cfg.Tenants)
-	r := &Registry{cfg: cfg, hub: newHub(cfg.ViewerQueue, cfg.Watcher), ln15: 0.4054651081081644, audits: make([][]Audit, n), auditHead: make([]int, n), auditN: make([]int, n), states: make([]uint8, n), grid: make([]byte, n), timeline: make([]event, cfg.TimelineRing), affected: make([]atomic.Bool, n), p99Ring: make([]time.Duration, cfg.BaselineTicks), rt: make([]rtCount, len(cfg.Providers))}
+	r := &Registry{cfg: cfg, hub: newHub(cfg.ViewerQueue, cfg.Watcher), ln15: 0.4054651081081644, audits: make([][]Audit, n), auditHead: make([]int, n), auditN: make([]int, n), states: make([]uint8, n), grid: make([]byte, n), timeline: make([]event, cfg.TimelineRing), affected: make([]atomic.Bool, n), p99Ring: make([]time.Duration, cfg.BaselineTicks), rt: make([]rtCount, len(cfg.Providers)), kmsProv: make([]atomic.Int64, len(cfg.Providers))}
 	for c := range r.hists {
 		r.hists[c] = make([]hist, cfg.P99Window)
 	}
@@ -351,13 +400,14 @@ func (r *Registry) Delivered(idx int, latency time.Duration) {
 // per-second flush, where AggregateMin or more of the same (provider, from, to) collapse to one line and the rest
 // keep the M2 form (a single waits ≤ 1 s).
 func (r *Registry) Audit(e Audit) {
+	if e.Idx < 0 || e.Idx >= len(r.audits) {
+		return
+	}
 	if e.Op == "unwrap" || e.Op == "generate" {
 		if e.Class < 3 {
 			r.kms[e.Class].Add(1)
 		}
-	}
-	if e.Idx < 0 || e.Idx >= len(r.audits) {
-		return
+		r.kmsProv[r.provider(e.Idx)].Add(1)
 	}
 	r.mu.Lock()
 	if e.Op == "state" {
@@ -631,6 +681,25 @@ func (r *Registry) tick() {
 	}
 	s.Backlog.Total, s.Backlog.Affected = total, affectedSum
 	s.Inflight = inflight
+	r.last = Reading{DeliveredPS: s.Tiles.DeliveredPS, KMSCallsPS: s.Tiles.KMSCallsPS, AcceptedPS: s.IngestPS.Accepted, HealthyP99Ms: s.P99Ms.Healthy, AffectedP99Ms: s.P99Ms.Affected,
+		Inflight: maps.Clone(inflight), ByState: s.Tiles.ByState, Backlog: total, ProviderCallsPS: make(map[string]float64, len(r.cfg.Providers))}
+	for i, p := range r.cfg.Providers {
+		r.last.ProviderCallsPS[p] = float64(r.kmsProv[i].Swap(0)) * perSec
+	}
+	if r.peak.Inflight != nil { // a peak window is open
+		pk := &r.peak
+		pk.DeliveredPS, pk.KMSCallsPS, pk.AcceptedPS = max(pk.DeliveredPS, r.last.DeliveredPS), max(pk.KMSCallsPS, r.last.KMSCallsPS), max(pk.AcceptedPS, r.last.AcceptedPS)
+		pk.HealthyP99Ms, pk.AffectedP99Ms, pk.Backlog = max(pk.HealthyP99Ms, r.last.HealthyP99Ms), max(pk.AffectedP99Ms, r.last.AffectedP99Ms), max(pk.Backlog, total)
+		for i := range pk.ByState {
+			pk.ByState[i] = max(pk.ByState[i], s.Tiles.ByState[i])
+		}
+		for p, v := range inflight {
+			pk.Inflight[p] = max(pk.Inflight[p], v)
+		}
+		for p, v := range r.last.ProviderCallsPS {
+			pk.ProviderCallsPS[p] = max(pk.ProviderCallsPS[p], v)
+		}
+	}
 	// step 6: transitions
 	r.flushTransitions(now)
 	s.Grid = string(r.grid)

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/prabenzo/cmek/internal/metrics"
 )
 
 var ErrBusy = errors.New("world: scenario running")            // 409 {"error":"busy"}
@@ -21,8 +23,9 @@ type phase struct {
 }
 
 // scenario is a scripted fault or surge (Q19): targets is the declared affected set, evaluated at Start and handed
-// to metrics.SetTargets (Q8); phases run in order; exit restores whatever enter changed and is idempotent; scope
-// names the affected set in the restored line; marker is the timeline line posted at Start.
+// to metrics.SetTargets (Q8); phases run in order; exit restores whatever enter changed and is idempotent; summary,
+// when set, posts the run's numbers and runs only after a natural end (a stopped run has no finding to report);
+// scope names the affected set in the restored line; marker is the timeline line posted at Start.
 type scenario struct {
 	name    string
 	scope   string
@@ -30,6 +33,7 @@ type scenario struct {
 	targets func() []int
 	phases  []phase
 	exit    func()
+	summary func()
 }
 
 // scenarios owns the single runner goroutine; at most one scenario runs per World. cancel, done and signal are nil
@@ -65,8 +69,9 @@ func (w *World) band(provider string) []int {
 	return out
 }
 
-// newScenarios defines the five cards' six scenarios: the two surges (M3) and the fault scenarios (M4), mapped to
-// the same flat FaultRequest, SetKey and Surge the curl API uses (ARCH Q19).
+// newScenarios defines the six cards' eight scenarios: the two surges (M3), the fault scenarios (M4) and the two
+// no-cache runs (NOCACHE.md), mapped to the same flat FaultRequest, SetKey, Surge and SetCache the curl API uses
+// (ARCH Q19).
 func newScenarios(w *World) *scenarios {
 	s := &scenarios{w: w, defs: make(map[string]*scenario)}
 	p := w.P
@@ -128,6 +133,94 @@ func newScenarios(w *World) *scenarios {
 		phases:  []phase{{name: "slow", dur: p.SlowFor, enter: fault(FaultRequest{Provider: slow, LatencyP50Ms: int(p.SlowP50 / time.Millisecond), LatencyP99Ms: int(p.SlowP99 / time.Millisecond)})}},
 		exit:    fault(FaultRequest{Provider: slow, Mode: "ok"}),
 	}
+	// No key cache (NOCACHE.md): two runs at a realistic KMS latency on every provider, so the cache is the one variable.
+	latencyAll := func(on bool) {
+		for _, prov := range p.Providers {
+			f := FaultRequest{Provider: prov}
+			if on {
+				f.LatencyP50Ms, f.LatencyP99Ms = int(p.NoCacheKMSP50/time.Millisecond), int(p.NoCacheKMSP99/time.Millisecond)
+			}
+			fault(f)()
+		}
+	}
+	withLatency := func(prov, mode string) func() {
+		return fault(FaultRequest{Provider: prov, Mode: mode, LatencyP50Ms: int(p.NoCacheKMSP50 / time.Millisecond), LatencyP99Ms: int(p.NoCacheKMSP99 / time.Millisecond)})
+	}
+	cacheProv := p.NoCacheProvider
+	other := p.Providers[0]
+	if other == cacheProv && len(p.Providers) > 1 {
+		other = p.Providers[1]
+	}
+	var bandCalls, otherCalls, bandP99, healthyP99 float64
+	var parked int
+	s.defs["no_cache"] = &scenario{
+		name: "no_cache", scope: cacheProv,
+		marker:  fmt.Sprintf("scenario no_cache started: %s tenants run without the key cache for %s; every event is two KMS calls; all providers at p50 %s", cacheProv, p.NoCacheFor+p.NoCacheBlip+p.NoCacheAfter, p.NoCacheKMSP50),
+		targets: func() []int { return w.band(cacheProv) },
+		phases: []phase{
+			{name: "cache_off", dur: p.NoCacheFor, enter: func() {
+				bandCalls, otherCalls, bandP99, healthyP99, parked = 0, 0, 0, 0, 0
+				latencyAll(true)
+				w.SetCache(cacheProv, false)
+				w.metrics.ResetPeaks()
+			}},
+			{name: "blip", dur: p.NoCacheBlip, enter: func() {
+				pk := w.metrics.Peaks()
+				bandCalls, otherCalls, bandP99, healthyP99 = pk.ProviderCallsPS[cacheProv], pk.ProviderCallsPS[other], pk.AffectedP99Ms, pk.HealthyP99Ms
+				w.metrics.ResetPeaks()
+				withLatency(cacheProv, "fast_fail")()
+			}},
+			{name: "cache_off", dur: p.NoCacheAfter, enter: func() {
+				parked = w.metrics.Peaks().ByState[2]
+				withLatency(cacheProv, "ok")()
+				w.metrics.Timeline(fmt.Sprintf("no cache: the %s blip parked %d tenants KEY_UNAVAILABLE, each on its first event (with the cache: a yellow ride-through, no 503)", cacheProv, parked))
+			}},
+		},
+		exit: func() {
+			w.SetCache(cacheProv, true)
+			latencyAll(false)
+		},
+		summary: func() {
+			w.metrics.Timeline(fmt.Sprintf("no cache (%s, %s): KMS calls peaked at %s %.0f/s vs %s %.0f/s · p99 peaked at %.0f ms affected vs %.0f ms healthy · blip: %d tenants KEY_UNAVAILABLE",
+				cacheProv, p.NoCacheFor+p.NoCacheBlip+p.NoCacheAfter, cacheProv, bandCalls, other, otherCalls, bandP99, healthyP99, parked))
+		},
+	}
+	capacity := float64(p.Workers) / ((p.SinkLatencyMin + p.SinkLatencyMax) / 2).Seconds()
+	var lead, surged metricsReading
+	s.defs["no_cache_surge"] = &scenario{
+		name: "no_cache_surge", scope: fmt.Sprintf("top %d", top),
+		marker:  fmt.Sprintf("scenario no_cache_surge started: every tenant runs without the key cache for %s at p50 %s; the global surge (×%g) starts at %s", p.NoCacheSurgeLead+p.NoCacheSurgeFor+p.NoCacheSurgeAfter, p.NoCacheKMSP50, p.GlobalSurgeMult, p.NoCacheSurgeLead),
+		targets: func() []int { return append([]int(nil), w.byRank[:top]...) },
+		phases: []phase{
+			{name: "cache_off", dur: p.NoCacheSurgeLead, enter: func() {
+				lead, surged = metricsReading{}, metricsReading{}
+				latencyAll(true)
+				w.SetCache("", false)
+				w.metrics.ResetPeaks()
+			}},
+			{name: "surge", dur: p.NoCacheSurgeFor, enter: func() {
+				lead = metricsReading(w.metrics.Last())
+				w.metrics.Timeline(fmt.Sprintf("no cache (everyone): delivered %.0f/s at %.0f/s accepted (capacity %.0f/s with the cache) · KMS calls %.0f/s · backlog %d and climbing", lead.DeliveredPS, lead.AcceptedPS, capacity, lead.KMSCallsPS, lead.Backlog))
+				w.metrics.ResetPeaks()
+				w.gen.SetGlobal(p.GlobalSurgeMult)
+			}},
+			{name: "cache_off", dur: p.NoCacheSurgeAfter, enter: func() {
+				surged = metricsReading(w.metrics.Peaks())
+				w.gen.SetGlobal(1)
+				w.metrics.Timeline(fmt.Sprintf("no cache + ×%g surge, peaks: KMS calls %.0f/s · in flight %s · backlog %d · end-to-end p99 %.0f s · delivered never above %.0f/s (with the cache: delivered ≈ %.0f/s, KMS ≤ 70/s, backlog under its cap)",
+					p.GlobalSurgeMult, surged.KMSCallsPS, inflightText(p.Providers, surged.Inflight), surged.Backlog, surged.AffectedP99Ms/1000, surged.DeliveredPS, capacity))
+			}},
+		},
+		exit: func() {
+			w.gen.SetGlobal(1)
+			w.SetCache("", true)
+			latencyAll(false)
+		},
+		summary: func() {
+			w.metrics.Timeline(fmt.Sprintf("no cache (everyone, %s): delivered %.0f/s before the surge at %.0f/s accepted, never above %.0f/s during it (capacity %.0f/s) · KMS calls %.0f/s, peak %.0f/s",
+				p.NoCacheSurgeLead+p.NoCacheSurgeFor+p.NoCacheSurgeAfter, lead.DeliveredPS, lead.AcceptedPS, surged.DeliveredPS, capacity, lead.KMSCallsPS, surged.KMSCallsPS))
+		},
+	}
 	rev := rank(p.RevokeTenantRank)
 	revID := w.ids[rev]
 	s.defs["key_revocation"] = &scenario{
@@ -138,6 +231,21 @@ func newScenarios(w *World) *scenarios {
 		exit:    func() { w.kms.Restore(w.specs[rev].KEKID) },
 	}
 	return s
+}
+
+// metricsReading is the metrics package's last-tick reading, named here so the scenario closures can hold one.
+type metricsReading = metrics.Reading
+
+// inflightText renders the in-flight map in provider order: "aws 29 gcp 31 azure 30".
+func inflightText(providers []string, inflight map[string]int) string {
+	out := ""
+	for i, p := range providers {
+		if i > 0 {
+			out += " "
+		}
+		out += fmt.Sprintf("%s %d", p, inflight[p])
+	}
+	return out
 }
 
 // StartScenario launches the named scenario's runner; ErrBusy while one runs or once the World is stopping
@@ -246,6 +354,9 @@ func (s *scenarios) run(ctx context.Context, cancel context.CancelFunc, sc *scen
 	}
 	sc.exit()
 	if !cancelled {
+		if sc.summary != nil {
+			sc.summary()
+		}
 		s.tail(ctx, sc)
 	}
 	s.mu.Lock()

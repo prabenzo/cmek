@@ -94,6 +94,8 @@ type tenant struct {
 	pending map[string]time.Time // dekID → dueAt: a worker needs this cold DEK [SC-F5]
 
 	waiters, inflight int // IngestWaiters cap; TenantInflight cap (0 = none)
+
+	passThrough bool // the no-cache demo: every EncryptKey/DecryptKey is one KMS call; the cache is neither read nor filled
 }
 
 // hot counts the DEKs whose plaintext is cached.
