@@ -25,16 +25,27 @@ type SinkConfig struct {
 	Lock                   *sync.Mutex
 }
 
-// Sink stamps deliveredAt on entry, verifies the canary's tenant, sleeps 5-20 ms, and records the delivery.
+// Sink stamps deliveredAt on entry, verifies the canary's tenant, sleeps 5-20 ms, and records the delivery: the
+// per-tenant total and, in a ring of Ring entries, each delivery's deliveredAt (S3's evidence).
 type Sink struct {
 	cfg        SinkConfig
 	count      []atomic.Int64
 	mismatches atomic.Int64
+	mu         []sync.Mutex // per tenant: the ring and its count move together
+	ring       [][]int64    // per tenant: deliveredAt unix-nanos, slot (seq-1) % Ring
 }
 
 // NewSink builds the sink.
 func NewSink(cfg SinkConfig) *Sink {
-	return &Sink{cfg: cfg, count: make([]atomic.Int64, len(cfg.Tenants))}
+	if cfg.Ring <= 0 {
+		cfg.Ring = 1024
+	}
+	n := len(cfg.Tenants)
+	s := &Sink{cfg: cfg, count: make([]atomic.Int64, n), mu: make([]sync.Mutex, n), ring: make([][]int64, n)}
+	for i := range s.ring {
+		s.ring[i] = make([]int64, cfg.Ring)
+	}
+	return s
 }
 
 func (s *Sink) latency() time.Duration {
@@ -58,8 +69,44 @@ func (s *Sink) Deliver(ctx context.Context, tenant string, idx int, msgID int64,
 	case <-ctx.Done():
 		return at, ctx.Err()
 	}
-	s.count[idx].Add(1)
+	s.mu[idx].Lock()
+	seq := s.count[idx].Load() + 1
+	s.ring[idx][(seq-1)%int64(len(s.ring[idx]))] = at.UnixNano()
+	s.count[idx].Store(seq)
+	s.mu[idx].Unlock()
 	return at, nil
+}
+
+// DeliveredBetween counts the tenant's deliveries with seq > sinceSeq and lo < deliveredAt ≤ hi (a zero hi is
+// +∞), returns the tenant's current seq to resume from, and overrun when deliveries since sinceSeq have already
+// left the ring (count − sinceSeq > Ring): the checker then cannot vouch for the window (S3 "coverage gap").
+func (s *Sink) DeliveredBetween(idx int, sinceSeq int64, lo, hi time.Time) (n, newSeq int64, overrun bool) {
+	if idx < 0 || idx >= len(s.ring) {
+		return 0, sinceSeq, false
+	}
+	s.mu[idx].Lock()
+	defer s.mu[idx].Unlock()
+	total := s.count[idx].Load()
+	ring := s.ring[idx]
+	size := int64(len(ring))
+	if sinceSeq < 0 {
+		sinceSeq = 0
+	}
+	if total-sinceSeq > size {
+		overrun = true
+		sinceSeq = total - size
+	}
+	loN, hiN := lo.UnixNano(), int64(0)
+	if !hi.IsZero() {
+		hiN = hi.UnixNano()
+	}
+	for seq := sinceSeq + 1; seq <= total; seq++ {
+		at := ring[(seq-1)%size]
+		if at > loN && (hiN == 0 || at <= hiN) {
+			n++
+		}
+	}
+	return n, total, overrun
 }
 
 // Delivered returns the tenant's total; DeliveredAll fills dst for every tenant (checker, under Census).

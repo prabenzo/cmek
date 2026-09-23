@@ -101,14 +101,40 @@ type Params struct {
 	BaselineTicks        int           // 20   ticks (10 s) before scenario start; baseline = mean of the tick p99s
 	L1Ratio              float64       // 1.25
 	L1Floor              time.Duration // 25ms L1 compares against L1Ratio × max(baseline, L1Floor) (M4 Decision)
-	L1Grace              time.Duration // 2s   after scenario start before L1 is judged
+	L1Grace              time.Duration // 7s   after scenario start before L1 is judged: P99Window × SnapshotInterval + 2 s, so the opening burst has left the window (M5)
+	L1For                time.Duration // 3s   the healthy p99 must stay over its limit this long before L1 turns red; 0 judges every pass (M5)
 	L4CapacityFactor     float64       // 0.9  delivered/s must stay ≥ this × measured capacity while backlogged
-	L4Settle             time.Duration // 2s   backlog must exceed Workers×ClaimBatch this long before L4 is judged
+	L4Settle             time.Duration // 7s   backlog must exceed Workers×ClaimBatch this long before L4 is judged: P99Window × SnapshotInterval + 2 s, so the delivered window holds no pre-surge seconds (M5)
 	TimelineAggregateMin int           // 3    same (provider, from, to) transitions in one tick collapse to one line
+
+	// Checker (M5)
+	CheckInterval  time.Duration // 1s   one checker pass
+	CanaryFullScan time.Duration // 5s   S1's full scan of the stored rows
+	Lights         []string      // {"S1","S2","S3","S4","L1","L4"}: which lights the checker judges; strike an id to grey it
+	Capacity       float64       // 620  the delivered plateau M4 measured (L4's threshold is L4CapacityFactor × it); 0 → Workers / mean sink latency
+
+	// Queue retention (M5)
+	Retention      time.Duration // 10m  ready rows older than this expire
+	ExpireInterval time.Duration // 5s   sweep period for Expire
+	ExpireLimit    int           // 1000 rows per Expire call
+
+	// Stream (M5)
+	StreamMaxAge       time.Duration // 55m  the handler ends a stream with event: reconnect before Cloud Run's 60-minute cut
+	StreamWriteTimeout time.Duration // 5s   per-frame write deadline
 
 	// Lifecycle
 	IdleRebuild time.Duration // 10s  no viewers longer than this → next connection builds a fresh World (M5)
-	StopTimeout time.Duration // 2s   Stop waits at most this long for goroutines
+	StopTimeout time.Duration // 2s   Stop waits at most this long for goroutines and released handlers
+}
+
+// Judges reports whether the checker judges the named light.
+func (p Params) Judges(light string) bool {
+	for _, l := range p.Lights {
+		if l == light {
+			return true
+		}
+	}
+	return false
 }
 
 // RetryAfter holds the fixed Retry-After header values in whole seconds.
@@ -142,8 +168,11 @@ func Demo() Params {
 		NoCacheProvider: "gcp", NoCacheFor: 30 * time.Second, NoCacheBlip: 10 * time.Second, NoCacheAfter: 15 * time.Second,
 		NoCacheKMSP50: 20 * time.Millisecond, NoCacheKMSP99: 80 * time.Millisecond,
 		NoCacheSurgeLead: 15 * time.Second, NoCacheSurgeFor: 60 * time.Second, NoCacheSurgeAfter: 15 * time.Second,
-		ChartWindow: 2 * time.Minute, P99Window: 10, BaselineTicks: 20, L1Ratio: 1.25, L1Floor: 25 * time.Millisecond, L1Grace: 2 * time.Second,
-		L4CapacityFactor: 0.9, L4Settle: 2 * time.Second, TimelineAggregateMin: 3,
+		ChartWindow: 2 * time.Minute, P99Window: 10, BaselineTicks: 20, L1Ratio: 1.25, L1Floor: 25 * time.Millisecond, L1Grace: 7 * time.Second, L1For: 3 * time.Second,
+		L4CapacityFactor: 0.9, L4Settle: 7 * time.Second, TimelineAggregateMin: 3,
+		CheckInterval: time.Second, CanaryFullScan: 5 * time.Second, Lights: []string{"S1", "S2", "S3", "S4", "L1", "L4"}, Capacity: 620,
+		Retention: 10 * time.Minute, ExpireInterval: 5 * time.Second, ExpireLimit: 1000,
+		StreamMaxAge: 55 * time.Minute, StreamWriteTimeout: 5 * time.Second,
 		IdleRebuild: 10 * time.Second, StopTimeout: 2 * time.Second,
 	}
 }

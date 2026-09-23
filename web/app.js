@@ -22,6 +22,7 @@ function connect() {
   es = new EventSource('/v1/stream');
   es.onopen = () => { connected = true; banner(world ? 'live · ' + world : 'waiting for the first snapshot…'); };
   es.onmessage = e => onSnapshot(JSON.parse(e.data));
+  es.addEventListener('reconnect', () => { es.close(); connect(); }); // the server ends a stream at StreamMaxAge, before Cloud Run's cut
   es.onerror = () => { connected = false; banner('reconnecting…'); renderCards(snap); };
 }
 
@@ -157,7 +158,7 @@ function bindCards() {
   $('reset').onclick = onReset;
 }
 
-function onReset() { post('/v1/reset'); } // the world-id change on the next snapshot resets the page; the button stays disabled until M5
+function onReset() { post('/v1/reset'); } // the stream ends with the old World; the reconnect's first snapshot carries the new id and resets the page
 
 let toastTimer = null;
 function toast(text) {

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/prabenzo/cmek/internal/admit"
+	"github.com/prabenzo/cmek/internal/check"
 	"github.com/prabenzo/cmek/internal/cmek"
 	"github.com/prabenzo/cmek/internal/kms"
 	"github.com/prabenzo/cmek/internal/logx"
@@ -45,14 +46,15 @@ type World struct {
 	ID string
 	P  Params
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
-	clock  Clock
-	log    *slog.Logger
-	errLog logx.Throttle // internal ingest errors, one line per second per message
-	rnd    *rand.Rand
-	rndMu  sync.Mutex
+	ctx      context.Context
+	cancel   context.CancelFunc
+	wg       sync.WaitGroup
+	handlers sync.WaitGroup // HTTP handlers holding this World (Holder.hold); Stop waits ≤ StopTimeout for them
+	clock    Clock
+	log      *slog.Logger
+	errLog   logx.Throttle // internal ingest errors, one line per second per message
+	rnd      *rand.Rand
+	rndMu    sync.Mutex
 
 	ids    []string
 	index  map[string]int
@@ -70,6 +72,7 @@ type World struct {
 	gen     *traffic.Generator
 	sink    *traffic.Sink
 	metrics *metrics.Registry
+	checker *check.Checker
 
 	started   time.Time
 	idleSince atomic.Int64 // unix ms when viewers dropped to 0; 0 while watched
@@ -141,7 +144,10 @@ func New(p Params, d Deps) (*World, error) {
 	})
 	w.sink = traffic.NewSink(traffic.SinkConfig{Tenants: w.ids, MinLatency: p.SinkLatencyMin, MaxLatency: p.SinkLatencyMax, Ring: p.SinkRing, CanaryPrefix: p.CanaryPrefix, Clock: d.Clock, Rand: w.rnd, Lock: &w.rndMu})
 	w.gen = traffic.NewGenerator(traffic.GeneratorConfig{Tenants: w.ids, Rates: rates, PayloadBytes: p.PayloadBytes, CanaryPrefix: p.CanaryPrefix, Ingest: w, Clock: d.Clock, Rand: w.rnd, Lock: &w.rndMu})
-	capacity := float64(p.Workers) / ((p.SinkLatencyMin + p.SinkLatencyMax) / 2).Seconds()
+	capacity := p.Capacity
+	if capacity <= 0 {
+		capacity = float64(p.Workers) / ((p.SinkLatencyMin + p.SinkLatencyMax) / 2).Seconds()
+	}
 	w.metrics = metrics.New(metrics.Config{Tenants: w.ids, Providers: p.Providers, Grid: &gridAdapter{w: w, buf: make([]cmek.State, n)}, Backlog: store, Offered: w.gen, Inflight: w.keys, Watcher: watcher{w}, Clock: d.Clock,
 		Interval: p.SnapshotInterval, ChartWindow: p.ChartWindow, P99Window: p.P99Window, BaselineTicks: p.BaselineTicks, AggregateMin: p.TimelineAggregateMin, DrainSlack: p.Workers * p.ClaimBatch,
 		AuditRing: p.AuditRing, TimelineRing: p.TimelineRing, SnapshotEvents: p.SnapshotEvents, ViewerQueue: p.ViewerQueue, Capacity: capacity, WorldID: d.ID})
@@ -149,6 +155,15 @@ func New(p Params, d Deps) (*World, error) {
 	w.sched = queue.NewScheduler(queue.SchedulerConfig{Store: store, Gate: w.keys, Share: w.admit, Tenants: w.ids, TwoClass: p.TwoClassSched, LightTurns: p.SchedLightTurns})
 	w.scen = newScenarios(w)
 	w.workers = queue.NewWorkers(queue.WorkersConfig{Store: store, Sched: w.sched, Keys: w.keys, Sink: w.sink, Recorder: w.metrics, Clock: d.Clock, Tenants: w.ids, Workers: p.Workers, ClaimBatch: p.ClaimBatch, ClaimTimeout: p.ClaimTimeout, IdlePoll: p.IdlePoll, Logger: w.log})
+	// The checker is the only reader of the fake KMS's ground truth; it reaches the store, the sink and the
+	// registry through the check interfaces and never the service's own view of itself.
+	w.checker = check.New(check.Config{
+		Tenants: w.ids, Rows: store, Deliveries: w.sink, Truth: w.kms.Truth(), Health: w.metrics, Reporter: w.metrics, Clock: d.Clock,
+		Lease: p.Lease, Interval: p.CheckInterval, FullScanEvery: p.CanaryFullScan, L1Grace: p.L1Grace, L1For: p.L1For, L1Floor: p.L1Floor, L4Settle: p.L4Settle,
+		CanaryPrefix: p.CanaryPrefix, Capacity: capacity, L1Ratio: p.L1Ratio, L4CapacityFactor: p.L4CapacityFactor,
+		GlobalCap: p.GlobalBacklogCap, Workers: p.Workers, ClaimBatch: p.ClaimBatch,
+		L1: p.Judges("L1"), L4: p.Judges("L4") && p.FairShare,
+	})
 	attrs := []any{"tenants", n}
 	for r := 0; r < n && r < 5; r++ { // the top ranks (the scenarios' revoke target is rank 3)
 		attrs = append(attrs, fmt.Sprintf("rank%d", r+1), w.ids[w.byRank[r]])
@@ -178,11 +193,13 @@ func (w *World) Start() {
 	w.spawn(w.gen.Run)
 	w.spawn(w.metrics.Run)
 	w.spawn(w.sweep)
+	w.spawn(w.checker.Run)
 }
 
-// sweep drives the core's Tick every SweepInterval and the queue's Reclaim every ReclaimInterval.
+// sweep drives the core's Tick every SweepInterval, the queue's Reclaim every ReclaimInterval (at-least-once
+// delivery) and Expire every ExpireInterval (retention).
 func (w *World) sweep(ctx context.Context) {
-	lastReclaim := w.clock.Now()
+	lastReclaim, lastExpire := w.clock.Now(), w.clock.Now()
 	for {
 		select {
 		case <-ctx.Done():
@@ -196,28 +213,48 @@ func (w *World) sweep(ctx context.Context) {
 					w.log.Error("reclaim", "err", err)
 				}
 			}
+			if w.P.Retention > 0 && now.Sub(lastExpire) >= w.P.ExpireInterval {
+				lastExpire = now
+				if n, err := w.store.Expire(ctx, now.Add(-w.P.Retention), w.P.ExpireLimit); err != nil && ctx.Err() == nil {
+					w.log.Error("expire", "err", err)
+				} else if n > 0 {
+					w.log.Info("expired", "rows", n)
+				}
+			}
 		}
 	}
 }
 
-// Stop cancels the context, closes every subscriber channel, waits ≤ StopTimeout for goroutines, then closes and deletes the DB file; a late goroutine is logged, not waited for.
+// hold counts one HTTP handler on this World; the returned release is idempotent.
+func (w *World) hold() func() {
+	w.handlers.Add(1)
+	var once sync.Once
+	return func() { once.Do(w.handlers.Done) }
+}
+
+// Stop cancels the context, closes every subscriber channel (so stream handlers return and release), waits
+// ≤ StopTimeout for goroutines and released handlers, then closes and deletes the DB file; a late goroutine or
+// handler is logged, not waited for [SC-F11].
 func (w *World) Stop() {
 	w.scen.stop() // no scenario may start (and wg.Add) once the wait below can begin
 	w.cancel()
 	w.metrics.CloseAll()
 	done := make(chan struct{})
-	go func() { w.wg.Wait(); close(done) }()
+	go func() { w.wg.Wait(); w.handlers.Wait(); close(done) }()
 	select {
 	case <-done:
 	case <-w.clock.After(w.P.StopTimeout):
-		w.log.Error("stop: goroutines still running after StopTimeout")
+		w.log.Error("stop: goroutines or handlers still running after StopTimeout")
 	}
 	if err := w.store.Close(); err != nil {
 		w.log.Error("store close", "err", err)
 	}
 }
 
-// Subscribe hands the metrics hub's channel to /v1/stream (M5's Holder.Acquire wraps it).
+// Log is the World's logger (the stream handler logs one warning through it).
+func (w *World) Log() *slog.Logger { return w.log }
+
+// Subscribe hands the metrics hub's channel to /v1/stream (Holder.Acquire wraps it).
 func (w *World) Subscribe() (<-chan []byte, func()) { return w.metrics.Subscribe() }
 
 // Viewers is the number of open SSE subscriptions.

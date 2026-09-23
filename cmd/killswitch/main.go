@@ -66,7 +66,9 @@ func main() {
 		defer cancel()
 		shut := make(chan error, 1)
 		go func() { shut <- srv.Shutdown(shutdownCtx) }()
-		if cur := holder.Current(); cur != nil {
+		cur, release := holder.Current()
+		release() // Stop waits for held handlers; this is not one
+		if cur != nil {
 			cur.Stop()
 		}
 		if err := <-shut; err != nil {
