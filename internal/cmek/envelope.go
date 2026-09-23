@@ -2,12 +2,8 @@
 package cmek
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"time"
 )
 
@@ -20,33 +16,23 @@ func aad(tenant string, msgID int64, dekID string) []byte {
 	return b
 }
 
-func gcm(key *[32]byte) (cipher.AEAD, error) {
-	block, err := aes.NewCipher(key[:])
-	if err != nil {
-		return nil, err
-	}
-	return cipher.NewGCM(block)
-}
-
-// Seal encrypts plaintext with AES-256-GCM, a fresh 96-bit nonce and AAD = tenant|msgID|dekID; refuses a handle with now >= ValidUntil.
+// Seal encrypts plaintext under the handle's DEK (Tink AES-256-GCM: the IV is drawn inside and embedded in the
+// ciphertext) with AAD = tenant|msgID|dekID; refuses a handle with now >= ValidUntil or one already zeroed.
 func Seal(h Handle, now time.Time, tenant string, msgID int64, plaintext []byte) (Envelope, error) {
 	if !now.Before(h.ValidUntil) {
 		return Envelope{}, ErrLeaseExpired
 	}
-	g, err := gcm(&h.key)
+	if h.prim == nil {
+		return Envelope{}, fmt.Errorf("cmek: seal: %w", ErrDEKCold)
+	}
+	ct, err := h.prim.Encrypt(plaintext, aad(tenant, msgID, h.DEKID))
 	if err != nil {
 		return Envelope{}, fmt.Errorf("cmek: seal: %w", err)
 	}
-	var env Envelope
-	env.DEKID = h.DEKID
-	if _, err := io.ReadFull(rand.Reader, env.Nonce[:]); err != nil {
-		return Envelope{}, fmt.Errorf("cmek: nonce: %w", err)
-	}
-	env.Ciphertext = g.Seal(nil, env.Nonce[:], plaintext, aad(tenant, msgID, h.DEKID))
-	return env, nil
+	return Envelope{DEKID: h.DEKID, Ciphertext: ct}, nil
 }
 
-// Open reverses Seal; a stale handle returns ErrLeaseExpired, any tag or AAD mismatch ErrPoison.
+// Open reverses Seal; a stale handle returns ErrLeaseExpired, a DEK id mismatch or any decrypt failure ErrPoison.
 func Open(h Handle, now time.Time, tenant string, msgID int64, env Envelope) ([]byte, error) {
 	if !now.Before(h.ValidUntil) {
 		return nil, ErrLeaseExpired
@@ -54,11 +40,10 @@ func Open(h Handle, now time.Time, tenant string, msgID int64, env Envelope) ([]
 	if h.DEKID != env.DEKID {
 		return nil, fmt.Errorf("%w: handle %q, envelope %q", ErrPoison, h.DEKID, env.DEKID)
 	}
-	g, err := gcm(&h.key)
-	if err != nil {
-		return nil, fmt.Errorf("cmek: open: %w", err)
+	if h.prim == nil {
+		return nil, fmt.Errorf("cmek: open: %w", ErrDEKCold)
 	}
-	pt, err := g.Open(nil, env.Nonce[:], env.Ciphertext, aad(tenant, msgID, env.DEKID))
+	pt, err := h.prim.Decrypt(env.Ciphertext, aad(tenant, msgID, env.DEKID))
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrPoison, err) // tag or AAD mismatch; the worker logs and dead-letters
 	}

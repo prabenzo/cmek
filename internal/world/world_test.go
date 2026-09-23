@@ -2,7 +2,9 @@
 package world
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"math"
@@ -11,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 type testClock struct {
@@ -117,13 +121,16 @@ func TestSmallPopulation(t *testing.T) {
 	w.Stop()
 }
 
-// TestScenarioRunner: start, busy, unknown, stop (returns the name, restores the multiplier, clears the card), stop
-// while idle, and a natural end.
+// TestScenarioRunner: start, busy, unknown, stop (returns the name, restores the multiplier, clears the card and the
+// targets), stop while idle, a natural end with its tail (recovery and drain stamped, the restored line), and the
+// revocation's open phase ended by Restore.
 func TestScenarioRunner(t *testing.T) {
 	p := Small()
 	p.DBDir = t.TempDir()
 	p.TenantSurgeFor = 60 * time.Millisecond
-	w, err := New(p, Deps{ID: "s", Clock: &testClock{now: time.Now()}})
+	p.SnapshotInterval = 20 * time.Millisecond
+	p.ScenarioTailMin, p.ScenarioTailMax = 100*time.Millisecond, 2*time.Second
+	w, err := New(p, Deps{ID: "s"}) // the real clock: the tail measures elapsed time
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,6 +150,9 @@ func TestScenarioRunner(t *testing.T) {
 	if name, running, _ := w.metrics.Scenario(); !running || name != "tenant_surge" {
 		t.Errorf("card: %q running=%v", name, running)
 	}
+	if !w.metrics.Affected(surge) {
+		t.Error("surge tenant not affected after start")
+	}
 	if got := w.gen.Offered(surge); math.Abs(got-base*p.TenantSurgeMult) > 1e-9 {
 		t.Errorf("surge multiplier: offered %v, want %v", got, base*p.TenantSurgeMult)
 	}
@@ -155,6 +165,9 @@ func TestScenarioRunner(t *testing.T) {
 	if got := w.gen.Offered(surge); got != base {
 		t.Errorf("after stop: offered %v, want %v", got, base)
 	}
+	if w.metrics.Affected(surge) {
+		t.Error("surge tenant still affected after stop")
+	}
 	if name := w.StopScenario(); name != "" {
 		t.Errorf("idle stop returned %q", name)
 	}
@@ -162,15 +175,25 @@ func TestScenarioRunner(t *testing.T) {
 	if err := w.StartScenario("tenant_surge"); err != nil {
 		t.Fatalf("restart: %v", err)
 	}
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(3 * time.Second)
+	seenDone := false // the tail holds the card for ≥ ScenarioTailMin once recovery and drain are stamped
 	for time.Now().Before(deadline) {
 		if _, running, _ := w.metrics.Scenario(); !running {
 			break
 		}
+		if _, _, done := w.metrics.Recovered(); done {
+			seenDone = true
+		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	if _, running, _ := w.metrics.Scenario(); running {
-		t.Fatal("scenario still running 2 s after a 60 ms phase")
+		t.Fatal("scenario still running 3 s after a 60 ms phase")
+	}
+	if !seenDone {
+		t.Error("tail: Recovered never reported done while the card was up")
+	}
+	if got := w.gen.Offered(surge); got != base {
+		t.Errorf("after natural end: offered %v, want %v", got, base)
 	}
 	if got := w.gen.Offered(surge); got != base {
 		t.Errorf("after natural end: offered %v, want %v", got, base)
@@ -178,5 +201,89 @@ func TestScenarioRunner(t *testing.T) {
 	if err := w.StartScenario("global_surge"); err != nil { // the slot is free again
 		t.Errorf("start after natural end: %v", err)
 	}
-	w.StopScenario()
+	if name := w.StopScenario(); name != "global_surge" {
+		t.Errorf("stop returned %q", name)
+	}
+	// key_revocation: an open phase that Restore (on the target only) ends, then the tail
+	rev := w.byRank[p.RevokeTenantRank-1]
+	if err := w.StartScenario("key_revocation"); err != nil {
+		t.Fatalf("revocation: %v", err)
+	}
+	other := w.byRank[0]
+	if err := w.SetKey(w.ids[other], "restore"); err != nil { // not the target: the run stays open
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if name, running, _ := w.metrics.Scenario(); !running || name != "key_revocation" {
+		t.Errorf("revocation ended by a restore of another tenant: %q running=%v", name, running)
+	}
+	if err := w.SetKey(w.ids[rev], "restore"); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, running, _ := w.metrics.Scenario(); !running {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, running, _ := w.metrics.Scenario(); running {
+		t.Fatal("revocation still running 3 s after Restore")
+	}
+}
+
+// TestNoPlaintextAtRest (S1's mechanism): with no workers running, every ingested row sits in the messages table as
+// a Tink ciphertext longer than the payload by the IV and the tag, and neither the canary nor any JSON of the payload
+// appears in it; the deks table holds only wrapped keysets.
+func TestNoPlaintextAtRest(t *testing.T) {
+	dir := t.TempDir()
+	p := Small()
+	p.DBDir = dir
+	w, err := New(p, Deps{ID: "rest", Clock: &testClock{now: time.Date(2026, 9, 23, 0, 0, 0, 0, time.UTC)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+	const n = 12
+	for i := 0; i < n; i++ {
+		tenant := fmt.Sprintf("t-%04d", i%p.Tenants)
+		payload := fmt.Sprintf(`{"canary":"%s%s","i":%d}`, p.CanaryPrefix, tenant, i)
+		if err := w.Ingest(context.Background(), tenant, []byte(payload)); err != nil {
+			t.Fatalf("ingest %d: %v", i, err)
+		}
+	}
+	db, err := sql.Open("sqlite", filepath.Join(dir, fmt.Sprintf("killswitch-%d-rest.db", os.Getpid())))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.Query(`SELECT tenant_id, ciphertext FROM messages`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		var tenant string
+		var ct []byte
+		if err := rows.Scan(&tenant, &ct); err != nil {
+			t.Fatal(err)
+		}
+		count++
+		for _, needle := range []string{p.CanaryPrefix, `"canary"`, `"i":`, tenant} {
+			if bytes.Contains(ct, []byte(needle)) {
+				t.Errorf("row of %s: ciphertext contains %q", tenant, needle)
+			}
+		}
+		if min := 12 + len(`{"canary":"`) + len(p.CanaryPrefix) + 16; len(ct) < min {
+			t.Errorf("row of %s: ciphertext is %d bytes, shorter than IV + payload + tag (%d)", tenant, len(ct), min)
+		}
+	}
+	if count != n {
+		t.Errorf("messages at rest = %d, want %d", count, n)
+	}
+	var deks int
+	if err := db.QueryRow(`SELECT count(*) FROM deks WHERE length(wrapped_dek) > 64`).Scan(&deks); err != nil || deks < 1 {
+		t.Errorf("wrapped deks = %d (%v), want at least one keyset-sized blob", deks, err)
+	}
 }

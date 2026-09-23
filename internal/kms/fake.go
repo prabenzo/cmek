@@ -3,14 +3,14 @@ package kms
 
 import (
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
-	"io"
 	"math"
 	mrand "math/rand"
 	"sync"
 	"time"
+
+	"github.com/tink-crypto/tink-go/v2/aead"
+	"github.com/tink-crypto/tink-go/v2/keyset"
+	"github.com/tink-crypto/tink-go/v2/tink"
 )
 
 // KEKSpec binds a KEK to a provider and a grid index.
@@ -29,14 +29,14 @@ type FakeConfig struct {
 }
 
 type kek struct {
-	key      [32]byte
+	prim     tink.AEAD // the KEK itself: a one-key Tink AES-256-GCM keyset, never serialized
 	provider string
 	idx      int
 	enabled  bool
 }
 
-// Fake is three in-process providers doing real AES-256-GCM wrapping under per-KEK keys, with fault injection per
-// provider or per KEK (fast-fail, error rate, lognormal latency), Revoke/Restore and a ground-truth log.
+// Fake is three in-process providers doing real AES-256-GCM wrapping (Tink) under per-KEK keys, with fault
+// injection per provider or per KEK (fast-fail, error rate, lognormal latency), Revoke/Restore and a ground-truth log.
 type Fake struct {
 	cfg        FakeConfig
 	mu         sync.RWMutex
@@ -46,17 +46,67 @@ type Fake struct {
 	truth      Truth
 }
 
-// NewFake builds the providers; every KEK gets 32 bytes from crypto/rand.
+// NewFake builds the providers; every KEK is a fresh Tink AES-256-GCM keyset (crypto/rand inside Tink).
 func NewFake(cfg FakeConfig) *Fake {
 	f := &Fake{cfg: cfg, keks: make(map[string]*kek, len(cfg.KEKs)), provFaults: make(map[string]Fault), kekFaults: make(map[string]Fault)}
 	for _, s := range cfg.KEKs {
-		k := &kek{provider: s.Provider, idx: s.Idx, enabled: true}
-		if _, err := io.ReadFull(rand.Reader, k.key[:]); err != nil {
-			panic("kms: crypto/rand: " + err.Error())
+		h, err := keyset.NewHandle(aead.AES256GCMKeyTemplate())
+		if err != nil {
+			panic("kms: new keyset: " + err.Error())
 		}
-		f.keks[s.ID] = k
+		prim, err := aead.New(h)
+		if err != nil {
+			panic("kms: aead: " + err.Error())
+		}
+		f.keks[s.ID] = &kek{prim: prim, provider: s.Provider, idx: s.Idx, enabled: true}
 	}
 	return f
+}
+
+// KEK returns the remote AEAD for one KEK: a gate that runs the fault, latency and revoke checks on every call and
+// then wraps or unwraps under the KEK's own Tink primitive. The lookup is offline; an unknown id is AccessDenied.
+func (f *Fake) KEK(kekID string) (tink.AEADWithContext, error) {
+	f.mu.RLock()
+	_, ok := f.keks[kekID]
+	f.mu.RUnlock()
+	if !ok {
+		return nil, &Error{Code: AccessDenied, Provider: "?", Msg: "unknown key " + kekID}
+	}
+	return &gate{f: f, kekID: kekID}, nil
+}
+
+// gate is one KEK's tink.AEADWithContext: begin (fault → fast-fail / error rate / latency raced with ctx → enabled
+// read after the latency) and then the KEK primitive with the caller's associated data (cmek passes the KEK id).
+type gate struct {
+	f     *Fake
+	kekID string
+}
+
+// EncryptWithContext wraps a DEK keyset under the KEK (the generate round trip).
+func (g *gate) EncryptWithContext(ctx context.Context, plaintext, associatedData []byte) ([]byte, error) {
+	k, err := g.f.begin(ctx, g.kekID)
+	if err != nil {
+		return nil, err
+	}
+	ct, err := k.prim.Encrypt(plaintext, associatedData)
+	if err != nil {
+		return nil, &Error{Code: Unavailable, Provider: k.provider, Msg: err.Error()}
+	}
+	return ct, nil
+}
+
+// DecryptWithContext unwraps a DEK keyset (the unwrap round trip); bytes that do not verify under this KEK and
+// this associated data are an authoritative deny, as a real provider answers for a blob wrapped by another key.
+func (g *gate) DecryptWithContext(ctx context.Context, ciphertext, associatedData []byte) ([]byte, error) {
+	k, err := g.f.begin(ctx, g.kekID)
+	if err != nil {
+		return nil, err
+	}
+	pt, err := k.prim.Decrypt(ciphertext, associatedData)
+	if err != nil {
+		return nil, &Error{Code: AccessDenied, Provider: k.provider, Msg: "wrapped key does not verify"}
+	}
+	return pt, nil
 }
 
 // SetFault installs a fault for a provider or a KEK; a zero Fault (ModeOK, no latency, no error rate) clears it.
@@ -75,7 +125,9 @@ func (f *Fake) SetFault(s Scope, fault Fault) {
 }
 
 // Revoke disables the KEK and records ground truth; the timestamp is read after the flip, inside the same critical
-// section, so no call that returned OK was checked after it [SC-F6]. Restore re-enables it the same way.
+// section, so no call that returned OK was checked after it [SC-F6]. Restore re-enables it the same way. Both are
+// idempotent: a flip to the state the key is already in records nothing (a Restore that ends the revocation
+// scenario is followed by the scenario's own exit Restore; the checker must see one event).
 func (f *Fake) Revoke(kekID string)  { f.flip(kekID, false) }
 func (f *Fake) Restore(kekID string) { f.flip(kekID, true) }
 
@@ -83,7 +135,7 @@ func (f *Fake) flip(kekID string, enabled bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	k := f.keks[kekID]
-	if k == nil {
+	if k == nil || k.enabled == enabled {
 		return
 	}
 	k.enabled = enabled
@@ -143,56 +195,4 @@ func (f *Fake) lognormal(p50, p99 time.Duration) time.Duration {
 	z := f.cfg.Rand.NormFloat64()
 	f.cfg.Lock.Unlock()
 	return time.Duration(math.Exp(mu+sigma*z) * float64(time.Second))
-}
-
-func (k *kek) aead() cipher.AEAD {
-	block, err := aes.NewCipher(k.key[:])
-	if err != nil {
-		panic(err)
-	}
-	g, err := cipher.NewGCM(block)
-	if err != nil {
-		panic(err)
-	}
-	return g
-}
-
-// GenerateDataKey returns a fresh 32-byte DEK and its wrapped form (nonce || AES-256-GCM(DEK) under the KEK).
-func (f *Fake) GenerateDataKey(ctx context.Context, kekID string) (DataKey, error) {
-	k, err := f.begin(ctx, kekID)
-	if err != nil {
-		return DataKey{}, err
-	}
-	var dk DataKey
-	if _, err := io.ReadFull(rand.Reader, dk.Plaintext[:]); err != nil {
-		return DataKey{}, &Error{Code: Unavailable, Provider: k.provider, Msg: err.Error()}
-	}
-	g := k.aead()
-	nonce := make([]byte, g.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return DataKey{}, &Error{Code: Unavailable, Provider: k.provider, Msg: err.Error()}
-	}
-	dk.Wrapped = g.Seal(nonce, nonce, dk.Plaintext[:], []byte(kekID))
-	dk.KEKVersion = 1
-	return dk, nil
-}
-
-// Unwrap recovers a DEK from its wrapped form; a disabled KEK answers KeyDisabled, checked after any latency.
-func (f *Fake) Unwrap(ctx context.Context, kekID string, kekVersion int, wrapped []byte) ([32]byte, error) {
-	var out [32]byte
-	k, err := f.begin(ctx, kekID)
-	if err != nil {
-		return out, err
-	}
-	g := k.aead()
-	ns := g.NonceSize()
-	if len(wrapped) < ns {
-		return out, &Error{Code: AccessDenied, Provider: k.provider, Msg: "malformed wrapped key"}
-	}
-	pt, err := g.Open(nil, wrapped[:ns], wrapped[ns:], []byte(kekID))
-	if err != nil || len(pt) != 32 {
-		return out, &Error{Code: AccessDenied, Provider: k.provider, Msg: "wrapped key does not verify"}
-	}
-	copy(out[:], pt)
-	return out, nil
 }

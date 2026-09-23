@@ -27,6 +27,7 @@ These are the build plans for the seven milestones in `docs/SPEC.md › Plan and
 | M4 UI and scenarios | 2:20–3:15 | [M4.md](M4.md) | [x] 2026-09-22, chat | all as recommended for the build; the UI decisions are reviewed by Ben in his browser testing after the push; Claude writes everything incl. `hist.go`, its test and the card copy; build starts once M3 merges |
 | M5 Checker and hardening | 3:15–3:40 | [M5.md](M5.md) | [ ] | standing: Claude writes everything incl. `holder.go`, reset and the README draft; Ben deploys, runs the clean-browser check, reviews; the rest open |
 | M6 Rationale | 3:40–4:25 | [M6.md](M6.md) | [ ] | standing: Claude writes every file; Ben reviews, records the video, exports his transcripts, deploys; the rest open |
+| Tink adoption (side branch `claude/tink-go`, merges into the M4 pull request) | — | [TINK.md](TINK.md) | [x] 2026-09-23, PR #8 | replace the hand-rolled AES-GCM in `internal/cmek/envelope.go` and `internal/kms/fake.go` with tink-go; cmek keeps only leases and caching; every decision's first option recommended; the spec's library list is amended on approval |
 
 ## Decisions recorded so far
 
@@ -43,6 +44,7 @@ These are the build plans for the seven milestones in `docs/SPEC.md › Plan and
 | M3: scheduler class (settled earlier), global-surge cap visibility (90 s), M3 slack use, scenario targets, who drafts `Next` | M3 | all as recommended; "run it once I merge M2" | chat, 2026-09-22 |
 | M3–M6: who writes | M3, M4, M5, M6, ARCH-NOTES 9 | Claude writes all the code, tests and drafts in every remaining milestone; Ben reviews at his pickup and keeps only what needs his laptop: browser observation, docker/gcloud deploys, the video, the transcript exports. Each plan's order of work is one Claude lane; Ben's review is at his pickup and never gates a step | chat, 2026-09-22 |
 | M2: cold-fetch edge, M2 split, slow-azure rows, walk extras, tenant/waiter cap full, Manager locking | M2 | Manager locking: per-tenant mutexes (the alternative); M2 split: Claude writes all of `internal/cmek` and every test, Ben reviews at his pickup and writes no tests (so the M5 walk extras' owner is Claude); the rest as recommended | chat, 2026-09-22 |
+| Tink: KMS round trip (Tink's `keyset.ReadWithContext`/`WriteWithContext` + `kms.CodeFromText` string shim, the direct-AEAD + `insecurecleartextkeyset` path as the alternative), NoPrefix template, drop the nonce column, `Zero()` as a reference drop, own fake gate, library-list amendment, crypto-only scope | TINK | round trip: the helpers plus the shim (Ben: "the documentation specifically mentions not to use insecure in prod and I would prioritize that over the string matching"); everything else as recommended; "Plan LGTM, please proceed" | PR #8 review and comment, 2026-09-23 |
 
 ## Working asynchronously
 

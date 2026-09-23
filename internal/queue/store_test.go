@@ -26,7 +26,7 @@ func openTest(tb testing.TB, dir string) (*Store, *testClock) {
 }
 
 func env(n byte) cmek.Envelope {
-	return cmek.Envelope{DEKID: "t-0000/1", Nonce: [12]byte{n}, Ciphertext: []byte("ciphertext-not-plaintext")}
+	return cmek.Envelope{DEKID: "t-0000/1", Ciphertext: append([]byte("ciphertext-not-plaintext-"), n)}
 }
 
 // TestLedger: insert, claim, release, dead, claim again, ack; the ledger must move by exactly the rows each statement changed.

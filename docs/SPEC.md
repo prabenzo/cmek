@@ -178,7 +178,7 @@ The fakes are honest stand-ins: the fake KMS does real cryptography and keeps gr
 
 | Fake | What it models |
 | --- | --- |
-| KMS | The interface a real adapter would implement: `GenerateDataKey` and `Unwrap`. Three simulated providers (labelled aws, gcp, azure) each host a third of the tenants. Real AES-256-GCM wrapping under per-tenant KEKs, so a revoked key is truly unusable. |
+| KMS | The interface a real adapter would implement: one remote AEAD per KEK (`KEK(kekID)` returning a `tink.AEADWithContext` whose encrypt and decrypt are the wrap and unwrap round trips; amended from `GenerateDataKey` and `Unwrap` by the Tink adoption, 2026-09-23). Three simulated providers (labelled aws, gcp, azure) each host a third of the tenants. Real AES-256-GCM wrapping via tink-go under per-tenant KEKs, so a revoked key is truly unusable. |
 | KMS faults | Per provider or per tenant: mode (ok, fast-fail), lognormal latency (p50, p99), error rate, key state (enabled, disabled). |
 | KMS ground truth | A timestamped log of every call and every key state change. Only the invariant checker reads it. |
 | Traffic | 1,000 tenants with Zipf-distributed rates, about 300 events/s in total. Payloads are \~1 KB synthetic webhook events containing the canary `PLAINTEXT-CANARY-<tenant>`. Surge controls multiply one tenant's rate or every tenant's rate. Rejections are counted by reason and not retried. |
@@ -229,7 +229,7 @@ The whole system is one static Go binary with the UI embedded, deployed as a sin
 | --- | --- | --- |
 | Language | Go, current stable | Goroutines and `context` deadlines map directly onto timeouts, bulkheads and worker pools |
 | Storage | `modernc.org/sqlite`, WAL mode, single writer connection | Pure Go, so no CGO and a simple static build; "at rest" stays tangible |
-| Libraries | stdlib `net/http`, `crypto/aes`, `crypto/cipher`; `x/sync/singleflight`; `x/time/rate` | Little to review beyond our own code |
+| Libraries | stdlib `net/http`; `tink-go` for all cryptography (amended 2026-09-23, docs/plan/TINK.md: it replaced our own `crypto/aes`/`crypto/cipher` envelope and KEK wrapping); `x/sync/singleflight`; `x/time/rate` | A vetted library for the part that must not be wrong; little to review beyond our own code elsewhere |
 | UI | `index.html`, vanilla JS, uPlot, served through `go:embed` | No npm, no build step |
 | Hosting | Cloud Run, scaled to zero: min 0 and max 1 instance, request-based billing, startup CPU boost, 60-minute request timeout, 1 GiB memory | Max one instance keeps the World in a single process. The World only needs CPU while someone is watching, and an open stream is an in-flight request, so [request-based billing](https://docs.cloud.google.com/run/docs/configuring/billing-settings) fits and idle time costs nothing. The price is a short cold start on the first visit, softened by [startup CPU boost](https://docs.cloud.google.com/run/docs/configuring/services/cpu). The [filesystem is in-memory](https://docs.cloud.google.com/run/docs/container-contract), so SQLite counts against instance memory. Streams end at the [request timeout](https://docs.cloud.google.com/run/docs/configuring/request-timeout), so the UI reconnects by itself. |
 

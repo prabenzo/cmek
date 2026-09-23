@@ -22,6 +22,10 @@ type BacklogSource interface {
 // OfferedSource reads the generator's current offered rate (traffic.Generator).
 type OfferedSource interface{ OfferedPS() float64 }
 
+// InflightSource reports KMS calls inside a provider (cmek.Manager.Inflight); read in tick step 2 before reg.mu,
+// it feeds the snapshot inflight{} and the #inflight tile.
+type InflightSource interface{ Inflight(provider string) int }
+
 // ViewerWatcher is told when the viewer count changes (world.World); called with no metrics lock held.
 type ViewerWatcher interface{ Viewers(n int) }
 
@@ -47,10 +51,12 @@ type Config struct {
 	Grid                                                                                         GridSource
 	Backlog                                                                                      BacklogSource
 	Offered                                                                                      OfferedSource
+	Inflight                                                                                     InflightSource
 	Watcher                                                                                      ViewerWatcher
 	Clock                                                                                        Clock
 	Interval, ChartWindow                                                                        time.Duration
 	P99Window, BaselineTicks, AuditRing, TimelineRing, SnapshotEvents, AggregateMin, ViewerQueue int
+	DrainSlack                                                                                   int // affected backlog at or under this counts as drained (Workers × ClaimBatch: rows in flight)
 	Capacity                                                                                     float64
 	WorldID                                                                                      string
 }
@@ -85,11 +91,12 @@ func reasonIndex(reason string) int {
 	return reasonInternal
 }
 
-// Registry holds every aggregate, the audit rings and the SSE hub.
+// Registry holds every aggregate, the audit rings, the histograms, the timeline and the SSE hub.
 type Registry struct {
 	cfg   Config
 	hub   *hub
 	ticks atomic.Int64
+	ln15  float64
 
 	ingest     [reasonCount]atomic.Int64 // per tick
 	delivered  atomic.Int64              // per tick
@@ -97,6 +104,10 @@ type Registry struct {
 	rejWithin  atomic.Int64              // per tick: admission rejections of within-share tenants (the L4 split)
 	rejOver    atomic.Int64              // per tick: admission rejections of over-share tenants
 	overWithin atomic.Int64              // cumulative: overloaded rejections of within-share tenants (L4 judges it)
+
+	affected []atomic.Bool // the scenario's declared set, read lock-free at record time (Q8)
+	hists    [2][]hist     // per class (0 healthy, 1 affected): P99Window tick slots
+	slot     atomic.Int32  // the slot Delivered writes
 
 	mu        sync.Mutex
 	audits    [][]Audit // per tenant ring
@@ -108,13 +119,26 @@ type Registry struct {
 	tlHead    int
 	tlN       int
 	tlSeq     int64
-	scen      scenarioState // the running scenario's card state
+	scen      scenarioState   // the running scenario's card state
+	targets   []int           // replaced whole by SetTargets, never mutated: safe to read after a copy under mu
+	p99Ring   []time.Duration // len BaselineTicks: the windowed healthy p99 as the snapshot reports it each tick
+	p99Head   int
+	p99N      int
+	baseline  time.Duration // frozen by SetTargets: mean of p99Ring
+	pendTrans []Audit       // state transitions other than ACTIVE↔RIDING_THROUGH and REVOKED, flushed per tick
+	rt        []rtCount     // per provider ACTIVE↔RIDING_THROUGH counts, flushed once per second
+	rtFlushed time.Time
 }
 
-// scenarioState is what the card countdown reads; name "" means idle.
+// rtCount buffers the ride-through churn of one provider.
+type rtCount struct{ up, down int }
+
+// scenarioState is what the card reads; name "" means idle. clearedAt is the fault-cleared instant from which
+// recovery (every target ACTIVE) and drain (affected backlog ≤ DrainSlack) are measured.
 type scenarioState struct {
-	name, phase   string
-	endsAt, since time.Time
+	name, phase                       string
+	endsAt, since                     time.Time
+	clearedAt, recoveredAt, drainedAt time.Time
 }
 
 // event is one timeline line as the snapshot carries it.
@@ -135,12 +159,32 @@ func New(cfg Config) *Registry {
 	if cfg.SnapshotEvents <= 0 {
 		cfg.SnapshotEvents = 20
 	}
+	if cfg.P99Window <= 0 {
+		cfg.P99Window = 10
+	}
+	if cfg.BaselineTicks <= 0 {
+		cfg.BaselineTicks = 20
+	}
+	if cfg.AggregateMin <= 0 {
+		cfg.AggregateMin = 3
+	}
 	n := len(cfg.Tenants)
-	r := &Registry{cfg: cfg, hub: newHub(cfg.ViewerQueue, cfg.Watcher), audits: make([][]Audit, n), auditHead: make([]int, n), auditN: make([]int, n), states: make([]uint8, n), grid: make([]byte, n), timeline: make([]event, cfg.TimelineRing)}
+	r := &Registry{cfg: cfg, hub: newHub(cfg.ViewerQueue, cfg.Watcher), ln15: 0.4054651081081644, audits: make([][]Audit, n), auditHead: make([]int, n), auditN: make([]int, n), states: make([]uint8, n), grid: make([]byte, n), timeline: make([]event, cfg.TimelineRing), affected: make([]atomic.Bool, n), p99Ring: make([]time.Duration, cfg.BaselineTicks), rt: make([]rtCount, len(cfg.Providers))}
+	for c := range r.hists {
+		r.hists[c] = make([]hist, cfg.P99Window)
+	}
 	return r
 }
 
-// Timeline appends a free-text line (scenarios and the checker use it; state transitions post through Audit).
+// provider is the provider index of a grid index (contiguous bands).
+func (r *Registry) provider(idx int) int {
+	if len(r.cfg.Providers) == 0 || len(r.cfg.Tenants) == 0 {
+		return 0
+	}
+	return idx * len(r.cfg.Providers) / len(r.cfg.Tenants)
+}
+
+// Timeline appends a free-text line (scenario markers, the restored line, the checker in M5).
 func (r *Registry) Timeline(text string) {
 	r.mu.Lock()
 	r.post(r.cfg.Clock.Now(), text)
@@ -205,7 +249,8 @@ func (r *Registry) Ingest(idx int, reason string, withinShare bool) {
 // OverloadedWithinShare is the cumulative count of overloaded rejections dealt to within-share tenants (L4: must stay 0).
 func (r *Registry) OverloadedWithinShare() int64 { return r.overWithin.Load() }
 
-// SetScenario publishes the card countdown; an empty name clears it; a zero endsAt means an open-ended phase.
+// SetScenario publishes the card countdown; an empty name clears it (and the recovery marks); a zero endsAt means
+// an open-ended phase (ends_at null).
 func (r *Registry) SetScenario(name, phase string, endsAt time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -226,11 +271,85 @@ func (r *Registry) Scenario() (name string, running bool, since time.Time) {
 	return r.scen.name, r.scen.name != "", r.scen.since
 }
 
-// Delivered records one delivery (histograms arrive in M4).
-func (r *Registry) Delivered(idx int, latency time.Duration) { r.delivered.Add(1) }
+// SetTargets replaces the affected set and freezes the baseline (mean of the last BaselineTicks windowed healthy
+// p99s, whatever the ring holds so far); only scenarios call it.
+func (r *Registry) SetTargets(idx []int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, i := range r.targets {
+		r.affected[i].Store(false)
+	}
+	r.targets = append([]int(nil), idx...)
+	for _, i := range r.targets {
+		if i >= 0 && i < len(r.affected) {
+			r.affected[i].Store(true)
+		}
+	}
+	var sum time.Duration
+	for i := 0; i < r.p99N; i++ {
+		sum += r.p99Ring[i]
+	}
+	r.baseline = 0
+	if r.p99N > 0 {
+		r.baseline = sum / time.Duration(r.p99N)
+	}
+	r.scen.clearedAt, r.scen.recoveredAt, r.scen.drainedAt = time.Time{}, time.Time{}, time.Time{}
+}
+
+// ClearTargets ends the affected set (the baseline stays until the next SetTargets).
+func (r *Registry) ClearTargets() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, i := range r.targets {
+		r.affected[i].Store(false)
+	}
+	r.targets = nil
+}
+
+// Affected reports the tenant's affected bit (lock-free atomic load); world.Tenant reads it.
+func (r *Registry) Affected(idx int) bool {
+	if idx < 0 || idx >= len(r.affected) {
+		return false
+	}
+	return r.affected[idx].Load()
+}
+
+// SetCleared marks the fault-cleared instant from which recovery_s and drain_s are measured.
+func (r *Registry) SetCleared(at time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.scen.clearedAt, r.scen.recoveredAt, r.scen.drainedAt = at, time.Time{}, time.Time{}
+}
+
+// Recovered reports whether, since SetCleared, every target has been seen ACTIVE and the affected backlog at or
+// under DrainSlack (tick step 5 stamps both), and the two durations (zero while unstamped).
+func (r *Registry) Recovered() (recovered, drained time.Duration, done bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.scen.recoveredAt.IsZero() {
+		recovered = r.scen.recoveredAt.Sub(r.scen.clearedAt)
+	}
+	if !r.scen.drainedAt.IsZero() {
+		drained = r.scen.drainedAt.Sub(r.scen.clearedAt)
+	}
+	return recovered, drained, !r.scen.recoveredAt.IsZero() && !r.scen.drainedAt.IsZero()
+}
+
+// Delivered records one end-to-end latency in the tick histogram of the tenant's class (queue.Recorder).
+func (r *Registry) Delivered(idx int, latency time.Duration) {
+	r.delivered.Add(1)
+	class := 0
+	if r.Affected(idx) {
+		class = 1
+	}
+	r.record(class, latency)
+}
 
 // Audit stores the entry in the tenant ring, counts KMS calls by class, and turns a state change into a timeline
-// line (one per transition; M4 aggregates same-transition bursts). A REVOKED line carries the purge count.
+// line: a REVOKED transition posts at once with its purge count (never aggregated); ACTIVE↔RIDING_THROUGH churn is
+// counted per provider and flushed once per second as one line; every other transition waits for the next
+// per-second flush, where AggregateMin or more of the same (provider, from, to) collapse to one line and the rest
+// keep the M2 form (a single waits ≤ 1 s).
 func (r *Registry) Audit(e Audit) {
 	if e.Op == "unwrap" || e.Op == "generate" {
 		if e.Class < 3 {
@@ -242,11 +361,15 @@ func (r *Registry) Audit(e Audit) {
 	}
 	r.mu.Lock()
 	if e.Op == "state" {
-		id := r.cfg.Tenants[e.Idx]
-		if e.To == 3 {
-			r.post(e.At, fmt.Sprintf("%s REVOKED, %d DEKs purged", id, e.Purged))
-		} else {
-			r.post(e.At, fmt.Sprintf("%s %s → %s (%s)", id, stateName(e.From), stateName(e.To), e.Detail))
+		switch {
+		case e.To == 3:
+			r.post(e.At, fmt.Sprintf("%s REVOKED, %d DEKs purged", r.cfg.Tenants[e.Idx], e.Purged))
+		case e.From == 0 && e.To == 1:
+			r.rt[r.provider(e.Idx)].up++
+		case e.From == 1 && e.To == 0:
+			r.rt[r.provider(e.Idx)].down++
+		default:
+			r.pendTrans = append(r.pendTrans, e)
 		}
 	}
 	ring := r.audits[e.Idx]
@@ -260,6 +383,81 @@ func (r *Registry) Audit(e Audit) {
 		r.auditN[e.Idx]++
 	}
 	r.mu.Unlock()
+}
+
+// TenantAudit returns the last n ring entries for one tenant, newest first.
+func (r *Registry) TenantAudit(idx, n int) []Audit {
+	out := []Audit{}
+	if idx < 0 || idx >= len(r.audits) {
+		return out
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if n > r.auditN[idx] {
+		n = r.auditN[idx]
+	}
+	ring := r.audits[idx]
+	for i := 1; i <= n; i++ {
+		out = append(out, ring[(r.auditHead[idx]-i+r.cfg.AuditRing)%r.cfg.AuditRing])
+	}
+	return out
+}
+
+// TenantCallsPerMin counts unwrap/generate entries newer than 60 s in the tenant's ring (a lower bound when the
+// ring covers less than 60 s).
+func (r *Registry) TenantCallsPerMin(idx int) float64 {
+	if idx < 0 || idx >= len(r.audits) {
+		return 0
+	}
+	cut := r.cfg.Clock.Now().Add(-time.Minute)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for i := 0; i < r.auditN[idx]; i++ {
+		e := r.audits[idx][i]
+		if (e.Op == "unwrap" || e.Op == "generate") && e.At.After(cut) {
+			n++
+		}
+	}
+	return float64(n)
+}
+
+// flushTransitions turns the buffered transitions into timeline lines (step 6) once per second, so an outage
+// posts at most one line per (provider, from, to) per second plus its singles; caller holds r.mu. Every line a
+// flush posts carries the flush instant (a buffered single is published up to 1 s after its transition), so the
+// timeline's timestamps never run backwards within a flush.
+func (r *Registry) flushTransitions(now time.Time) {
+	if now.Sub(r.rtFlushed) < time.Second {
+		return
+	}
+	r.rtFlushed = now
+	if len(r.pendTrans) > 0 {
+		type key struct{ prov, from, to uint8 }
+		counts := map[key]int{}
+		for _, e := range r.pendTrans {
+			counts[key{uint8(r.provider(e.Idx)), e.From, e.To}]++
+		}
+		posted := map[key]bool{}
+		for _, e := range r.pendTrans {
+			k := key{uint8(r.provider(e.Idx)), e.From, e.To}
+			switch {
+			case counts[k] >= r.cfg.AggregateMin && !posted[k]:
+				posted[k] = true
+				r.post(now, fmt.Sprintf("%d %s tenants %s → %s", counts[k], r.cfg.Providers[k.prov], stateName(e.From), stateName(e.To)))
+			case counts[k] < r.cfg.AggregateMin:
+				r.post(now, fmt.Sprintf("%s %s → %s (%s)", r.cfg.Tenants[e.Idx], stateName(e.From), stateName(e.To), e.Detail))
+			}
+		}
+		r.pendTrans = r.pendTrans[:0]
+	}
+	for p := range r.rt {
+		c := r.rt[p]
+		if c.up == 0 && c.down == 0 {
+			continue
+		}
+		r.rt[p] = rtCount{}
+		r.post(now, fmt.Sprintf("%s: %d ACTIVE → RIDING_THROUGH, %d back", r.cfg.Providers[p], c.up, c.down))
+	}
 }
 
 // Subscribe returns a channel of encoded snapshots (cap ViewerQueue, drop-on-slow) and a cancel func.
@@ -280,11 +478,12 @@ type snapshot struct {
 	T       int64  `json:"t"`
 	Viewers int    `json:"viewers"`
 	Tiles   struct {
-		DeliveredPS float64 `json:"delivered_ps"`
-		CapacityPS  float64 `json:"capacity_ps"`
-		OfferedPS   float64 `json:"offered_ps"`
-		KMSCallsPS  float64 `json:"kms_calls_ps"`
-		ByState     [4]int  `json:"by_state"`
+		DeliveredPS  float64 `json:"delivered_ps"`
+		CapacityPS   float64 `json:"capacity_ps"`
+		OfferedPS    float64 `json:"offered_ps"`
+		HealthyP99Ms float64 `json:"healthy_p99_ms"`
+		KMSCallsPS   float64 `json:"kms_calls_ps"`
+		ByState      [4]int  `json:"by_state"`
 	} `json:"tiles"`
 	IngestPS struct {
 		Accepted       float64 `json:"accepted"`
@@ -295,20 +494,26 @@ type snapshot struct {
 		KeyRevoked     float64 `json:"key_revoked"`
 		Internal       float64 `json:"internal"`
 	} `json:"ingest_ps"`
+	L4 struct {
+		RejectedWithinSharePS float64 `json:"rejected_within_share_ps"`
+		RejectedOverSharePS   float64 `json:"rejected_over_share_ps"`
+	} `json:"l4"`
+	P99Ms struct {
+		Healthy  float64 `json:"healthy"`
+		Affected float64 `json:"affected"`
+		Baseline float64 `json:"baseline"`
+	} `json:"p99_ms"`
 	KMSPS struct {
 		OK        float64 `json:"ok"`
 		Transient float64 `json:"transient"`
 		Deny      float64 `json:"deny"`
 		EventsPS  float64 `json:"events_ps"`
 	} `json:"kms_ps"`
-	L4 struct {
-		RejectedWithinSharePS float64 `json:"rejected_within_share_ps"`
-		RejectedOverSharePS   float64 `json:"rejected_over_share_ps"`
-	} `json:"l4"`
 	Backlog struct {
 		Total    int `json:"total"`
 		Affected int `json:"affected"`
 	} `json:"backlog"`
+	Inflight map[string]int `json:"inflight"`
 	Scenario struct {
 		Name      string   `json:"name"`
 		Phase     string   `json:"phase"`
@@ -320,15 +525,42 @@ type snapshot struct {
 	Events []event `json:"events"`
 }
 
-// tick builds one snapshot: sources are read before the lock, per-tick atomics are swapped, and the encoded bytes go to the hub.
+func ms(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
+
+// tick builds one snapshot (ARCH › (f)): every source is read before reg.mu (states, backlog totals, the affected
+// backlog sum over the targets, in-flight per provider), per-tick atomics are swapped, the p99 window rolls,
+// recovery is stamped from the locals, buffered transitions are flushed, and the encoded bytes go to the hub.
 func (r *Registry) tick() {
 	tick := r.ticks.Add(1)
 	now := r.cfg.Clock.Now()
 	perSec := float64(time.Second) / float64(r.cfg.Interval)
+	// step 2: sources, with no metrics lock held
+	r.mu.Lock()
+	targets := r.targets
+	r.mu.Unlock()
+	states := r.states // written only by this goroutine
+	r.cfg.Grid.States(states)
+	total := r.cfg.Backlog.Total()
+	affectedSum, allActive := 0, true
+	for _, i := range targets {
+		affectedSum += r.cfg.Backlog.Backlog(i)
+		allActive = allActive && states[i] == 0
+	}
+	inflight := make(map[string]int, len(r.cfg.Providers))
+	for _, p := range r.cfg.Providers {
+		if r.cfg.Inflight != nil {
+			inflight[p] = r.cfg.Inflight.Inflight(p)
+		} else {
+			inflight[p] = 0
+		}
+	}
+	offered := 0.0
+	if r.cfg.Offered != nil {
+		offered = r.cfg.Offered.OfferedPS()
+	}
+	healthy, affected := r.roll()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.cfg.Grid.States(r.states)
-	total := r.cfg.Backlog.Total()
 	var s snapshot
 	s.World, s.Tick, s.T, s.Viewers = r.cfg.WorldID, tick, now.UnixMilli(), r.hub.viewers()
 	var ing [reasonCount]int64
@@ -342,15 +574,18 @@ func (r *Registry) tick() {
 	}
 	s.Tiles.DeliveredPS = float64(del) * perSec
 	s.Tiles.CapacityPS = r.cfg.Capacity
-	if r.cfg.Offered != nil {
-		s.Tiles.OfferedPS = r.cfg.Offered.OfferedPS()
-	}
+	s.Tiles.OfferedPS = offered
 	s.Tiles.KMSCallsPS = float64(k[0]+k[1]+k[2]) * perSec
-	for i, st := range r.states {
+	s.Tiles.HealthyP99Ms = ms(healthy)
+	for i, st := range states {
 		if st < 4 {
 			s.Tiles.ByState[st]++
 		}
-		r.grid[i] = '0' + st
+		c := '0' + st
+		if r.affected[i].Load() {
+			c += 4
+		}
+		r.grid[i] = c
 	}
 	s.IngestPS.Accepted = float64(ing[reasonAccepted]) * perSec
 	s.IngestPS.RateLimited = float64(ing[reasonRateLimited]) * perSec
@@ -363,12 +598,41 @@ func (r *Registry) tick() {
 	s.KMSPS.EventsPS = s.IngestPS.Accepted
 	s.L4.RejectedWithinSharePS = float64(r.rejWithin.Swap(0)) * perSec
 	s.L4.RejectedOverSharePS = float64(r.rejOver.Swap(0)) * perSec
-	s.Scenario.Name, s.Scenario.Phase = r.scen.name, r.scen.phase
-	if r.scen.name != "" && !r.scen.endsAt.IsZero() {
-		ends := r.scen.endsAt.UnixMilli()
-		s.Scenario.EndsAt = &ends
+	// the healthy ring feeds the next baseline
+	r.p99Ring[r.p99Head] = healthy
+	r.p99Head = (r.p99Head + 1) % len(r.p99Ring)
+	if r.p99N < len(r.p99Ring) {
+		r.p99N++
 	}
-	s.Backlog.Total = total
+	s.P99Ms.Healthy, s.P99Ms.Affected, s.P99Ms.Baseline = ms(healthy), ms(affected), ms(r.baseline)
+	// step 5: recovery bookkeeping from the locals
+	if !r.scen.clearedAt.IsZero() {
+		if r.scen.recoveredAt.IsZero() && allActive {
+			r.scen.recoveredAt = now
+		}
+		if r.scen.drainedAt.IsZero() && affectedSum <= r.cfg.DrainSlack {
+			r.scen.drainedAt = now
+		}
+	}
+	s.Scenario.Name, s.Scenario.Phase = r.scen.name, r.scen.phase
+	if r.scen.name != "" {
+		if !r.scen.endsAt.IsZero() {
+			ends := r.scen.endsAt.UnixMilli()
+			s.Scenario.EndsAt = &ends
+		}
+		if !r.scen.recoveredAt.IsZero() {
+			v := r.scen.recoveredAt.Sub(r.scen.clearedAt).Seconds()
+			s.Scenario.RecoveryS = &v
+		}
+		if !r.scen.drainedAt.IsZero() {
+			v := r.scen.drainedAt.Sub(r.scen.clearedAt).Seconds()
+			s.Scenario.DrainS = &v
+		}
+	}
+	s.Backlog.Total, s.Backlog.Affected = total, affectedSum
+	s.Inflight = inflight
+	// step 6: transitions
+	r.flushTransitions(now)
 	s.Grid = string(r.grid)
 	s.Events = r.events(r.cfg.SnapshotEvents)
 	b, err := json.Marshal(&s)

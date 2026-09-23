@@ -1,14 +1,147 @@
 <!doctype html>
+<html lang="en">
+<head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Killswitch</title>
-<h1>Killswitch</h1>
-<p>Placeholder page (M0). Live tick from <code>/v1/stream</code>:</p>
-<p>world <b id="world">-</b> · tick <b id="tick">-</b></p>
-<script>
-  const es = new EventSource('/v1/stream');
-  es.onmessage = e => {
-    const s = JSON.parse(e.data);
-    document.getElementById('tick').textContent = s.tick;
-    document.getElementById('world').textContent = s.world;
-  };
-</script>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/uplot.min.css">
+<style>
+  :root { --bg:#0f1115; --panel:#181b22; --line:#2a2f3a; --fg:#e6e8ee; --dim:#9aa3b2; --green:#2ecc71; --yellow:#f1c40f; --orange:#e67e22; --purple:#9b59b6; --red:#e74c3c; --grey:#4a5160; --blue:#3498db; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { padding:16px 20px 10px; border-bottom:1px solid var(--line); }
+  header h1 { margin:0 0 6px; font-size:20px; }
+  header p { margin:4px 0; max-width:1100px; color:var(--dim); }
+  header .notice { color:var(--fg); }
+  #banner { display:inline-block; margin-left:12px; padding:2px 8px; border-radius:4px; background:var(--grey); font-size:12px; }
+  #reset { float:right; }
+  button { background:#262b36; color:var(--fg); border:1px solid var(--line); border-radius:4px; padding:5px 10px; cursor:pointer; font-size:13px; }
+  button:hover:not(:disabled) { background:#313847; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  main { display:grid; grid-template-columns:320px 862px 1fr; gap:14px; padding:14px 20px; align-items:start; }
+  #cards { display:flex; flex-direction:column; gap:10px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:10px 12px; }
+  .card h3 { margin:0 0 4px; font-size:14px; }
+  .card p { margin:0 0 8px; color:var(--dim); font-size:12.5px; }
+  .card .row { display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
+  .card .status { margin-top:6px; font-size:12.5px; min-height:18px; color:var(--fg); }
+  .card.running { border-color:var(--blue); }
+  #center { display:flex; flex-direction:column; gap:10px; }
+  #gridwrap { position:relative; background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:10px 10px 10px 52px; }
+  #grid { display:block; background:#0b0d11; cursor:crosshair; }
+  #bands { position:absolute; left:8px; top:10px; width:40px; height:500px; pointer-events:none; }
+  #bands div { position:absolute; left:0; color:var(--dim); font-size:12px; }
+  #legend { display:flex; gap:14px; font-size:12px; color:var(--dim); margin-top:6px; }
+  #legend i { display:inline-block; width:10px; height:10px; margin-right:4px; vertical-align:-1px; border-radius:2px; }
+  #tip { position:absolute; display:none; background:#000c; border:1px solid var(--line); border-radius:4px; padding:6px 8px; font-size:12px; pointer-events:none; white-space:nowrap; z-index:5; }
+  #pin { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:8px 12px; font-size:12.5px; display:none; }
+  #pin ol { margin:6px 0 0; padding-left:18px; color:var(--dim); font-family:ui-monospace, Menlo, monospace; font-size:11.5px; }
+  #tiles { display:grid; grid-template-columns:repeat(4, 1fr); gap:10px; }
+  .tile { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:8px 12px; }
+  .tile .k { color:var(--dim); font-size:12px; }
+  .tile .v { font-size:22px; font-weight:600; }
+  .tile .sub { color:var(--dim); font-size:12px; }
+  #charts { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .chart { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:6px 8px 2px; }
+  .chart .t { font-size:12px; color:var(--dim); margin:0 0 2px 4px; }
+  .uplot { color:var(--fg); }
+  .u-legend { font-size:11px; }
+  #right { display:flex; flex-direction:column; gap:10px; min-width:280px; }
+  #panel { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:8px 12px; }
+  #panel h3, #tl h3 { margin:0 0 6px; font-size:14px; }
+  .light { display:flex; align-items:center; gap:8px; padding:3px 0; font-size:12.5px; }
+  .light i { width:12px; height:12px; border-radius:50%; background:var(--grey); flex:none; }
+  .light.ok i { background:var(--green); } .light.bad i { background:var(--red); }
+  .light b { flex:none; }
+  .light span { color:var(--dim); flex:1; min-width:0; }
+  [data-tip] { cursor:help; border-bottom:1px dotted var(--dim); }
+  #help { position:fixed; display:none; max-width:380px; background:#000e; border:1px solid var(--line); border-radius:4px; padding:8px 10px; font-size:12.5px; line-height:1.4; color:var(--fg); pointer-events:none; z-index:9; }
+  #tl { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:8px 12px; }
+  #timeline { margin:0; padding-left:0; list-style:none; font-family:ui-monospace, Menlo, monospace; font-size:11.5px; max-height:640px; overflow:auto; }
+  #timeline li { padding:2px 0; border-bottom:1px solid #1f232c; color:var(--dim); }
+  #timeline li.mark { color:var(--fg); }
+  #toast { position:fixed; bottom:16px; left:50%; transform:translateX(-50%); background:var(--red); color:#fff; padding:6px 12px; border-radius:4px; display:none; z-index:9; }
+</style>
+</head>
+<body>
+<header>
+  <button id="reset" disabled title="M5">Reset world</button>
+  <h1>Killswitch <span id="banner">connecting…</span></h1>
+  <p>Customer-managed encryption keys (CMEK) let each tenant own the key that protects its data: revoke the key and the provider can no longer read it. This is a multi-tenant webhook queue where every message is sealed under a per-tenant data key that is itself wrapped by that tenant's KMS key, leased for at most 30 s.</p>
+  <p>The thesis: one tenant's KMS trouble, revocation or traffic surge changes nothing for the other 999, and no plaintext is ever decrypted after a key is revoked. Below, 1,000 tenants across three simulated KMS providers run at about 300 events/s; each card injects a fault or a surge and says what to watch.</p>
+  <p class="notice">This is one shared live system: anyone viewing this page sees the same World, and a scenario started here runs for everyone. Traffic runs only while someone is watching.</p>
+</header>
+<main>
+  <section id="cards">
+    <div class="card" data-scenario="provider_blip provider_outage">
+      <h3>Provider outage</h3>
+      <p>gcp fast-fails. <b>Blip (10 s):</b> up to a third of the grid turns yellow as renewals fail, a few cold cells go orange with one 503, then everything is green within ~12 s of the clear; no chart moves. <b>Outage (60 s):</b> yellow spreads over 0–15 s with no customer impact; from ~9 s leases lapse at staggered times, cells turn orange and those tenants get <code>503 key_unavailable</code>. aws and azure stay flat. Calls to gcp decay through backoff. On restore, green within ~10 s and the parked messages deliver.</p>
+      <div class="row"><button data-start="provider_blip">Start blip</button><button data-start="provider_outage">Start outage</button><button data-stop>Stop</button></div>
+      <div class="status"></div>
+    </div>
+    <div class="card" data-scenario="key_revocation">
+      <h3>Key revocation</h3>
+      <p>The KMS key of one high-traffic tenant (rank 3) is disabled. Its cell turns purple, typically within 15 s and always within 30 s; ingest for it returns <code>403 key_revoked</code>; the timeline shows REVOKED and the data keys purged; nothing of its is decrypted after that. Click <b>Restore</b>: the re-probe sees it within 5 s and the parked messages deliver.</p>
+      <div class="row"><button data-start="key_revocation">Start</button><button data-stop>Stop</button><button id="restore" disabled>Restore</button></div>
+      <div class="status"></div>
+    </div>
+    <div class="card" data-scenario="slow_kms">
+      <h3>Slow KMS</h3>
+      <p>azure latency rises to p50 400 ms / p99 3 s against a 500 ms timeout, for 60 s. Azure cells flicker yellow; cold azure tenants see slow ingest and a few 503s. The healthy-tenant p99 line stays flat. Calls in flight to azure rise while aws and gcp fetches run freely.</p>
+      <div class="row"><button data-start="slow_kms">Start</button><button data-stop>Stop</button></div>
+      <div class="status"></div>
+    </div>
+    <div class="card" data-scenario="tenant_surge">
+      <h3>Tenant surge</h3>
+      <p>One top-20 tenant (rank 5) sends 100× its rate for 60 s. Its cell stays green, marked with a ring. After the 200-event burst it gets <code>429 rate_limited</code> above 100 events/s; those 429s show as <i>within share</i> by design. Its KMS calls stay flat: renewals at most 1 per 15 s, plus one data-key rotation per 10,000 accepted messages. Other tenants' p99 does not move.</p>
+      <div class="row"><button data-start="tenant_surge">Start</button><button data-stop>Stop</button></div>
+      <div class="status"></div>
+    </div>
+    <div class="card" data-scenario="global_surge">
+      <h3>Global surge</h3>
+      <p>Every tenant sends 5× for 90 s: about 1,500 events/s against a delivery capacity near 640. Delivered holds at capacity instead of collapsing. The heaviest tenants are held to their fair share with 429s and, near 75 s, the heaviest ~40 are shed with <code>503 overloaded</code> while the other ~960 notice nothing. Backlog levels off under its caps and drains in about a minute. KMS calls stay under ~67/s.</p>
+      <div class="row"><button data-start="global_surge">Start</button><button data-stop>Stop</button></div>
+      <div class="status"></div>
+    </div>
+  </section>
+  <section id="center">
+    <div id="gridwrap">
+      <canvas id="grid" width="800" height="500"></canvas>
+      <div id="bands"></div>
+      <div id="tip"></div>
+      <div id="legend"><span data-tip="ACTIVE: the tenant's key lease is valid and its data key is cached; events are sealed and delivered normally."><i style="background:var(--green)"></i>ACTIVE</span><span data-tip="RIDING_THROUGH: a lease renewal failed (timeout or 5xx from the KMS) but the 30 s lease is still valid, so the tenant keeps sealing and delivering on the cached key while probes retry with backoff. No customer impact."><i style="background:var(--yellow)"></i>RIDING_THROUGH</span><span data-tip="KEY_UNAVAILABLE: the lease expired with no successful renewal, so the cached keys were purged; ingest answers 503 key_unavailable with Retry-After and delivery is parked until a probe succeeds. Nothing is lost."><i style="background:var(--orange)"></i>KEY_UNAVAILABLE</span><span data-tip="REVOKED: the KMS answered an authoritative deny (key disabled or access denied); keys were purged at once, ingest answers 403 key_revoked and nothing of this tenant's is decrypted until the key is restored."><i style="background:var(--purple)"></i>REVOKED</span><span data-tip="A white ring marks the tenants the running scenario targets: one tenant for a revocation or a tenant surge, a provider's third of the grid for a blip, an outage or slow KMS, everyone for the global surge."><i style="border:2px solid #fff;background:none"></i>scenario target</span><span>hover: tenant · click: pin</span></div>
+    </div>
+    <div id="pin"></div>
+    <div id="tiles">
+      <div class="tile"><div class="k">delivered / capacity (events/s)</div><div class="v" id="t-delivered">—</div><div class="sub" id="l4-split">rejected: within share — · over share —</div><div class="sub" id="t-offered">offered —</div></div>
+      <div class="tile"><div class="k">healthy-tenant p99 (ms)</div><div class="v" id="t-p99">—</div><div class="sub" id="t-baseline">baseline —</div></div>
+      <div class="tile"><div class="k">KMS calls/s</div><div class="v" id="t-kms">—</div><div class="sub" id="inflight">in flight: aws — · gcp — · azure —</div></div>
+      <div class="tile"><div class="k">tenants by state</div><div class="v" id="t-states">—</div><div class="sub" id="t-backlog">backlog —</div></div>
+    </div>
+    <div id="charts">
+      <div class="chart"><div class="t">1. ingest outcomes per second</div><div id="c-ingest"></div></div>
+      <div class="chart"><div class="t">2. end-to-end p99 (ms): healthy vs affected</div><div id="c-p99"></div></div>
+      <div class="chart"><div class="t">3. KMS calls per second by class, against events/s</div><div id="c-kms"></div></div>
+      <div class="chart"><div class="t">4. backlog: total and affected set</div><div id="c-backlog"></div></div>
+    </div>
+  </section>
+  <section id="right">
+    <div id="panel">
+      <h3>Invariants</h3>
+      <div class="light" data-k="S1"><i></i><b data-tip="S1 No plaintext at rest. A payload that can't be encrypted under its tenant's key is rejected: there is no fallback key and no plaintext write. Live check: every payload carries a canary string and the checker scans the stored rows for it; the count must be 0.">No plaintext at rest</b><span>pending</span></div>
+      <div class="light" data-k="S2"><i></i><b data-tip="S2 Tenant key isolation. A payload is only ever encrypted under a DEK wrapped by its own tenant's KEK. Live check: the AAD binds tenant, message and DEK ids, and the sink verifies that the payload's tenant equals the envelope's tenant.">Tenant key isolation</b><span>pending</span></div>
+      <div class="light" data-k="S3"><i></i><b data-tip="S3 Bounded revocation. After a key is revoked at time t, none of that tenant's payloads is decrypted after t + lease (30 s here); an authoritative deny purges the keys at once. Live check: the checker counts decrypts later than the ground-truth t + lease; the count must be 0, and the detection latency is displayed.">Bounded revocation</b><span>pending</span></div>
+      <div class="light" data-k="S4"><i></i><b data-tip="S4 No loss from key unavailability. A transient key failure never drops a message, dead-letters it or burns its retry budget. Live check: conservation per tenant, accepted = delivered + queued + expired + dead.">No loss from key unavailability</b><span>pending</span></div>
+      <div class="light" data-k="L1"><i></i><b data-tip="L1 Blast radius. During a fault or surge on some tenants, unaffected tenants keep their p99 end-to-end latency within 1.25x of baseline and a rejection rate of 0. Live check: the healthy-versus-affected p99 chart and this light.">Blast radius</b><span>pending</span></div>
+      <div class="light" data-k="L4"><i></i><b data-tip="L4 Overload. When offered load exceeds delivery capacity, delivered throughput holds at capacity and the backlog stays bounded; the excess is rejected at ingest, heaviest tenants first, and tenants within their fair share see no rejections. Live check: the delivered-against-capacity tile, the backlog chart and the rejections split by tenants within and over their share.">Overload</b><span>pending</span></div>
+    </div>
+    <div id="tl"><h3>Timeline</h3><ol id="timeline"></ol></div>
+  </section>
+</main>
+<div id="toast"></div>
+<div id="help"></div>
+<script src="/uplot.min.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

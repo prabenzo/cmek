@@ -15,6 +15,8 @@ The milestone plans (M0.md–M6.md) are written against this reference and amend
 | World | `Deps{ID, Clock, Logger}` (the Holder passes `w-<seq>`); `Params.DBPath` becomes the directory `DBDir` (file `<DBDir>/killswitch-<pid>-<ID>.db`); `Params.SyncMode`, `WALAutocheckpoint` (env `KS_SYNC`, `KS_WAL_AUTOCHECKPOINT`); `NewHolder(p Params, d Deps)`; `World.IngestID` returns the message id for the 202 body; `Holder.Current()` returns `(w, release)` | M1, M5 |
 | cmek | `Config.Nonce` deleted: `Seal` reads `crypto/rand.Reader` directly | M1 |
 | Ownership | From M2 on (Ben, chat 2026-09-22) Claude writes every file and every test; the per-package "B" marks below and in the milestone plans read "Claude writes, Ben reviews" with the review scope of ARCH-NOTES 9 unchanged | M2–M6 |
+| Tink as built | tink-go v2.8.0 does every byte of cryptography ([TINK.md](TINK.md), branch `claude/tink-go`, PR #8 plan approved 2026-09-23): `kms.KMS` is `KEK(kekID) (tink.AEADWithContext, error)`, one remote AEAD per KEK, and `DataKey`/`GenerateDataKey`/`Unwrap` are gone; the fake keeps its gate (fault → fast-fail / error rate / latency raced with ctx → enabled read after the latency) in front of a per-KEK Tink AES-256-GCM primitive and answers a blob that does not verify with `AccessDenied`; the fetcher wraps a fresh `AES256GCMNoPrefixKeyTemplate` keyset with `keyset.WriteWithContext` (the `generate` call) and unwraps with `keyset.ReadWithContext` (the `unwrap` call), AAD = KEK id; a cached DEK is the `tink.AEAD` (`dek.prim`, nil while cold) and `Handle{DEKID, ValidUntil, prim}`; `Handle.Zero` drops the reference (Tink offers no zeroization: plaintext DEKs are dropped on purge and collected, never wiped); `Envelope{DEKID, Ciphertext}` with the IV embedded (12 + n + 16 bytes) and no `nonce` column; the keyset helpers flatten the adapter's error with `%v`, so `Classify` falls back to `kms.CodeFromText` (the one sanctioned string match; `TestCodeThroughTink` runs real Tink against the gate so a changed shape fails the unit tests); `internal/cmek` imports `tink-go/v2/{aead,keyset,tink}` and never `insecurecleartextkeyset`; the CI import regex allows `tink-go/v2`, `google.golang.org/protobuf` and `golang.org/x/crypto` | TINK |
+| M4 as built | `hist.p99` interpolates at the sample's mid position, `lo + (hi−lo)·(rank − cumBefore − ½)/inBucket`, so the value stays inside `[lo, hi)`; buffered state transitions (all but REVOKED) flush once per second together with the ACTIVE↔RIDING_THROUGH churn, not per tick; `StartScenario` sets targets, enters the first phase, publishes the card and the marker before returning; the tail publishes phase `recovery` with `ScenarioTailMin` as its countdown and posts `<scope> restored: N tenants ACTIVE in x s, backlog drained in y s` (or a `not drained` / `not restored` variant at `ScenarioTailMax`); `Recovered` is stamped by the tick from step-2 locals against `DrainSlack = Workers × ClaimBatch`; the snapshot carries `inflight{}` as a map by provider; `TenantDetail.Audit` is the last 10 ring entries newest first; the page ships all four charts and hover/pin (no cut); a restore of a non-target tenant never ends the revocation run; the invariant lights show the spec's short names ("No plaintext at rest", "Blast radius", …) with the full statement and live check on hover, and the legend swatches carry a description of each state on hover, shown at once in the page's own `#help` box on mouseenter (`data-tip`, not the native `title` tooltip); the embedded files are served with `Cache-Control: no-cache` because they carry no validators and a browser otherwise keeps the previous build's page (Ben's browser notes, PR #10). PR #10 review: `Fake.Revoke`/`Restore` are idempotent (a flip to the current state records no `KeyEvent`, so a Restore that ends the revocation run plus the run's exit Restore leave one enable event for the checker); the tail re-publishes the recovery phase with a null `ends_at` once `ScenarioTailMin` has passed and the page then says "waiting for drain"; every line a transition flush posts carries the flush instant (`TestTransitionLines` pins the aggregation rule); `TenantDetail.Audit` is `[]AuditEntry` (`at`, `op`, `outcome`, `detail`, `latency_ms`, `purged`), the pinned strip is built with `createElement`/`textContent`, and the `event: reconnect` listener is gone until M5 adds the server side (`StreamMaxAge`) | M4 |
 | M3 as built | `Store.Expire` counts per tenant then deletes (as `Reclaim`), compiled in M3, wired in M5; `traffic.Sink.Deliver` counts a mismatch only when a payload's canary names another tenant, a payload with no canary (a manual curl) is delivered, so S2 remains evidence of cross-tenant delivery; the two-class `Next` scans the preferred class then the other with `Gate.Hot` last; `Admit` returns the share class of its one backlog read; the cut trigger passed at ×10 (cap at t+17 s, no within-share overloaded) | M3 |
 | M2 as built | `cmek` imports `internal/logx` (throttled error log) and the CI regex allows it; `Info` fills every `TenantInfo` field in M2 (the M4 deferral was not needed); `scheduler.go`/`workers.go` needed no M2 change (M1 already carried the `Gate.Hot` call and the three `DecryptKey` branches); a deny zeroes only `lease.SentAt` (the TTLs are configuration; the walk's row 11 caught the zero-value bug); cmek is 730 code lines (887 with comments), over the ≤ 600 bound, `envelope.go` left in place pending Ben's review | M2 |
 | M1 review (PR #5) | `ViewerWatcher` runs under `hub.mu` (ordering); every ledger-coupled store statement runs under the store's own context, never the request's; `Reclaim` counts per tenant then updates (no `RETURNING`); `Claim` treats `rows.Err()` like a scan error; a `PutDEK` failure reaches Ingest unclassified (500 `internal`, no audit); a `Claim` error or empty batch waits like the idle branch; `main` awaits `World.Stop`, run alongside `Shutdown` | M1 |
@@ -57,7 +59,7 @@ flowchart TD
 | check → queue, kms | value types only (`queue.Census`, `kms.KeyEvent`); interfaces declared in `check` | types |
 | metrics, admit, traffic, kms | leaves: stdlib + x/ only | — |
 
-`internal/cmek` imports exactly: `context`, `crypto/aes`, `crypto/cipher`, `crypto/rand`, `encoding/binary`, `errors`, `fmt`, `io`, `sync`, `sync/atomic`, `time`, `golang.org/x/sync/singleflight`, `github.com/prabenzo/cmek/internal/kms`, and (as built in M1/M2, the M1 review's "log every error") `log/slog`, `strconv` and `github.com/prabenzo/cmek/internal/logx`. Enforced in CI by `go list -deps ./internal/cmek | grep -vE '^(golang.org/x/sync|github.com/prabenzo/cmek/internal/(cmek|kms|logx)$|[a-z0-9./]+$)'` producing no output (no `TestImports` in the package) `[BB-04]`. `queue` does not import `traffic`; `metrics` does not import `cmek` (world bridges the audit type in 15 lines). From M1 on, `world.keys` is `*cmek.Manager`; there is no key stub outside `internal/cmek` `[BB-03]`.
+`internal/cmek` imports exactly: `bytes`, `context`, `encoding/binary`, `errors`, `fmt`, `sync`, `sync/atomic`, `time`, `golang.org/x/sync/singleflight`, `github.com/tink-crypto/tink-go/v2/aead`, `.../keyset`, `.../tink`, `github.com/prabenzo/cmek/internal/kms`, and (as built in M1/M2, the M1 review's "log every error") `log/slog`, `strconv` and `github.com/prabenzo/cmek/internal/logx` (Tink as built: no `crypto/*` and never `insecurecleartextkeyset`). Enforced in CI by `go list -deps ./internal/cmek | grep -vE '^(golang.org/x/(sync|crypto)|google.golang.org/protobuf|github.com/tink-crypto/tink-go/v2|github.com/prabenzo/cmek/internal/(cmek|kms|logx)$|[a-z0-9./]+$)'` producing no output (no `TestImports` in the package) `[BB-04]`. `queue` does not import `traffic`; `metrics` does not import `cmek` (world bridges the audit type in 15 lines). From M1 on, `world.keys` is `*cmek.Manager`; there is no key stub outside `internal/cmek` `[BB-03]`.
 
 Consumer-declared interfaces (≤ 3 methods each): `cmek.DEKStore`, `cmek.Auditor`, `cmek.Clock`, `cmek.Jitter`; `queue.Gate`, `queue.Keys`, `queue.Sink`, `queue.Recorder`, `queue.Share`, `queue.Clock`; `admit.Backlog`, `admit.Clock`; `traffic.Ingester`, `traffic.Clock`; `check.Rows`, `check.Deliveries`, `check.Truth`, `check.Health`, `check.Reporter`; `metrics.GridSource`, `metrics.BacklogSource`, `metrics.ViewerWatcher`.
 
@@ -298,8 +300,8 @@ func (h *Holder) Reset() *World
 | Key state | `cmek.State` uint8: `Active=0, RidingThrough=1, KeyUnavailable=2, Revoked=3` | cmek |
 | Class | `cmek.Class`: `OK, Transient, Deny, Poison` | cmek |
 | KMS error | `kms.Error{Code, Provider, Msg}`; codes `Timeout, Unavailable, AccessDenied, KeyDisabled` (no Throttled: X3) | kms |
-| Envelope | `cmek.Envelope{DEKID string; Nonce [12]byte; Ciphertext []byte}`; AAD = `tenant \| msgID (8 BE) \| dekID` | cmek |
-| Handle | `cmek.Handle{DEKID string; ValidUntil time.Time; key [32]byte}`: a copy of one plaintext DEK; the only way key bytes leave the Manager | cmek |
+| Envelope | `cmek.Envelope{DEKID string; Ciphertext []byte}` (Tink as built: the IV is embedded, no nonce field); AAD = `tenant \| msgID (8 BE) \| dekID` | cmek |
+| Handle | `cmek.Handle{DEKID string; ValidUntil time.Time; prim tink.AEAD}`: one usable DEK primitive (shared with the cache, immutable); the only way a key leaves the Manager | cmek |
 | Audit entry | `cmek.Audit{At, Tenant, Op ("unwrap","generate","purge","state"), KEKVersion, Outcome, Class, From, To State, Latency, Detail}` | cmek |
 | Canary | `"PLAINTEXT-CANARY-<tenant>"` inside the ~1 KB JSON payload | traffic |
 | Grid char | `'0' + state + (affected ? 4 : 0)` → `'0'..'7'`, one char per tenant in grid order | metrics |
@@ -341,7 +343,7 @@ cmd handler / traffic loop
       2. err := w.admit.Admit(idx)                          (O(1) atomics; ErrOverloaded / ErrRateLimited / ErrBacklogFull)
       3. h, err := w.keys.EncryptKey(ctx, tenant)           (hot: µs; cold: ≤ KMSTimeout; see below)
       4. id := w.store.NextID()                             (atomic add; no lock)                              [BB-12]
-         env, err := cmek.Seal(h, w.clock.Now(), tenant, id, payload)   // AES-GCM ≈ 2 µs, outside every lock; Now() read at the seal instant [SC-F9]
+         env, err := cmek.Seal(h, w.clock.Now(), tenant, id, payload)   // Tink AES-GCM ≈ 2 µs, outside every lock; Now() read at the seal instant [SC-F9]
          h.Zero()
       5. err = w.store.Insert(ctx, idx, id, env)            (INSERT + ledger under store.mu)
       6. w.metrics.Ingest(idx, reason, w.admit.WithinShare(idx)); return err
@@ -376,7 +378,7 @@ worker goroutine (×8), queue.Workers.run
         err != nil (ErrLeaseExpired, ErrKeyRevoked):
           store.Release(ctx, idx, ids(batch.Msgs[i:])); break    // rows back to ready, attempts untouched
       }
-      pt, err := cmek.Open(h, clock.Now(), batch.Tenant, m.ID, cmek.Envelope{m.DEKID, m.Nonce, m.Ciphertext}); h.Zero()
+      pt, err := cmek.Open(h, clock.Now(), batch.Tenant, m.ID, cmek.Envelope{m.DEKID, m.Ciphertext}); h.Zero()
       errors.Is(err, cmek.ErrPoison) → store.Dead(ctx, idx, m.ID); continue
       deliveredAt, err = d.sink.Deliver(ctx, batch.Tenant, idx, m.ID, pt)   // stamps deliveredAt on entry, then 5–20 ms
       err != nil (canary tenant mismatch, S2 witness) → store.Dead(ctx, idx, m.ID); continue
@@ -463,9 +465,9 @@ POST /v1/traffic {"tenant":"t-0042"|"", "multiplier":5}
   → world.Surge(tenant, mult) → gen.SetMultiplier(idx, x) / SetGlobal(x)
 ```
 
-Revoke ordering `[SC-F6]`: `func (f *Fake) Revoke(kek string) { f.mu.Lock(); f.enabled[kek] = false; f.truth.append(KeyEvent{At: f.clock.Now(), Enabled: false, ...}); f.mu.Unlock() }`: the ground-truth timestamp is read **inside** the critical section, after the flip. `Unwrap`/`GenerateDataKey` read `enabled` under `f.mu.RLock` **after** the latency sleep, so every OK the fake ever returned was checked strictly before the recorded `tRevoke`, and every call checked after it is a Deny; with the settable test clock this is what the S3 tests assert on.
+Revoke ordering `[SC-F6]`: `func (f *Fake) Revoke(kek string) { f.mu.Lock(); f.enabled[kek] = false; f.truth.append(KeyEvent{At: f.clock.Now(), Enabled: false, ...}); f.mu.Unlock() }`: the ground-truth timestamp is read **inside** the critical section, after the flip. The gate's `DecryptWithContext`/`EncryptWithContext` (Tink as built; `Unwrap`/`GenerateDataKey` before) read `enabled` under `f.mu.RLock` **after** the latency sleep, so every OK the fake ever returned was checked strictly before the recorded `tRevoke`, and every call checked after it is a Deny; with the settable test clock this is what the S3 tests assert on.
 
-Fake call order (`GenerateDataKey`/`Unwrap`): resolve fault under `fake.mu` (tenant fault overrides provider fault field-by-field where set) → truth log call start → `FastFail || rand < ErrorRate` → `kms.Error{Unavailable}` at once → else sleep lognormal: `μ = ln(P50)`, `σ = (ln(P99) − ln(P50)) / 2.326`, `d = exp(μ + σ·Z)` with Z from the locked rand, via `select { <-clock.After(d); <-ctx.Done() → return ctx.Err() }` → key enabled? checked **after** the latency under `RLock` → `kms.Error{KeyDisabled}` → real AES-256-GCM wrap/unwrap under the tenant KEK (32 bytes from crypto/rand at `NewFake`) → truth log outcome.
+Fake call order (the KEK gate's `EncryptWithContext`/`DecryptWithContext`, Tink as built): resolve fault under `fake.mu` (tenant fault overrides provider fault field-by-field where set) → `FastFail || rand < ErrorRate` → `kms.Error{Unavailable}` at once → else sleep lognormal: `μ = ln(P50)`, `σ = (ln(P99) − ln(P50)) / 2.326`, `d = exp(μ + σ·Z)` with Z from the locked rand, via `select { <-clock.After(d); <-ctx.Done() → return ctx.Err() }` → key enabled? checked **after** the latency under `RLock` → `kms.Error{KeyDisabled}` → real AES-256-GCM wrap/unwrap of the DEK keyset under the tenant KEK (a Tink keyset made at `NewFake`, AAD = KEK id; a blob that does not verify answers `AccessDenied`). The truth log records key events only (`Revoke`/`Restore`), never calls [BB-11].
 
 ### (e) Checker reads
 
@@ -528,8 +530,7 @@ CREATE TABLE messages (
   id            INTEGER PRIMARY KEY,    -- Store.NextID(): atomic, monotone
   tenant_id     TEXT    NOT NULL,
   dek_id        TEXT    NOT NULL,
-  nonce         BLOB    NOT NULL,       -- 12 bytes
-  ciphertext    BLOB    NOT NULL,       -- AES-256-GCM output incl. tag; never plaintext
+  ciphertext    BLOB    NOT NULL,       -- Tink AES-256-GCM output: IV || ciphertext || tag; never plaintext (no nonce column: Tink as built)
   state         TEXT    NOT NULL CHECK (state IN ('ready','claimed','dead')),
   attempts      INTEGER NOT NULL DEFAULT 0,   -- incremented by Dead only in P0 (sink never fails); kept for the S4 story
   enqueued_at   INTEGER NOT NULL,
@@ -541,9 +542,9 @@ CREATE INDEX messages_claimed_until   ON messages (claimed_until) WHERE state = 
 
 | Method | Statement | Ledger update (same `store.mu` section; every delta uses the drained row count or rowsAffected) |
 | --- | --- | --- |
-| `Insert` | `INSERT INTO messages (id, tenant_id, dek_id, nonce, ciphertext, state, attempts, enqueued_at) VALUES (?1,?2,?3,?4,?5,'ready',0,?6)` — plain write, id and envelope supplied by the caller `[BB-12]` | `accepted[i]++ ready[i]++ total++`; `backlogged++` if backlog was 0; non-blocking send on `wake`; `insertN++, insertSumNs += d, insertMaxNs = max` (M1 instrument `[BB-02]`) |
+| `Insert` | `INSERT INTO messages (id, tenant_id, dek_id, ciphertext, state, attempts, enqueued_at) VALUES (?1,?2,?3,?4,'ready',0,?5)` — plain write, id and envelope supplied by the caller `[BB-12]` | `accepted[i]++ ready[i]++ total++`; `backlogged++` if backlog was 0; non-blocking send on `wake`; `insertN++, insertSumNs += d, insertMaxNs = max` (M1 instrument `[BB-02]`) |
 | `PutDEK` | `INSERT INTO deks (id, tenant_id, kek_id, kek_version, wrapped_dek, created_at) VALUES (?1,?2,?3,?4,?5,?6)` | — |
-| `Claim` | `UPDATE messages SET state='claimed', claimed_until=?1 WHERE id IN (SELECT id FROM messages WHERE tenant_id=?2 AND state='ready' ORDER BY id LIMIT ?3) RETURNING id, dek_id, nonce, ciphertext, attempts, enqueued_at` | the cursor is drained to completion with a plain loop that ignores ctx (SQLite applies every change on the first step); `ready[i] -= n; claimed[i] += n` with n = rows drained; on a scan error `SELECT changes()` on the pinned conn in the same section supplies n `[SC-F10]` |
+| `Claim` | `UPDATE messages SET state='claimed', claimed_until=?1 WHERE id IN (SELECT id FROM messages WHERE tenant_id=?2 AND state='ready' ORDER BY id LIMIT ?3) RETURNING id, dek_id, ciphertext, attempts, enqueued_at` | the cursor is drained to completion with a plain loop that ignores ctx (SQLite applies every change on the first step); `ready[i] -= n; claimed[i] += n` with n = rows drained; on a scan error `SELECT changes()` on the pinned conn in the same section supplies n `[SC-F10]` |
 | `Ack` | `DELETE FROM messages WHERE state='claimed' AND id IN (SELECT value FROM json_each(?1))` | `delivered[i] += ra; claimed[i] -= ra; total -= ra`; `backlogged--` if backlog hits 0 |
 | `Release` | `UPDATE messages SET state='ready', claimed_until=NULL WHERE state='claimed' AND id IN (SELECT value FROM json_each(?1))` | `claimed[i] -= ra; ready[i] += ra`; wake |
 | `Dead` (poison / S2 mismatch / unknown dek_id) | `UPDATE messages SET state='dead', claimed_until=NULL, attempts=attempts+1 WHERE id=?1 AND state='claimed'` | `claimed[i] -= ra; dead[i] += ra` |
@@ -589,10 +590,10 @@ func (s State) String() string
 type Class uint8
 const ( OK Class = iota; Transient; Deny; Poison )
 
-// Envelope is one message's ciphertext plus what is needed to open it; AAD is derived, never stored.
-type Envelope struct { DEKID string; Nonce [12]byte; Ciphertext []byte }
-// Handle is a copy of one plaintext DEK, usable until ValidUntil; Zero wipes it.
-type Handle struct { DEKID string; ValidUntil time.Time; key [32]byte }
+// Envelope is one message's ciphertext (Tink AES-256-GCM, IV embedded) plus what is needed to open it; AAD is derived, never stored.
+type Envelope struct { DEKID string; Ciphertext []byte }
+// Handle is one usable DEK primitive until ValidUntil; Zero drops the reference (Tink does not zeroize).
+type Handle struct { DEKID string; ValidUntil time.Time; prim tink.AEAD }
 func (h *Handle) Zero()
 // WrappedDEK is what DEKStore persists: wrapped bytes only.
 type WrappedDEK struct { ID, Tenant, KEKID string; KEKVersion int; Wrapped []byte; CreatedAt time.Time }
@@ -620,7 +621,7 @@ type DEKStore interface { PutDEK(ctx context.Context, d WrappedDEK) error }
 type Auditor interface { Audit(e Audit) }
 // Clock is the only time source the core reads.
 type Clock interface { Now() time.Time }
-// Jitter is the only randomness the core reads (backoff); nonces come from Config.Nonce.
+// Jitter is the only randomness the core reads (backoff); Tink draws the DEKs and the IVs from crypto/rand.
 type Jitter interface { Float64() float64 }
 
 // Config carries the lease parameters and injected dependencies; zero Nonce means crypto/rand, zero Spawn means go f().
@@ -634,11 +635,11 @@ type Config struct {
 	DEKMaxMessages, ProviderInflight, TenantInflight, IngestWaiters int
 }
 
-// Seal encrypts plaintext with AES-256-GCM, a fresh 96-bit nonce and AAD = tenant|msgID|dekID; refuses a handle with now ≥ ValidUntil.
+// Seal encrypts plaintext under the handle's DEK (Tink AES-256-GCM, the IV drawn inside) with AAD = tenant|msgID|dekID; refuses a handle with now ≥ ValidUntil or one already zeroed.
 func Seal(h Handle, now time.Time, tenant string, msgID int64, plaintext []byte) (Envelope, error)
-// Open reverses Seal; a stale handle returns ErrLeaseExpired, any tag or AAD mismatch ErrPoison.
+// Open reverses Seal; a stale handle returns ErrLeaseExpired, a DEK id mismatch or any decrypt failure ErrPoison.
 func Open(h Handle, now time.Time, tenant string, msgID int64, env Envelope) ([]byte, error)
-// Classify maps a call result to its class: nil → OK; ErrPoison → Poison; context deadline/cancel and kms Timeout/Unavailable → Transient; AccessDenied/KeyDisabled → Deny; unknown → Transient.
+// Classify maps a call result to its class: nil → OK; ErrPoison → Poison; context deadline/cancel and kms Timeout/Unavailable → Transient; AccessDenied/KeyDisabled → Deny; unknown → Transient. The code comes from the typed kms.Error or, when Tink's helpers flattened it, from kms.CodeFromText.
 func Classify(err error) Class
 
 // Manager is the CMEK core: one lease, DEK cache and key state machine per tenant, one fetcher, one mutex.
@@ -710,11 +711,13 @@ func (t *Truth) KeyEvents() []KeyEvent
 type Clock interface { Now() time.Time; After(d time.Duration) <-chan time.Time }
 // FakeConfig sizes the fake.
 type FakeConfig struct { Providers []string; KEKs []KEKSpec; Clock Clock; Rand *rand.Rand; Lock *sync.Mutex }
-// Fake is three in-process providers doing real AES-256-GCM wrapping under per-KEK keys.
+// Fake is three in-process providers doing real AES-256-GCM wrapping (Tink) under per-KEK keys.
 type Fake struct { /* unexported */ }
 func NewFake(cfg FakeConfig) *Fake
-func (f *Fake) GenerateDataKey(ctx context.Context, kekID string) (DataKey, error)
-func (f *Fake) Unwrap(ctx context.Context, kekID string, kekVersion int, wrapped []byte) ([32]byte, error)
+// KEK returns the remote AEAD for one KEK (the gate); unknown id → *Error{AccessDenied}. Tink as built; GenerateDataKey/Unwrap before.
+func (f *Fake) KEK(kekID string) (tink.AEADWithContext, error)
+// CodeFromText recovers the Code of an *Error flattened to text (Tink's keyset helpers format the cause with %v).
+func CodeFromText(err error) (Code, bool)
 // SetFault installs a fault for a provider or a KEK; ModeOK with zero latency clears it.
 func (f *Fake) SetFault(s Scope, fault Fault)
 // Revoke disables the KEK and records ground truth (timestamp read after the flip, same critical section); Restore re-enables it.
@@ -736,7 +739,7 @@ func (f *Fake) Truth() *Truth
 package queue
 
 // Message is one stored row as workers see it.
-type Message struct { ID int64; DEKID string; Nonce [12]byte; Ciphertext []byte; Attempts int; EnqueuedAt time.Time }
+type Message struct { ID int64; DEKID string; Ciphertext []byte; Attempts int; EnqueuedAt time.Time }
 // Batch is one tenant's claimed rows.
 type Batch struct { Tenant string; Idx int; Msgs []Message }
 // Census is one consistent per-tenant ledger plus SQL row counts taken in one critical section (Q1).
@@ -1044,7 +1047,7 @@ func (w *World) Fault(f FaultRequest) error
 func (w *World) Surge(tenant string, mult float64) error
 func (w *World) SetKey(tenant, action string) error
 // TenantDetail is the body of GET /v1/tenants/{id}; hover and click-to-pin read it. [SF-F6]
-type TenantDetail struct { ID, Provider, State string; Rank int; LeaseAgeMs, LeaseRemainingMs, NextProbeMs int64; Backlog, Ready int; OfferedPS, KMSCallsPerMin float64; Affected bool; Audit []metrics.Audit }
+type TenantDetail struct { ID, Provider, State string; Rank int; LeaseAgeMs, LeaseRemainingMs, NextProbeMs int64; Backlog, Ready int; OfferedPS, KMSCallsPerMin float64; Affected bool; Audit []AuditEntry }
 func (w *World) Tenant(id string) (TenantDetail, error)
 ```
 
@@ -1153,8 +1156,8 @@ Lock order (never reversed): `holder.mu` → nothing (New/Stop take no other loc
 - **Naming.** `lease`, `Lease`, `SoftTTL`, `SentAt` refer only to the key lease. Message rows use `claimed`, `claimed_until`, `Claim`, `Reclaim`, `ClaimBatch`, `ClaimTimeout`. `Hot` = dispatchable, `Warm` = re-unwrap a DEK, `Seal`/`Open` = encrypt/decrypt, `probe` = one KMS call made by the state machine. JSON and timeline show `ACTIVE`, `RIDING_THROUGH`, `KEY_UNAVAILABLE`, `REVOKED`. Tenants `t-0042`, KEKs `kek-t-0042`, DEKs `t-0042/3`, Worlds `w-7`.
 - **No globals.** No package-level `var` with mutable state; `init()` forbidden; `world_test` runs two Worlds concurrently as the regression test. Every constructor takes a config struct; every long-running thing has `Run(ctx)` and returns when ctx ends. CI: `go vet`, `grep -n '^var ' internal/ | grep -v Err`, and the `go list -deps` import check for `internal/cmek`.
 - **Clock injection.** Each package declares the 1- or 2-method `Clock` it needs; `world.Deps.Clock` satisfies all of them. cmek needs only `Now`. Nothing calls `time.Now()` or `time.Sleep` outside `cmd/main.go` and the real clock; loops use `clock.After`; `context.WithTimeout` (KMS deadline) uses wall time (documented; X4 replaces it under synctest). The test clock is `{now atomic; After: time.After}`, ~15 lines, no timer heap.
-- **Randomness.** One `*rand.Rand` seeded from `Params.Seed` behind `lockedRand.mu`, shared by rank shuffle, traffic, sink, fake latency and jitter; nonces and KEKs from `crypto/rand`.
-- **Errors.** Plain sentinels compared with `errors.Is`; wrap with `%w`; never match strings; no wrapped error types. `kms.Error` is the only structured error type. Handlers map through `world.Outcome` only. KMS errors are classified in exactly one function.
+- **Randomness.** One `*rand.Rand` seeded from `Params.Seed` behind `lockedRand.mu`, shared by rank shuffle, traffic, sink, fake latency and jitter; DEKs, KEKs and IVs from `crypto/rand` inside Tink.
+- **Errors.** Plain sentinels compared with `errors.Is`; wrap with `%w`; never match strings, with one sanctioned exception: `kms.CodeFromText` reads the `kms <provider>: <Code>: ` frame back out of an error Tink's keyset helpers flattened with `%v` (Tink as built; pinned by `TestCodeFromText` and `TestCodeThroughTink`); no wrapped error types. `kms.Error` is the only structured error type. Handlers map through `world.Outcome` only. KMS errors are classified in exactly one function.
 - **Logging.** `log/slog` JSON to stderr, one logger per World with `world=w-3`; hot paths log nothing; state changes are audit entries.
 - **Tests.** Table-driven; `-race` on; cmek tests use `Spawn: func(f func()) { f() }`, a fake clock and `kms.NewFake` with no latency; no `time.Sleep` and no goroutine waits in `internal/cmek` tests; SQLite tests use `t.TempDir()`. `testing/synctest` only in X4.
 - **Ownership marks.** Each file header carries `// Owner: Ben` or `// Owner: Claude (reviewed by Ben)`; `docs/TIMELOG.md` records planned vs actual per milestone, created in M0.
@@ -1195,7 +1198,7 @@ Lock order (never reversed): `holder.mu` → nothing (New/Stop take no other loc
 
 17. **Bulkheads.** Per provider: `map[string]chan struct{}` cap 32, acquired with `select` against the call's 500 ms context so waiting counts against the deadline (the slow-KMS tile shows in-flight pinned at 32 because callers queue at the bulkhead). The honest bound `[SF-F17]`: at most 32 goroutines are *inside* a slow provider, and up to `IngestWaiters + 1` (4 cold-path waiters plus one probe or warm) per tenant may be *queued at the semaphore*, each for ≤ `KMSTimeout` before returning a transient timeout; with one generator goroutine per tenant the practical queue is ≤ 2 × 333 goroutines for ≤ 500 ms, all parked on a channel, none holding a lock or a worker. P0_EXPLAINED's "at most 32 stuck" is the inside count; the alternative (fail fast when the semaphore is full → immediate 503) is a one-line change (Decision for Ben). Per tenant: an `inflight int` under `m.mu` capped at `TenantInflight` (2; 0 = no cap, the M2 cut line); a third concurrent call returns unclassified `errBusy` at once, never feeds backoff or the audit as a KMS failure: ingest cold path → fast `503 key_unavailable` (Retry-After 1), probe/warm → retried at the next Tick. Ingest waiters: `waiters int` under `m.mu` capped at 4; the fifth cold-path request returns `503 key_unavailable` immediately instead of joining the singleflight.
 
-18. **Backoff.** `Backoff(n) = min(0.5 s × 2^(n−1), 8 s) × (1 + 0.5 × (2u − 1))`, `u ∈ [0,1)` from `Jitter.Float64()`, `n` = consecutive transient failures, reset on any success: 0.5, 1, 2, 4, 8, 8 … s each ±50 %. `t.probing` guarantees a single probe *or warm* in flight per tenant; Tick launches the next only when `!probing && now ≥ nextProbeAt` (probe) or `!probing && some pending dueAt ≤ now` (warm); `errBusy` leaves `nextProbeAt` unchanged. A warm that fails transiently is re-queued at `nextProbeAt`, so a cold DEK under an outage costs the same schedule as a probe, never one call per ring pass `[SC-F5]`. REVOKED uses a fixed `RevokedReprobe = 5 s` without jitter (a deny never touches `n`) and the repeated denies neither re-audit the state nor re-post the timeline `[SC-F7]`. Randomness: the World's `*rand.Rand` seeded from `Params.Seed`, behind a mutex, passed as `cmek.Jitter`, so a seed reproduces the probe schedule; nonces come from `crypto/rand` regardless. During a gcp outage 333 tenants spread their probes over 4–12 s at the cap (≈ 42 calls/s after settling) and recover within one backoff interval (≤ ~12 s) on restore.
+18. **Backoff.** `Backoff(n) = min(0.5 s × 2^(n−1), 8 s) × (1 + 0.5 × (2u − 1))`, `u ∈ [0,1)` from `Jitter.Float64()`, `n` = consecutive transient failures, reset on any success: 0.5, 1, 2, 4, 8, 8 … s each ±50 %. `t.probing` guarantees a single probe *or warm* in flight per tenant; Tick launches the next only when `!probing && now ≥ nextProbeAt` (probe) or `!probing && some pending dueAt ≤ now` (warm); `errBusy` leaves `nextProbeAt` unchanged. A warm that fails transiently is re-queued at `nextProbeAt`, so a cold DEK under an outage costs the same schedule as a probe, never one call per ring pass `[SC-F5]`. REVOKED uses a fixed `RevokedReprobe = 5 s` without jitter (a deny never touches `n`) and the repeated denies neither re-audit the state nor re-post the timeline `[SC-F7]`. Randomness: the World's `*rand.Rand` seeded from `Params.Seed`, behind a mutex, passed as `cmek.Jitter`, so a seed reproduces the probe schedule; DEKs and IVs come from `crypto/rand` inside Tink regardless. During a gcp outage 333 tenants spread their probes over 4–12 s at the cap (≈ 42 calls/s after settling) and recover within one backoff interval (≤ ~12 s) on restore.
 
 19. **Scenarios.** `world/scenarios.go` defines `scenario{name, targets func() []int, phases []phase{name, dur, enter func()}, exit func()}`; `StartScenario` refuses (409) if one is running, sets targets and the marker, freezes the baseline, and launches one goroutine that walks the phases with `clock.After`, updating `metrics.SetScenario(name, phase, endsAt)` for the card countdown, then runs `exit`: restore faults and multipliers, `metrics.SetCleared(now)`, and a tail that lasts at least `ScenarioTailMin` (15 s) and ends when `metrics.Recovered()` reports every target ACTIVE and affected backlog 0, or at `ScenarioTailMax` (90 s), whichever is first `[SF-F13]`; L1/L4 stay judged and the affected series keeps drawing through the tail; the tail posts `gcp restored: 333 tenants ACTIVE in 9.4 s, backlog drained in 41 s` and the snapshot carries `recovery_s`/`drain_s` `[SF-F7]`; then `ClearTargets`. `StopScenario` cancels the goroutine and runs `exit`. Mapping (flat `FaultRequest` shape `[SF-F5]`): provider blip/outage → `{provider: gcp, mode: fast_fail}` for 10 s / 60 s then `mode: ok` (blip card: a third of the grid turns yellow with a few orange cold cells and a small 503 blip, then green `[SF-F14]`); key revocation → `SetKey(byRank[3], revoke)`, one open phase until the card's Restore (or Stop) calls `SetKey(restore)`, then the tail; slow KMS → `{provider: azure, latency_p50_ms: 400, latency_p99_ms: 3000}` for 60 s; tenant surge → `Surge(byRank[5], 100)` for 60 s; global surge → `Surge("", 5)` for `GlobalSurgeFor` (90 s recommended `[BB-06]`) with targets = top 150 ranks and a tail long enough for the ≈ 59 s drain.
 

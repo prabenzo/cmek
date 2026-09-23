@@ -5,6 +5,8 @@ import (
 	"math"
 	"sync"
 	"time"
+
+	"github.com/tink-crypto/tink-go/v2/tink"
 )
 
 // Lease is the window in which cached DEKs may be used; the zero value is "no lease".
@@ -57,12 +59,13 @@ func Backoff(n int, min, max time.Duration, jitter, u float64) time.Duration {
 	return time.Duration(base * (1 + jitter*(2*u-1)))
 }
 
-// dek is one DEK: wrapped bytes forever, plaintext only while hot. key == nil means cold.
+// dek is one DEK: wrapped bytes (the keyset encrypted under the KEK) forever, the primitive only while hot.
+// prim == nil means cold.
 type dek struct {
 	id         string
 	wrapped    []byte
 	kekVersion int
-	key        *[32]byte
+	prim       tink.AEAD
 	msgs       int
 	createdAt  time.Time
 	hotSince   time.Time
@@ -97,20 +100,19 @@ type tenant struct {
 func (t *tenant) hot() int {
 	n := 0
 	for _, d := range t.deks {
-		if d.key != nil {
+		if d.prim != nil {
 			n++
 		}
 	}
 	return n
 }
 
-// purge zeroes and drops every plaintext, clears pending, keeps wrapped bytes; returns how many were hot.
+// purge drops every plaintext primitive, clears pending, keeps wrapped bytes; returns how many were hot.
 func (t *tenant) purge() int {
 	n := 0
 	for _, d := range t.deks {
-		if d.key != nil {
-			*d.key = [32]byte{}
-			d.key = nil
+		if d.prim != nil {
+			d.prim = nil
 			n++
 		}
 	}

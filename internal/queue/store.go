@@ -22,7 +22,6 @@ import (
 type Message struct {
 	ID         int64
 	DEKID      string
-	Nonce      [12]byte
 	Ciphertext []byte
 	Attempts   int
 	EnqueuedAt time.Time
@@ -85,7 +84,6 @@ CREATE TABLE IF NOT EXISTS messages (
   id            INTEGER PRIMARY KEY,
   tenant_id     TEXT    NOT NULL,
   dek_id        TEXT    NOT NULL,
-  nonce         BLOB    NOT NULL,
   ciphertext    BLOB    NOT NULL,
   state         TEXT    NOT NULL CHECK (state IN ('ready','claimed','dead')),
   attempts      INTEGER NOT NULL DEFAULT 0,
@@ -165,9 +163,9 @@ func Open(cfg Config) (*Store, error) {
 		dst **sql.Stmt
 		q   string
 	}{
-		{&s.insert, `INSERT INTO messages (id, tenant_id, dek_id, nonce, ciphertext, state, attempts, enqueued_at) VALUES (?1,?2,?3,?4,?5,'ready',0,?6)`},
+		{&s.insert, `INSERT INTO messages (id, tenant_id, dek_id, ciphertext, state, attempts, enqueued_at) VALUES (?1,?2,?3,?4,'ready',0,?5)`},
 		{&s.putDEK, `INSERT INTO deks (id, tenant_id, kek_id, kek_version, wrapped_dek, created_at) VALUES (?1,?2,?3,?4,?5,?6)`},
-		{&s.claim, `UPDATE messages SET state='claimed', claimed_until=?1 WHERE id IN (SELECT id FROM messages WHERE tenant_id=?2 AND state='ready' ORDER BY id LIMIT ?3) RETURNING id, dek_id, nonce, ciphertext, attempts, enqueued_at`},
+		{&s.claim, `UPDATE messages SET state='claimed', claimed_until=?1 WHERE id IN (SELECT id FROM messages WHERE tenant_id=?2 AND state='ready' ORDER BY id LIMIT ?3) RETURNING id, dek_id, ciphertext, attempts, enqueued_at`},
 		{&s.ack, `DELETE FROM messages WHERE state='claimed' AND id IN (SELECT value FROM json_each(?1))`},
 		{&s.release, `UPDATE messages SET state='ready', claimed_until=NULL WHERE state='claimed' AND id IN (SELECT value FROM json_each(?1))`},
 		{&s.dead, `UPDATE messages SET state='dead', claimed_until=NULL, attempts=attempts+1 WHERE id=?1 AND state='claimed'`},
@@ -242,7 +240,7 @@ func (s *Store) Insert(ctx context.Context, idx int, id int64, env cmek.Envelope
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	start := s.cfg.Clock.Now()
-	_, err := s.insert.ExecContext(s.bg(), id, s.cfg.Tenants[idx], env.DEKID, env.Nonce[:], env.Ciphertext, ms(now))
+	_, err := s.insert.ExecContext(s.bg(), id, s.cfg.Tenants[idx], env.DEKID, env.Ciphertext, ms(now))
 	d := s.cfg.Clock.Now().Sub(start).Nanoseconds()
 	s.insN.Add(1)
 	s.insSumNs.Add(d)
@@ -287,13 +285,11 @@ func (s *Store) Claim(ctx context.Context, idx, n int, until time.Time) (Batch, 
 	for rows.Next() {
 		drained++
 		var m Message
-		var nonce []byte
 		var enq int64
-		if err := rows.Scan(&m.ID, &m.DEKID, &nonce, &m.Ciphertext, &m.Attempts, &enq); err != nil {
+		if err := rows.Scan(&m.ID, &m.DEKID, &m.Ciphertext, &m.Attempts, &enq); err != nil {
 			scanErr = err
 			continue
 		}
-		copy(m.Nonce[:], nonce)
 		m.EnqueuedAt = time.UnixMilli(enq)
 		b.Msgs = append(b.Msgs, m)
 	}
