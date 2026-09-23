@@ -137,3 +137,69 @@ func TestHistP99(t *testing.T) {
 		t.Error("affected bit set after ClearTargets")
 	}
 }
+
+// TestTransitionLines pins the timeline rule for state changes: a REVOKED transition posts at once with its purge
+// count; AggregateMin or more identical (provider, from, to) transitions collapse to one line at the next flush
+// while fewer keep the M2 single form; ACTIVE↔RIDING_THROUGH churn flushes once per second as one line per
+// provider; nothing flushes twice within a second; every line a flush posts carries the flush instant.
+func TestTransitionLines(t *testing.T) {
+	r, clk, _, _ := newTestRegistry(9) // three tenants per provider: a-c aws, d-f gcp, g-i azure
+	lines := func(n int) []event {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return r.events(n)
+	}
+	flush := func(at time.Time) {
+		r.mu.Lock()
+		r.flushTransitions(at)
+		r.mu.Unlock()
+	}
+	t0 := clk.now
+	state := func(idx int, from, to uint8, detail string, purged int) {
+		r.Audit(Audit{At: t0.Add(100 * time.Millisecond), Idx: idx, Op: "state", From: from, To: to, Detail: detail, Purged: purged})
+	}
+	// REVOKED posts at once, before any flush
+	state(0, 0, 3, "key revoked, 2 DEKs purged", 2)
+	if got := lines(1); len(got) != 1 || got[0].Text != "t-a REVOKED, 2 DEKs purged" || got[0].At != t0.Add(100*time.Millisecond).UnixMilli() {
+		t.Fatalf("revoked line = %+v", got)
+	}
+	// three gcp cold fetches aggregate; the one azure single keeps its form; churn on aws counts per provider
+	for _, idx := range []int{3, 4, 5, 6} {
+		state(idx, 0, 2, "cold fetch failed", 0)
+	}
+	state(1, 0, 1, "renewal failed", 0)
+	state(2, 0, 1, "renewal failed", 0)
+	state(1, 1, 0, "authorization renewed", 0)
+	if got := lines(9); len(got) != 1 {
+		t.Fatalf("buffered transitions posted before the flush: %+v", got)
+	}
+	flush(t0.Add(time.Second))
+	got := lines(9)
+	want := []string{"aws: 2 ACTIVE → RIDING_THROUGH, 1 back", "t-g ACTIVE → KEY_UNAVAILABLE (cold fetch failed)", "3 gcp tenants ACTIVE → KEY_UNAVAILABLE", "t-a REVOKED, 2 DEKs purged"}
+	if len(got) != len(want) {
+		t.Fatalf("lines after flush = %+v, want %d", got, len(want))
+	}
+	for i, w := range want {
+		if got[i].Text != w {
+			t.Errorf("line %d = %q, want %q", i, got[i].Text, w)
+		}
+		if i < 3 && got[i].At != t0.Add(time.Second).UnixMilli() {
+			t.Errorf("line %d at %d, want the flush instant %d", i, got[i].At, t0.Add(time.Second).UnixMilli())
+		}
+	}
+	for i := 1; i < len(got); i++ {
+		if got[i].Seq >= got[i-1].Seq || got[i].At > got[i-1].At {
+			t.Errorf("lines out of order: %+v then %+v", got[i], got[i-1])
+		}
+	}
+	// a second flush within the second posts nothing; the next second flushes the new churn as one line
+	state(7, 0, 1, "renewal failed", 0)
+	flush(t0.Add(1500 * time.Millisecond))
+	if got := lines(1); got[0].Text != want[0] {
+		t.Errorf("flushed within a second: %q", got[0].Text)
+	}
+	flush(t0.Add(2 * time.Second))
+	if got := lines(1); got[0].Text != "azure: 1 ACTIVE → RIDING_THROUGH, 0 back" || got[0].At != t0.Add(2*time.Second).UnixMilli() {
+		t.Errorf("second flush = %+v", got)
+	}
+}

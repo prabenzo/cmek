@@ -108,11 +108,19 @@ func TestGate(t *testing.T) {
 	if ev := f.Truth().KeyEvents(); len(ev) != 1 || ev[0].KEKID != "kek-a" || ev[0].Enabled {
 		t.Errorf("truth = %+v", ev)
 	}
+	f.Revoke("kek-a") // already revoked: no second event
+	if ev := f.Truth().KeyEvents(); len(ev) != 1 {
+		t.Errorf("a repeated revoke recorded an event: %+v", ev)
+	}
 	f.SetFault(Scope{Provider: "gcp"}, Fault{})
 	if _, err := b.EncryptWithContext(ctx, blob, []byte("kek-b")); err != nil {
 		t.Errorf("kek-b after kek-a revoked: %v", err)
 	}
 	f.Restore("kek-a")
+	f.Restore("kek-a") // the scenario's exit after a manual Restore: still one enable event
+	if ev := f.Truth().KeyEvents(); len(ev) != 2 || !ev[1].Enabled {
+		t.Errorf("truth after restore = %+v, want one disable and one enable", ev)
+	}
 	if _, err := a.DecryptWithContext(ctx, wrapped, []byte("kek-a")); err != nil {
 		t.Errorf("after restore: %v", err)
 	}

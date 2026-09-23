@@ -147,7 +147,7 @@ Milestone column = the plan whose Files/Order of work delivers the item. "cut li
 | Invariant panel S1–S4, L1, L4: light, counter, last-checked | M4 (`renderPanel`) + M5 (`Report`, `invariants`) | |
 | Event timeline, newest first, aggregation | M2 (lines) → M4 (aggregation, `renderTimeline`) | |
 | Starting state before first snapshot; world-id change clears | M4 (`connect`, `onSnapshot`) | |
-| Reconnect on `event: reconnect` / Cloud Run cut | M4 (`connect`) + M5 (`StreamMaxAge`, C3 optional) | |
+| Reconnect on `event: reconnect` / Cloud Run cut | M5 (`StreamMaxAge` and the listener together; M4's listener was dropped in the PR #10 review because nothing sent the event) | |
 
 ## 6. Invariants and SLO lights (SPEC › Correctness contract)
 

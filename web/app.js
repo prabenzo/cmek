@@ -22,7 +22,6 @@ function connect() {
   es = new EventSource('/v1/stream');
   es.onopen = () => { connected = true; banner(world ? 'live · ' + world : 'waiting for the first snapshot…'); };
   es.onmessage = e => onSnapshot(JSON.parse(e.data));
-  es.addEventListener('reconnect', () => { es.close(); connect(); }); // the server ends a stream before Cloud Run's cut
   es.onerror = () => { connected = false; banner('reconnecting…'); renderCards(snap); };
 }
 
@@ -128,7 +127,7 @@ function renderCards(s) {
     if (!mine) { st.textContent = ''; return; }
     const sc = s.scenario;
     let text = sc.phase;
-    if (sc.ends_at == null) text += ' · waiting for Restore';
+    if (sc.ends_at == null) text += sc.phase === 'recovery' ? ' · waiting for drain' : ' · waiting for Restore';
     else text += ' · ' + Math.max(0, (sc.ends_at - s.t) / 1000).toFixed(0) + ' s';
     if (sc.recovery_s != null) text += ' · recovered in ' + sc.recovery_s.toFixed(1) + ' s';
     if (sc.drain_s != null) text += ' · drained in ' + sc.drain_s.toFixed(1) + ' s';
@@ -284,11 +283,36 @@ function pin(i) {
   const refresh = async () => {
     const d = await fetchTenant(i);
     if (!d || pinIdx !== i) return;
-    const audit = (d.audit || []).map(a => '<li>' + clock(Date.parse(a.At)) + ' ' + a.Op + ' ' + a.Outcome + (a.Detail ? ' (' + a.Detail + ')' : '') + (a.Latency ? ' ' + (a.Latency / 1e6).toFixed(0) + ' ms' : '') + '</li>').join('');
-    el.innerHTML = '<b>' + d.id + '</b> · ' + d.provider + ' · ' + d.state + ' · rank ' + d.rank + ' · lease age ' + (d.lease_age_ms / 1000).toFixed(1) + ' s, ' + (d.lease_remaining_ms / 1000).toFixed(1) + ' s left' +
-      (d.next_probe_ms > 0 ? ' · next probe in ' + (d.next_probe_ms / 1000).toFixed(1) + ' s' : '') + ' · backlog ' + d.backlog + ' (ready ' + d.ready + ') · offered ' + d.offered_ps.toFixed(1) + '/s · KMS ' + d.kms_calls_per_min + '/min' +
-      (d.affected ? ' · <span style="color:#e74c3c">affected</span>' : '') + ' <button id="unpin" style="float:right;padding:1px 6px">unpin</button><ol>' + (audit || '<li>no audit entries yet</li>') + '</ol>';
-    $('unpin').onclick = () => pin(-1);
+    // built with createElement + textContent: server strings (state, audit detail) are never parsed as HTML
+    el.replaceChildren();
+    const b = document.createElement('b');
+    b.textContent = d.id;
+    el.append(b, ' · ' + d.provider + ' · ' + d.state + ' · rank ' + d.rank + ' · lease age ' + (d.lease_age_ms / 1000).toFixed(1) + ' s, ' + (d.lease_remaining_ms / 1000).toFixed(1) + ' s left' +
+      (d.next_probe_ms > 0 ? ' · next probe in ' + (d.next_probe_ms / 1000).toFixed(1) + ' s' : '') + ' · backlog ' + d.backlog + ' (ready ' + d.ready + ') · offered ' + d.offered_ps.toFixed(1) + '/s · KMS ' + d.kms_calls_per_min + '/min');
+    if (d.affected) {
+      const aff = document.createElement('span');
+      aff.style.color = '#e74c3c';
+      aff.textContent = 'affected';
+      el.append(' · ', aff);
+    }
+    const unpin = document.createElement('button');
+    unpin.textContent = 'unpin';
+    unpin.style.cssText = 'float:right;padding:1px 6px';
+    unpin.onclick = () => pin(-1);
+    el.append(' ', unpin);
+    const ol = document.createElement('ol');
+    const audit = d.audit || [];
+    for (const a of audit) {
+      const li = document.createElement('li');
+      li.textContent = clock(Date.parse(a.at)) + ' ' + a.op + ' ' + a.outcome + (a.detail ? ' (' + a.detail + ')' : '') + (a.latency_ms ? ' ' + a.latency_ms.toFixed(0) + ' ms' : '');
+      ol.append(li);
+    }
+    if (!audit.length) {
+      const li = document.createElement('li');
+      li.textContent = 'no audit entries yet';
+      ol.append(li);
+    }
+    el.append(ol);
   };
   refresh();
   pinTimer = setInterval(refresh, 2000);

@@ -259,12 +259,14 @@ func (s *scenarios) run(ctx context.Context, cancel context.CancelFunc, sc *scen
 // tail runs after a normal end: SetCleared(now); every SnapshotInterval poll metrics.Recovered(); end at
 // ≥ ScenarioTailMin once done, at ScenarioTailMax, or on a cancel (no restored line then); post "<scope> restored:
 // N tenants ACTIVE in x s, backlog drained in y s". The card shows the recovery phase with the minimum tail as its
-// countdown, and the snapshot carries recovery_s / drain_s as they fill.
+// countdown and, once the minimum has passed with the drain still pending, as open-ended (ends_at null: the page
+// says "waiting for drain"); the snapshot carries recovery_s / drain_s as they fill.
 func (s *scenarios) tail(ctx context.Context, sc *scenario) {
 	w := s.w
 	start := w.clock.Now()
 	w.metrics.SetCleared(start)
 	w.metrics.SetScenario(sc.name, "recovery", start.Add(w.P.ScenarioTailMin))
+	openEnded := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -273,6 +275,10 @@ func (s *scenarios) tail(ctx context.Context, sc *scenario) {
 		}
 		rec, drain, done := w.metrics.Recovered()
 		el := w.clock.Now().Sub(start)
+		if !openEnded && el >= w.P.ScenarioTailMin {
+			openEnded = true
+			w.metrics.SetScenario(sc.name, "recovery", time.Time{})
+		}
 		if (done && el >= w.P.ScenarioTailMin) || el >= w.P.ScenarioTailMax {
 			n := len(sc.targets())
 			switch {

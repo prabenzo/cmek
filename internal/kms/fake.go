@@ -125,7 +125,9 @@ func (f *Fake) SetFault(s Scope, fault Fault) {
 }
 
 // Revoke disables the KEK and records ground truth; the timestamp is read after the flip, inside the same critical
-// section, so no call that returned OK was checked after it [SC-F6]. Restore re-enables it the same way.
+// section, so no call that returned OK was checked after it [SC-F6]. Restore re-enables it the same way. Both are
+// idempotent: a flip to the state the key is already in records nothing (a Restore that ends the revocation
+// scenario is followed by the scenario's own exit Restore; the checker must see one event).
 func (f *Fake) Revoke(kekID string)  { f.flip(kekID, false) }
 func (f *Fake) Restore(kekID string) { f.flip(kekID, true) }
 
@@ -133,7 +135,7 @@ func (f *Fake) flip(kekID string, enabled bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	k := f.keks[kekID]
-	if k == nil {
+	if k == nil || k.enabled == enabled {
 		return
 	}
 	k.enabled = enabled

@@ -423,7 +423,9 @@ func (r *Registry) TenantCallsPerMin(idx int) float64 {
 }
 
 // flushTransitions turns the buffered transitions into timeline lines (step 6) once per second, so an outage
-// posts at most one line per (provider, from, to) per second plus its singles; caller holds r.mu.
+// posts at most one line per (provider, from, to) per second plus its singles; caller holds r.mu. Every line a
+// flush posts carries the flush instant (a buffered single is published up to 1 s after its transition), so the
+// timeline's timestamps never run backwards within a flush.
 func (r *Registry) flushTransitions(now time.Time) {
 	if now.Sub(r.rtFlushed) < time.Second {
 		return
@@ -443,7 +445,7 @@ func (r *Registry) flushTransitions(now time.Time) {
 				posted[k] = true
 				r.post(now, fmt.Sprintf("%d %s tenants %s → %s", counts[k], r.cfg.Providers[k.prov], stateName(e.From), stateName(e.To)))
 			case counts[k] < r.cfg.AggregateMin:
-				r.post(e.At, fmt.Sprintf("%s %s → %s (%s)", r.cfg.Tenants[e.Idx], stateName(e.From), stateName(e.To), e.Detail))
+				r.post(now, fmt.Sprintf("%s %s → %s (%s)", r.cfg.Tenants[e.Idx], stateName(e.From), stateName(e.To), e.Detail))
 			}
 		}
 		r.pendTrans = r.pendTrans[:0]

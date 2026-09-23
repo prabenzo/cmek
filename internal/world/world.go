@@ -286,19 +286,29 @@ func (j jitter) Float64() float64 {
 
 // TenantDetail is the body of GET /v1/tenants/{id}; M1 fills the fields the data path knows, M4 the rest.
 type TenantDetail struct {
-	ID               string          `json:"id"`
-	Provider         string          `json:"provider"`
-	State            string          `json:"state"`
-	Rank             int             `json:"rank"`
-	LeaseAgeMs       int64           `json:"lease_age_ms"`
-	LeaseRemainingMs int64           `json:"lease_remaining_ms"`
-	NextProbeMs      int64           `json:"next_probe_ms"`
-	Backlog          int             `json:"backlog"`
-	Ready            int             `json:"ready"`
-	OfferedPS        float64         `json:"offered_ps"`
-	KMSCallsPerMin   float64         `json:"kms_calls_per_min"`
-	Affected         bool            `json:"affected"`
-	Audit            []metrics.Audit `json:"audit"`
+	ID               string       `json:"id"`
+	Provider         string       `json:"provider"`
+	State            string       `json:"state"`
+	Rank             int          `json:"rank"`
+	LeaseAgeMs       int64        `json:"lease_age_ms"`
+	LeaseRemainingMs int64        `json:"lease_remaining_ms"`
+	NextProbeMs      int64        `json:"next_probe_ms"`
+	Backlog          int          `json:"backlog"`
+	Ready            int          `json:"ready"`
+	OfferedPS        float64      `json:"offered_ps"`
+	KMSCallsPerMin   float64      `json:"kms_calls_per_min"`
+	Affected         bool         `json:"affected"`
+	Audit            []AuditEntry `json:"audit"`
+}
+
+// AuditEntry is one audit ring entry as the API publishes it (snake_case like every other field, latency in ms).
+type AuditEntry struct {
+	At        time.Time `json:"at"`
+	Op        string    `json:"op"`
+	Outcome   string    `json:"outcome"`
+	Detail    string    `json:"detail,omitempty"`
+	LatencyMs float64   `json:"latency_ms,omitempty"`
+	Purged    int       `json:"purged,omitempty"`
 }
 
 // Tenant returns the tenant read model: state and lease (cmek), rank, backlog, offered rate, KMS calls per minute
@@ -312,7 +322,15 @@ func (w *World) Tenant(id string) (TenantDetail, error) {
 	return TenantDetail{ID: id, Provider: w.P.Providers[idx*len(w.P.Providers)/w.P.Tenants], State: info.State.String(), Rank: w.rankOf[idx],
 		LeaseAgeMs: info.LeaseAge.Milliseconds(), LeaseRemainingMs: info.LeaseRemaining.Milliseconds(), NextProbeMs: info.NextProbeIn.Milliseconds(),
 		Backlog: w.store.Backlog(idx), Ready: w.store.Ready(idx), OfferedPS: w.gen.Offered(idx),
-		KMSCallsPerMin: w.metrics.TenantCallsPerMin(idx), Affected: w.metrics.Affected(idx), Audit: w.metrics.TenantAudit(idx, 10)}, nil
+		KMSCallsPerMin: w.metrics.TenantCallsPerMin(idx), Affected: w.metrics.Affected(idx), Audit: auditEntries(w.metrics.TenantAudit(idx, 10))}, nil
+}
+
+func auditEntries(in []metrics.Audit) []AuditEntry {
+	out := make([]AuditEntry, 0, len(in))
+	for _, a := range in {
+		out = append(out, AuditEntry{At: a.At, Op: a.Op, Outcome: a.Outcome, Detail: a.Detail, LatencyMs: float64(a.Latency) / float64(time.Millisecond), Purged: a.Purged})
+	}
+	return out
 }
 
 // FaultRequest is the flat body of POST /v1/faults: one of Provider or Tenant, plus a mode and optional latency
