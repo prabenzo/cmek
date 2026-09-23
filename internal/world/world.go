@@ -347,6 +347,29 @@ type FaultRequest struct {
 // ErrBadFault is a fault request the World refuses (400).
 var ErrBadFault = errors.New("world: bad fault request")
 
+// SetCache turns the key cache on or off for every tenant of one provider, or of every provider when provider is
+// "" (the two no-cache runs' switch; NOCACHE.md). Off means every seal and every open is one KMS call.
+func (w *World) SetCache(provider string, on bool) error {
+	if provider != "" {
+		known := false
+		for _, p := range w.P.Providers {
+			known = known || p == provider
+		}
+		if !known {
+			return fmt.Errorf("%w: unknown provider %q", ErrBadFault, provider)
+		}
+	}
+	n := 0
+	for i, id := range w.ids {
+		if provider == "" || w.P.Providers[i*len(w.P.Providers)/w.P.Tenants] == provider {
+			w.keys.SetPassThrough(id, !on)
+			n++
+		}
+	}
+	w.log.Info("key cache", "provider", provider, "on", on, "tenants", n)
+	return nil
+}
+
 // Fault validates the request and installs it in the fake KMS; a body with mode "ok" and no latency clears the scope.
 func (w *World) Fault(f FaultRequest) error {
 	var scope kms.Scope

@@ -203,3 +203,29 @@ func TestTransitionLines(t *testing.T) {
 		t.Errorf("second flush = %+v", got)
 	}
 }
+
+// TestProviderCallsPS: KMS calls are counted per provider per tick for the no-cache summary lines.
+func TestProviderCallsPS(t *testing.T) {
+	r, clk, _, _ := newTestRegistry(6) // a,b aws · c,d gcp · e,f azure
+	for _, idx := range []int{0, 1, 0} {
+		r.Audit(Audit{At: clk.now, Idx: idx, Op: "unwrap", Outcome: "ok"})
+	}
+	r.Audit(Audit{At: clk.now, Idx: 2, Op: "generate", Outcome: "ok"})
+	r.Audit(Audit{At: clk.now, Idx: 4, Op: "state", Outcome: "x"}) // not a call
+	r.tick()
+	for _, row := range []struct {
+		prov string
+		want float64
+	}{{"aws", 6}, {"gcp", 2}, {"azure", 0}} {
+		if got := r.ProviderCallsPS(row.prov); got != row.want {
+			t.Errorf("%s: %v calls/s, want %v", row.prov, got, row.want)
+		}
+	}
+	if last := r.Last(); last.ProviderCallsPS["aws"] != 6 || last.KMSCallsPS != 8 {
+		t.Errorf("Last = %+v", last)
+	}
+	r.tick()
+	if got := r.ProviderCallsPS("aws"); got != 0 {
+		t.Errorf("counter not reset per tick: %v", got)
+	}
+}

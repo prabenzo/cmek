@@ -81,10 +81,78 @@ func (m *Manager) exhausted(d *dek, now time.Time) bool {
 	return d.msgs >= m.cfg.DEKMaxMessages || now.Sub(d.createdAt) >= m.cfg.DEKMaxAge
 }
 
+// SetPassThrough switches one tenant between the cached design (off) and per-request KMS calls (on): the no-cache
+// demo. Entering pass-through drops every cached primitive (audit purge "cache off"); leaving it lets the next
+// probe or renewal fill the cache again. Everything else (state machine, backoff, bulkheads, the Deny row and the
+// stale-OK guard) is unchanged, so the runs isolate the cache as the one variable.
+func (m *Manager) SetPassThrough(id string, on bool) {
+	t := m.tenants[id]
+	if t == nil {
+		return
+	}
+	now := m.cfg.Clock.Now()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.passThrough == on {
+		return
+	}
+	t.passThrough = on
+	if on {
+		if purged := t.purge(); purged > 0 {
+			m.audit(Audit{At: now, Tenant: t.spec.ID, Op: "purge", Outcome: "cache off", Detail: "per-request KMS calls", Purged: purged})
+		}
+	}
+}
+
+// passThroughEncrypt is EncryptKey without the cache: one KMS call (a generate for a tenant with no DEK or an
+// exhausted one, else an unwrap of the active DEK) made directly, outside singleflight, and its primitive handed
+// to the caller once. Called with t.mu released, after the parked-state returns.
+func (m *Manager) passThroughEncrypt(t *tenant) (Handle, error) {
+	now := m.cfg.Clock.Now()
+	t.mu.Lock()
+	d := t.active
+	gen := d == nil || (t.state == Active && m.exhausted(d, now))
+	t.mu.Unlock()
+	var r result
+	if gen {
+		d, r = m.generate(t)
+	} else {
+		r = m.call(t, "unwrap", d)
+		m.apply(t, "unwrap", d, r)
+	}
+	return m.passThroughHandle(t, d, r, true)
+}
+
+// passThroughHandle maps one direct call's result to a Handle or the caller's sentinel; count is true for a seal.
+func (m *Manager) passThroughHandle(t *tenant, d *dek, r result, count bool) (Handle, error) {
+	switch {
+	case r.err == nil:
+		now := m.cfg.Clock.Now()
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		if t.state == Revoked {
+			return Handle{}, ErrKeyRevoked // a stale OK: the deny won
+		}
+		if !t.lease.Usable(now) {
+			return Handle{}, ErrKeyUnavailable
+		}
+		if count {
+			d.msgs++
+		}
+		return Handle{DEKID: d.id, ValidUntil: t.lease.Until(), prim: r.prim}, nil
+	case r.class == Deny:
+		return Handle{}, ErrKeyRevoked
+	case errors.Is(r.err, errStore):
+		return Handle{}, r.err
+	default:
+		return Handle{}, ErrKeyUnavailable
+	}
+}
+
 // handle wraps the active primitive in a Handle when the tenant may seal now; caller holds t.mu.
 func (m *Manager) handle(t *tenant, now time.Time) (Handle, bool) {
 	d := t.active
-	if d == nil || d.prim == nil || !t.lease.Usable(now) || (t.state == Active && m.exhausted(d, now)) {
+	if d == nil || d.prim == nil || t.passThrough || !t.lease.Usable(now) || (t.state == Active && m.exhausted(d, now)) {
 		return Handle{}, false
 	}
 	d.msgs++
@@ -107,6 +175,10 @@ func (m *Manager) EncryptKey(ctx context.Context, id string) (Handle, error) {
 	case KeyUnavailable:
 		t.mu.Unlock()
 		return Handle{}, ErrKeyUnavailable
+	}
+	if t.passThrough {
+		t.mu.Unlock()
+		return m.passThroughEncrypt(t)
 	}
 	if h, ok := m.handle(t, now); ok { // hot path
 		kick := t.state == Active && t.lease.SoftDue(now) && !t.probing
@@ -144,7 +216,8 @@ func (m *Manager) EncryptKey(ctx context.Context, id string) (Handle, error) {
 }
 
 // DecryptKey checks the lease now and returns a handle on the named DEK; ErrPoison for a dek_id the tenant does not
-// own [SC-F8]; it never blocks and never calls a KMS.
+// own [SC-F8]; it never blocks and never calls a KMS, except for a tenant in pass-through (the no-cache demo), where
+// it makes one unwrap call per message and a failed call parks the tenant and answers ErrKeyUnavailable.
 func (m *Manager) DecryptKey(id, dekID string) (Handle, error) {
 	t := m.tenants[id]
 	if t == nil {
@@ -152,17 +225,26 @@ func (m *Manager) DecryptKey(id, dekID string) (Handle, error) {
 	}
 	now := m.cfg.Clock.Now()
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	d := t.deks[dekID]
 	if d == nil {
+		t.mu.Unlock()
 		return Handle{}, ErrPoison
 	}
 	switch t.state {
 	case Revoked:
+		t.mu.Unlock()
 		return Handle{}, ErrKeyRevoked
 	case KeyUnavailable:
+		t.mu.Unlock()
 		return Handle{}, ErrLeaseExpired
 	}
+	if t.passThrough {
+		t.mu.Unlock()
+		r := m.call(t, "unwrap", d)
+		m.apply(t, "unwrap", d, r)
+		return m.passThroughHandle(t, d, r, false)
+	}
+	defer t.mu.Unlock()
 	if !t.lease.Usable(now) {
 		return Handle{}, ErrLeaseExpired
 	}
@@ -181,6 +263,11 @@ func (m *Manager) Hot(id string) bool {
 	}
 	now := m.cfg.Clock.Now()
 	t.mu.Lock()
+	if t.passThrough { // no lease to check and nothing to kick: the worker's DecryptKey is the call
+		hot := t.state == Active
+		t.mu.Unlock()
+		return hot
+	}
 	usable := t.lease.Usable(now)
 	hot := (t.state == Active || t.state == RidingThrough) && usable && len(t.pending) == 0
 	kick := t.state == Active && !t.probing && (!usable || t.lease.SoftDue(now))
@@ -204,7 +291,7 @@ func (m *Manager) Warm(id, dekID string) {
 	now := m.cfg.Clock.Now()
 	t.mu.Lock()
 	d := t.deks[dekID]
-	if d == nil {
+	if d == nil || t.passThrough { // pass-through: nothing is warmed, every DecryptKey calls
 		t.mu.Unlock()
 		return
 	}
