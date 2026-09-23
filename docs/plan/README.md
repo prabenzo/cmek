@@ -28,6 +28,7 @@ These are the build plans for the seven milestones in `docs/SPEC.md › Plan and
 | M5 Checker and hardening | 3:15–3:40 | [M5.md](M5.md) | [ ] | standing: Claude writes everything incl. `holder.go`, reset and the README draft; Ben deploys, runs the clean-browser check, reviews; the rest open |
 | M6 Rationale | 3:40–4:25 | [M6.md](M6.md) | [ ] | standing: Claude writes every file; Ben reviews, records the video, exports his transcripts, deploys; the rest open |
 | Tink adoption (side branch `claude/tink-go`, merges into the M4 pull request) | — | [TINK.md](TINK.md) | [x] 2026-09-23, PR #8 | replace the hand-rolled AES-GCM in `internal/cmek/envelope.go` and `internal/kms/fake.go` with tink-go; cmek keeps only leases and caching; every decision's first option recommended; the spec's library list is amended on approval |
+| No key cache (sixth scenario, before M5) | — | [NOCACHE.md](NOCACHE.md) | [ ] | Ben's ask (2026-09-23): a failure mode that shows what happens with no caching, every seal and open calling through to the KMS; one provider's band without the cache next to two cached ones at a realistic KMS latency, with the gcp blip in the middle; seven decisions, all with a recommendation |
 
 ## Decisions recorded so far
 
