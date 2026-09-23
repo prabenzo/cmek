@@ -156,6 +156,17 @@ function bindCards() {
   document.querySelectorAll('[data-stop]').forEach(b => b.onclick = () => post('/v1/scenarios/x/stop'));
   $('restore').onclick = () => { const id = targetTenant(); if (id) post('/v1/tenants/' + id + '/key', { action: 'restore' }); };
   $('reset').onclick = onReset;
+  $('cardtoggle').onclick = () => setCards(document.body.classList.contains('nocards'));
+  let show = true;
+  try { show = localStorage.getItem('cards') !== 'hidden'; } catch (e) { /* storage blocked: cards stay shown */ }
+  setCards(show);
+}
+
+// setCards shows or hides the scenario column (a per-viewer preference, remembered in this browser only).
+function setCards(show) {
+  document.body.classList.toggle('nocards', !show);
+  $('cardtoggle').textContent = show ? 'Hide cards' : 'Show cards';
+  try { localStorage.setItem('cards', show ? 'shown' : 'hidden'); } catch (e) { /* storage blocked */ }
 }
 
 function onReset() { post('/v1/reset'); } // the stream ends with the old World; the reconnect's first snapshot carries the new id and resets the page

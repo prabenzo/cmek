@@ -15,7 +15,9 @@
   header p { margin:4px 0; max-width:1100px; color:var(--dim); }
   header .notice { color:var(--fg); }
   #banner { display:inline-block; margin-left:12px; padding:2px 8px; border-radius:4px; background:var(--grey); font-size:12px; }
-  #reset { float:right; }
+  #reset, #cardtoggle { float:right; margin-left:8px; }
+  body.nocards #cards { display:none; }
+  body.nocards main { grid-template-columns:862px 1fr; }
   button { background:#262b36; color:var(--fg); border:1px solid var(--line); border-radius:4px; padding:5px 10px; cursor:pointer; font-size:13px; }
   button:hover:not(:disabled) { background:#313847; }
   button:disabled { opacity:.45; cursor:not-allowed; }
@@ -67,6 +69,7 @@
 <body>
 <header>
   <button id="reset" title="Stop this World and build a fresh one: new id, empty queue, every key restored">Reset world</button>
+  <button id="cardtoggle" title="Show or hide the scenario cards; a running scenario keeps running and the timeline still reports it">Hide cards</button>
   <h1>Killswitch <span id="banner">connecting…</span></h1>
   <p>Customer-managed encryption keys (CMEK) let each tenant own the key that protects its data: revoke the key and the provider can no longer read it. This is a multi-tenant webhook queue where every message is sealed under a per-tenant data key that is itself wrapped by that tenant's KMS key, leased for at most 30 s.</p>
   <p>The thesis: one tenant's KMS trouble, revocation or traffic surge changes nothing for the other 999, and no plaintext is ever decrypted after a key is revoked. Below, 1,000 tenants across three simulated KMS providers run at about 300 events/s; each card injects a fault or a surge and says what to watch.</p>
