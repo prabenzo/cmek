@@ -153,4 +153,15 @@ Estimated ≈ 40 working minutes at the measured pace. Pushed at T+12 (kms), T+2
 
 ## Status
 
-**Awaiting approval.** No code on this branch beyond this document. On approval the build runs on `claude/tink-go`, Ben opens its pull request into `claude/epic-rubin-kgewov`, and the M4 pull request carries the result.
+**Built 2026-09-23** on `claude/tink-go` (restarted from the merged plan, base `c8fc38b`), approved by Ben on PR #8 ("Plan LGTM, please proceed"). Code commit `d2628fd`, docs commit follows; Ben opens the pull request into `claude/epic-rubin-kgewov`. Numbers in `docs/TIMELOG.md` › Tink row.
+
+**As built, where it differs from the plan above.**
+
+- `TestCodeThroughTink` and `TestGate` use a manual clock whose `After` hands out a channel the test fires, so the "revoked during the latency" row and the timeout rows run without sleeping; the "truth records the call" wording was wrong: the truth log records key events only ([BB-11]), and the test asserts the flip.
+- The fake gate maps a blob that does not verify (another KEK, another associated data) to `AccessDenied`, as `Unwrap` did; Tink itself reports it as `aead_factory: decryption failed`, which the spike surfaced.
+- A zeroed `Handle` refuses `Seal` and `Open` with `ErrDEKCold` instead of sealing under nothing (the old wipe left a usable all-zero key; a nil primitive would panic).
+- `TestNoPlaintextAtRest` lives in `world_test.go` (a World with no workers started keeps its rows at rest; `Handle`'s primitive is unexported, so `store_test` cannot seal).
+- The wrapped keyset is 142 bytes (measured), not the 100–140 guessed; the deks table grows by ≈ 80 bytes per DEK.
+- `internal/cmek` did not shrink: 774 → 789 code lines by one rule (non-blank, non-comment). The envelope lost 32 lines, but `newDEK`/`openDEK`, the classify fallback and the nil-primitive guards in `Seal`/`Open` cost more. `internal/kms` 262 → 266.
+- `internal/cmek` imports: as listed, plus `bytes`; `crypto/rand`, `io` and `crypto/*` are gone. `go list -deps` also shows `tink-go/v2/insecuresecretdataaccess`, an internal Tink dependency of `keyset`, not an import of ours; `insecurecleartextkeyset` is nowhere in the graph.
+- One code commit instead of two pushes: the interface change and its callers do not compile apart.
