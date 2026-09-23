@@ -48,7 +48,7 @@ Milestone column = the plan whose Files/Order of work delivers the item. "cut li
 | UI: invariant panel | UI | M4 (markup + `renderPanel`) → M5 (`invariants` key) | M4 ships `renderPanel`; M5 adds only the `invariants` key (M5 CR-1) |
 | UI: event timeline | UI | M2 (ring, lines) → M4 (aggregation, page) | |
 | UI: reset | UI | M4 (button, disabled) → M5 (`POST /v1/reset`) | M5 removes the `disabled` attribute (M5 CR-1) |
-| Live invariant checker | Checks | M5 | S1–S4; L1/L4 expected cut |
+| Live invariant checker | Checks | M5 | S1–S4, L1, L4 (`internal/check`; the C1 cut was not needed) |
 | Unit tests: lease | Checks | M2 | `TestLease` |
 | Unit tests: classifier | Checks | M2 | `TestClassify` |
 | Unit tests: envelope | Checks | M1 (`TestEnvelope`, Ben) | M2 adds two rows only (M2 CR-2) |
@@ -158,10 +158,10 @@ Milestone column = the plan whose Files/Order of work delivers the item. "cut li
 | S2 Tenant key isolation | AAD (M1) + sink mismatch counter | M1 (`Mismatches`) → M5 (S2 light) | |
 | S3 Bounded revocation | ground truth + `DeliveredBetween`, detection latency | M5 | `sinceSeq` init amendment |
 | S4 No loss from key unavailability | conservation per tenant via `Census` | M5 | sink bound kept |
-| L1 Blast radius (light + healthy-vs-affected chart) | `HealthyP99`, `HealthyRejections` | M5 — **expected cut C1 → buffer 4:25–4:45** | chart M4 |
+| L1 Blast radius (light + healthy-vs-affected chart) | `HealthyP99`, `HealthyRejections` | M5 (built in the box; judged while a scenario runs) | chart M4 |
 | L2 KMS call economy (chart 3 + tenant detail; no light) | — | M4 upside (chart 3) + tenant detail (M4 cond.) | no light per spec |
 | L3 Self-healing (timeline + recovery time; no light) | — | M4 (`recovery_s`, restored line) | |
-| L4 Overload (light + delivered tile + backlog chart + within/over split) | `DeliveredPS`, `OverloadedWithinShare` | M5 — **expected cut C1 → buffer**; tile/split M3–M4 | |
+| L4 Overload (light + delivered tile + backlog chart + within/over split) | `DeliveredPS`, `OverloadedWithinShare` | M5 (built in the box; judged in the two global surges); tile/split M3–M4 | |
 
 ## 7. Checks (SPEC › Scope › Checks; P0_EXPLAINED › Checks)
 
@@ -273,10 +273,10 @@ Milestone column = the plan whose Files/Order of work delivers the item. "cut li
 | Scenario targets: surge rank and affected set | M3 | `SurgeTenantRank = 5`, `GlobalSurgeAffectedTop = 150` / rank 1, top 50 | yes (other half; M3 CR-2) |
 | Revocation timeline lines | M5 | two lines per episode (service audit + checker ground truth) / checker-only single line | yes (M5 CR-6) |
 | `#inflight` under slow KMS | M4 | card does not claim 32; must-see azure ≥ 5 and ≥ 5× / `SoftTTL` or `KMSTimeout` lever | plan-added |
-| C1 by evidence at 3:15 | M5 | decide L1/L4 from TIMELOG; expected cut / attempt in box | plan-added |
-| Stream lifetime | M5 | `StreamMaxAge = 55 min` + `event: reconnect` / rely on Cloud Run cut | yes |
-| Holder phasing | M5 (M0 defers) | grow in place, `TestHolderIdleRule` as buffer / prove by curl only | yes |
-| Tests | M5 (M1 variant) | `TestCheckerTurnsRed` required; storm + idle tests buffer / add store_test rows | yes |
+| C1 by evidence at 3:15 | M5 | decide L1/L4 from TIMELOG; expected cut / attempt in box | plan-added; **Ben 2026-09-23: in the box, six lights** |
+| Stream lifetime | M5 | `StreamMaxAge = 55 min` + `event: reconnect` / rely on Cloud Run cut | yes; **Ben 2026-09-23: recommended** |
+| Holder phasing | M5 (M0 defers) | grow in place, `TestHolderIdleRule` as buffer / prove by curl only | yes; **Ben 2026-09-23: grown in place, the test built** |
+| Tests | M5 (M1 variant) | `TestCheckerTurnsRed` required; storm + idle tests buffer / add store_test rows | yes; **Ben 2026-09-23: all three built in the box** |
 | Ben's parallel stream in M5 | M5 | Ben drafts `store.go` + `holder.go` + reset / ARCH fallback (README from 3:25) | plan-added |
 | Scenarios in the video | M6 | revocation → outage → tenant surge / global surge instead | plan-added |
 | Video format | M6 | one continuous take in a pause-capable recorder / silent capture + voice-over | plan-added |
