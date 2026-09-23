@@ -150,7 +150,7 @@ func (w *Workers) loop(ctx context.Context) {
 				w.release(ctx, batch, batch.Msgs[i:], "key not usable", err)
 				break
 			}
-			pt, err := cmek.Open(h, c.Clock.Now(), batch.Tenant, m.ID, cmek.Envelope{DEKID: m.DEKID, Nonce: m.Nonce, Ciphertext: m.Ciphertext})
+			pt, err := cmek.Open(h, c.Clock.Now(), batch.Tenant, m.ID, cmek.Envelope{DEKID: m.DEKID, Ciphertext: m.Ciphertext})
 			h.Zero()
 			if err != nil {
 				if errors.Is(err, cmek.ErrPoison) {

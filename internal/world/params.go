@@ -8,7 +8,7 @@ type Params struct {
 	// Population
 	Tenants   int      // 1000
 	Providers []string // {"aws","gcp","azure"}; grid index i belongs to Providers[i*len/Tenants] (contiguous bands)
-	Seed      int64    // 1; seeds the World's *rand.Rand; nonces and KEKs use crypto/rand
+	Seed      int64    // 1; seeds the World's *rand.Rand; DEKs, KEKs and IVs come from crypto/rand inside Tink
 
 	// Key lease (cmek)
 	Lease            time.Duration // 30s   hard TTL: revocation bound and max ride-through

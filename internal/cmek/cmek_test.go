@@ -12,22 +12,39 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tink-crypto/tink-go/v2/aead"
+	"github.com/tink-crypto/tink-go/v2/keyset"
+	"github.com/tink-crypto/tink-go/v2/tink"
+
 	"github.com/prabenzo/cmek/internal/kms"
 )
 
-func testHandle(t *testing.T, dekID string, validUntil time.Time) Handle {
+// testKeyset is one fresh DEK keyset as the fetcher builds it, and its primitive.
+func testKeyset(t *testing.T) (*keyset.Handle, tink.AEAD) {
 	t.Helper()
-	h := Handle{DEKID: dekID, ValidUntil: validUntil}
-	for i := range h.key {
-		h.key[i] = byte(i * 7)
+	kh, err := keyset.NewHandle(aead.AES256GCMNoPrefixKeyTemplate())
+	if err != nil {
+		t.Fatal(err)
 	}
-	return h
+	prim, err := aead.New(kh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return kh, prim
 }
 
-// TestEnvelope: round trip; wrong tenant, wrong msgID, wrong dekID in the AAD -> ErrPoison; a stale handle -> ErrLeaseExpired from Seal and Open.
+func testHandle(t *testing.T, dekID string, validUntil time.Time) (Handle, *keyset.Handle) {
+	t.Helper()
+	kh, prim := testKeyset(t)
+	return Handle{DEKID: dekID, ValidUntil: validUntil, prim: prim}, kh
+}
+
+// TestEnvelope: round trip; wrong tenant, wrong msgID, wrong dekID in the AAD -> ErrPoison; a stale handle -> ErrLeaseExpired
+// from Seal and Open; a flipped byte -> ErrPoison; a zeroed handle refuses; and the ciphertext is plain Tink AES-GCM: a
+// primitive built independently from the same keyset opens it with our AAD.
 func TestEnvelope(t *testing.T) {
 	now := time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC)
-	h := testHandle(t, "t-0042/1", now.Add(29*time.Second))
+	h, kh := testHandle(t, "t-0042/1", now.Add(29*time.Second))
 	pt := []byte(`{"event":"x","canary":"PLAINTEXT-CANARY-t-0042"}`)
 	env, err := Seal(h, now, "t-0042", 123, pt)
 	if err != nil {
@@ -46,7 +63,7 @@ func TestEnvelope(t *testing.T) {
 		{"round trip", "t-0042", 123, env, nil},
 		{"wrong tenant", "t-0043", 123, env, ErrPoison},
 		{"wrong msgID", "t-0042", 124, env, ErrPoison},
-		{"wrong dekID", "t-0042", 123, Envelope{DEKID: "t-0042/2", Nonce: env.Nonce, Ciphertext: env.Ciphertext}, ErrPoison},
+		{"wrong dekID", "t-0042", 123, Envelope{DEKID: "t-0042/2", Ciphertext: env.Ciphertext}, ErrPoison},
 	}
 	for _, r := range rows {
 		hh := h
@@ -77,8 +94,28 @@ func TestEnvelope(t *testing.T) {
 		t.Errorf("flipped byte: err = %v, want ErrPoison", err)
 	}
 	env2, _ := Seal(h, now, "t-0042", 123, pt)
-	if env2.Nonce == env.Nonce {
-		t.Error("two seals reused a nonce")
+	if bytes.Equal(env2.Ciphertext, env.Ciphertext) {
+		t.Error("two seals of one plaintext produced one ciphertext (IV reuse)")
+	}
+	// a zeroed handle refuses on both sides instead of sealing under nothing
+	z := h
+	z.Zero()
+	if _, err := Seal(z, now, "t-0042", 1, pt); !errors.Is(err, ErrDEKCold) {
+		t.Errorf("zeroed seal: err = %v, want ErrDEKCold", err)
+	}
+	if _, err := Open(z, now, "t-0042", 123, env); !errors.Is(err, ErrDEKCold) {
+		t.Errorf("zeroed open: err = %v, want ErrDEKCold", err)
+	}
+	// interop: Tink itself, from the same keyset, opens our ciphertext with our AAD (IV embedded, 12 + n + 16 bytes)
+	other, err := aead.New(kh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := other.Decrypt(env.Ciphertext, aad("t-0042", 123, "t-0042/1")); err != nil || !bytes.Equal(got, pt) {
+		t.Errorf("tink decrypt of our envelope: %q, %v", got, err)
+	}
+	if len(env.Ciphertext) != 12+len(pt)+16 {
+		t.Errorf("ciphertext length = %d, want %d (IV || ct || tag)", len(env.Ciphertext), 12+len(pt)+16)
 	}
 }
 
@@ -108,7 +145,7 @@ func (c *fakeClock) Advance(d time.Duration) {
 	c.mu.Unlock()
 }
 
-// latentKMS counts calls and moves the clock by d before delegating, so a reply lands d after its send.
+// latentKMS counts KMS round trips and moves the clock by d before delegating, so a reply lands d after its send.
 type latentKMS struct {
 	kms.KMS
 	clk   *fakeClock
@@ -116,16 +153,29 @@ type latentKMS struct {
 	calls atomic.Int64
 }
 
-func (l *latentKMS) GenerateDataKey(ctx context.Context, kekID string) (kms.DataKey, error) {
-	l.calls.Add(1)
-	l.clk.Advance(l.d)
-	return l.KMS.GenerateDataKey(ctx, kekID)
+func (l *latentKMS) KEK(kekID string) (tink.AEADWithContext, error) {
+	kek, err := l.KMS.KEK(kekID)
+	if err != nil {
+		return nil, err
+	}
+	return &latentKEK{l: l, kek: kek}, nil
 }
 
-func (l *latentKMS) Unwrap(ctx context.Context, kekID string, v int, wrapped []byte) ([32]byte, error) {
-	l.calls.Add(1)
-	l.clk.Advance(l.d)
-	return l.KMS.Unwrap(ctx, kekID, v, wrapped)
+type latentKEK struct {
+	l   *latentKMS
+	kek tink.AEADWithContext
+}
+
+func (k *latentKEK) EncryptWithContext(ctx context.Context, pt, ad []byte) ([]byte, error) {
+	k.l.calls.Add(1)
+	k.l.clk.Advance(k.l.d)
+	return k.kek.EncryptWithContext(ctx, pt, ad)
+}
+
+func (k *latentKEK) DecryptWithContext(ctx context.Context, ct, ad []byte) ([]byte, error) {
+	k.l.calls.Add(1)
+	k.l.clk.Advance(k.l.d)
+	return k.kek.DecryptWithContext(ctx, ct, ad)
 }
 
 type recorder struct {
@@ -225,6 +275,89 @@ func (r *rig) calls() int64 { return r.lat.calls.Load() }
 
 func (r *rig) state() State { return r.m.Info(rigTenant).State }
 
+// TestWrappedDEK: the deks row is a Tink keyset encrypted under the tenant's KEK. It opens only under that KEK with
+// the KEK id as associated data, parses as a one-key AES-256-GCM keyset whose primitive decrypts what the handle
+// sealed, fails under another KEK with AccessDenied, and, once the KEK is revoked, the same unwrap through Tink's
+// helper classifies Deny (the text path CodeFromText covers).
+func TestWrappedDEK(t *testing.T) {
+	r := newRig(t)
+	ctx := context.Background()
+	h, err := r.m.EncryptKey(ctx, rigTenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := Seal(h, r.clk.Now(), rigTenant, 7, []byte("payload"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.store.puts) != 1 {
+		t.Fatalf("puts = %d", len(r.store.puts))
+	}
+	w := r.store.puts[0]
+	if w.KEKID != rigKEK || w.KEKVersion != 1 || w.ID != h.DEKID {
+		t.Errorf("wrapped dek = %+v", w)
+	}
+	kek, err := r.fake.KEK(rigKEK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kh, err := keyset.ReadWithContext(ctx, keyset.NewBinaryReader(bytes.NewReader(w.Wrapped)), kek, []byte(rigKEK))
+	if err != nil {
+		t.Fatalf("unwrap under own KEK: %v", err)
+	}
+	if n := kh.Len(); n != 1 {
+		t.Errorf("keyset has %d keys, want 1", n)
+	}
+	if e, err := kh.Primary(); err != nil || e.Key() == nil {
+		t.Errorf("primary: %v", err)
+	}
+	prim, err := aead.New(kh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := prim.Decrypt(env.Ciphertext, aad(rigTenant, 7, h.DEKID)); err != nil || string(got) != "payload" {
+		t.Errorf("unwrapped keyset does not open the envelope: %q, %v", got, err)
+	}
+	if _, err := keyset.ReadWithContext(ctx, keyset.NewBinaryReader(bytes.NewReader(w.Wrapped)), kek, []byte("kek-other")); Classify(err) != Deny {
+		t.Errorf("other associated data: class %v, err %v", Classify(err), err)
+	}
+	other := kms.NewFake(kms.FakeConfig{Providers: []string{"aws"}, KEKs: []kms.KEKSpec{{ID: "kek-other", Provider: "aws"}}, Clock: r.clk, Rand: rand.New(rand.NewSource(2)), Lock: &sync.Mutex{}})
+	okek, _ := other.KEK("kek-other")
+	if _, err := keyset.ReadWithContext(ctx, keyset.NewBinaryReader(bytes.NewReader(w.Wrapped)), okek, []byte(rigKEK)); Classify(err) != Deny {
+		t.Errorf("another KEK: class %v, err %v", Classify(err), err)
+	} else if c, _ := kms.CodeFromText(err); c != kms.AccessDenied {
+		t.Errorf("another KEK: code %v, err %v", c, err)
+	}
+	r.fake.Revoke(rigKEK)
+	_, err = keyset.ReadWithContext(ctx, keyset.NewBinaryReader(bytes.NewReader(w.Wrapped)), kek, []byte(rigKEK))
+	if Classify(err) != Deny {
+		t.Errorf("revoked: class %v, err %v", Classify(err), err)
+	}
+	if c, _ := kms.CodeFromText(err); c != kms.KeyDisabled {
+		t.Errorf("revoked: code %v, err %v", c, err)
+	}
+	// the Manager's own denied call audits the trimmed cause, not Tink's prefix (the timeline shows Detail verbatim)
+	r.clk.Advance(16 * time.Second)
+	r.m.EncryptKey(ctx, rigTenant) // hot path: the handle is copied, then the soft-due renewal runs inline and is denied
+	if r.state() != Revoked {
+		t.Fatalf("state after the denied renewal = %v, want REVOKED", r.state())
+	}
+	r.rec.mu.Lock()
+	defer r.rec.mu.Unlock()
+	denied := 0
+	for _, e := range r.rec.entries {
+		if e.Op == "unwrap" && e.Outcome == "denied" {
+			denied++
+			if want := "kms gcp: KeyDisabled: " + rigKEK + " is disabled"; e.Detail != want {
+				t.Errorf("denied audit Detail = %q, want %q", e.Detail, want)
+			}
+		}
+	}
+	if denied != 1 {
+		t.Errorf("denied audits = %d, want 1", denied)
+	}
+}
+
 // TestClassify: the down-versus-revoked table, one row per input.
 func TestClassify(t *testing.T) {
 	rows := []struct {
@@ -243,6 +376,10 @@ func TestClassify(t *testing.T) {
 		{"unknown", errors.New("x"), Transient},
 		{"wrapped deny", fmt.Errorf("call: %w", &kms.Error{Code: kms.KeyDisabled}), Deny},
 		{"wrapped poison", fmt.Errorf("open: %w", ErrPoison), Poison},
+		{"tink-flattened deny", errors.New("keyset.Handle: decryption failed: kms gcp: KeyDisabled: kek is disabled"), Deny},
+		{"tink-flattened access denied", errors.New("keyset.Handle: keyset.Handle: encryption failed: kms aws: AccessDenied: no"), Deny},
+		{"tink-flattened unavailable", errors.New("keyset.Handle: decryption failed: kms gcp: Unavailable: injected fault"), Transient},
+		{"tink-flattened deadline", errors.New("keyset.Handle: decryption failed: context deadline exceeded"), Transient},
 	}
 	for _, r := range rows {
 		if got := Classify(r.err); got != r.want {

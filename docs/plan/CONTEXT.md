@@ -11,7 +11,7 @@ Nothing is to be built yet. Ben must approve each milestone's plan before any bu
 ## Environment facts (binding)
 - Repo: github.com/prabenzo/cmek, currently only README.md and docs/SPEC.md. Module path to use: `github.com/prabenzo/cmek`. Binary name: `killswitch` (cmd/killswitch).
 - Build machine in this session: Go 1.24.7 linux/amd64, Docker present, gcloud NOT present. Ben's laptop is assumed to have gcloud and Docker; Cloud Run deploys happen from Ben's machine (or a GitHub Actions workflow Ben sets up), never from this session.
-- Libraries allowed (spec): stdlib net/http, crypto/aes, crypto/cipher; golang.org/x/sync/singleflight; golang.org/x/time/rate; modernc.org/sqlite. uPlot for charts (vendored as a single JS + CSS file under web/, no npm).
+- Libraries allowed (spec, amended by TINK.md 2026-09-23): stdlib net/http; github.com/tink-crypto/tink-go/v2 for every byte of cryptography (its transitive modules google.golang.org/protobuf and golang.org/x/crypto ride along; no crypto/aes or crypto/cipher in the repo); golang.org/x/sync/singleflight; golang.org/x/time/rate; modernc.org/sqlite. uPlot for charts (vendored as a single JS + CSS file under web/, no npm).
 - `testing/synctest` is stretch X4 only; P0 tests use an injected clock.
 - Package layout from the spec (binding):
   cmd/killswitch/     HTTP server, embeds the UI, owns the World
@@ -76,7 +76,7 @@ Bullets with the mitigation.
 ## Architecture doc template (for the architecture stage)
 ```
 # Architecture and conventions
-## Package dependency graph (mermaid, arrows = imports; must be acyclic; internal/cmek imports only kms + stdlib + x/sync)
+## Package dependency graph (mermaid, arrows = imports; must be acyclic; internal/cmek imports only kms + logx + stdlib + x/sync + tink-go)
 ## World: struct, Params (every spec parameter with its demo default), lifecycle (New, Run, Reset, viewer count, idle pause, idle rebuild), goroutine inventory (name, rate, owner)
 ## Shared types and error sentinels (ids, states, classes, ingest outcomes → HTTP code + JSON body + Retry-After)
 ## Data flow: exact call sequences for (a) ingest, (b) delivery, (c) key fetch / lease renewal / probes / expiry, (d) fault injection, (e) checker reads, (f) SSE snapshot

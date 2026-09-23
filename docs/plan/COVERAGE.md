@@ -9,7 +9,7 @@ Milestone column = the plan whose Files/Order of work delivers the item. "cut li
 | Item | Spec ref | Milestone | Note |
 | --- | --- | --- | --- |
 | Ingest API `POST /v1/events`, same function for the load generator | Data path | M1 | `world.Ingest`/`IngestID`; admission inserted M3 |
-| Envelope encryption, AES-256-GCM, 96-bit nonce, AAD = tenant\|msgID\|dekID | Data path | M1 | `cmek.Seal`/`Open` (Ben writes) |
+| Envelope encryption, AES-256-GCM (tink-go, IV embedded), AAD = tenant\|msgID\|dekID | Data path | M1, TINK | `cmek.Seal`/`Open` |
 | SQLite queue (deks, messages tables, index, WAL, single writer) | Data path | M1 | schema + Insert/Claim/Ack/Release/Dead; Expire M3 (Ben, unwired) → wired M5; Census/CanaryFull M5 |
 | At-least-once via claim timeout (`Reclaim`) | Data path (P0_EXPLAINED binding) | M1 (optional) → M5 (unconditional) | consistent |
 | Fair round-robin scheduler (ring, skips parked) | Data path | M1 (plain ring) → M2 (`Gate.Hot`) → M3 (two-class) | |
