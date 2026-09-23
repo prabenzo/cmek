@@ -228,4 +228,18 @@ func TestProviderCallsPS(t *testing.T) {
 	if got := r.ProviderCallsPS("aws"); got != 0 {
 		t.Errorf("counter not reset per tick: %v", got)
 	}
+	// peaks: the maxima since ResetPeaks, per field and per key
+	r.ResetPeaks()
+	r.Audit(Audit{At: clk.now, Idx: 5, Op: "unwrap", Outcome: "ok"})
+	r.tick()
+	r.Audit(Audit{At: clk.now, Idx: 0, Op: "unwrap", Outcome: "ok"})
+	r.Audit(Audit{At: clk.now, Idx: 0, Op: "unwrap", Outcome: "ok"})
+	r.tick()
+	r.tick()
+	if pk := r.Peaks(); pk.KMSCallsPS != 4 || pk.ProviderCallsPS["azure"] != 2 || pk.ProviderCallsPS["aws"] != 4 {
+		t.Errorf("Peaks = %+v", pk)
+	}
+	if last := r.Last(); last.KMSCallsPS != 0 {
+		t.Errorf("Last after an idle tick = %+v", last)
+	}
 }

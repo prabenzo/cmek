@@ -41,6 +41,7 @@ Milestone column = the plan whose Files/Order of work delivers the item. "cut li
 | Scenario: slow KMS | Scenarios | M4 | |
 | Scenario: tenant surge | Scenarios | M3 | |
 | Scenario: global surge | Scenarios | M3 | 90 s (M3 decision) |
+| Scenario: no key cache (one band + blip 55 s; everyone + surge 90 s) | Scenarios | NOCACHE | added 2026-09-23 |
 | UI: scenario cards | UI | M4 | copy by Ben |
 | UI: tenant grid | UI | M4 | hover/pin = cut line, upside at 3:03 |
 | UI: 4 charts | UI | M4 | charts 1–2 base; 3–4 upside at 2:57 (cut line) |

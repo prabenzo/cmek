@@ -160,22 +160,24 @@ func newScenarios(w *World) *scenarios {
 				bandCalls, otherCalls, bandP99, healthyP99, parked = 0, 0, 0, 0, 0
 				latencyAll(true)
 				w.SetCache(cacheProv, false)
+				w.metrics.ResetPeaks()
 			}},
 			{name: "blip", dur: p.NoCacheBlip, enter: func() {
-				last := w.metrics.Last()
-				bandCalls, otherCalls, bandP99, healthyP99 = last.ProviderCallsPS[cacheProv], last.ProviderCallsPS[other], last.AffectedP99Ms, last.HealthyP99Ms
+				pk := w.metrics.Peaks()
+				bandCalls, otherCalls, bandP99, healthyP99 = pk.ProviderCallsPS[cacheProv], pk.ProviderCallsPS[other], pk.AffectedP99Ms, pk.HealthyP99Ms
+				w.metrics.ResetPeaks()
 				withLatency(cacheProv, "fast_fail")()
 			}},
 			{name: "cache_off", dur: p.NoCacheAfter, enter: func() {
-				parked = w.metrics.Last().ByState[2]
+				parked = w.metrics.Peaks().ByState[2]
 				withLatency(cacheProv, "ok")()
-				w.metrics.Timeline(fmt.Sprintf("no cache: the %s blip parked %d tenants KEY_UNAVAILABLE at once (with the cache: a yellow ride-through)", cacheProv, parked))
+				w.metrics.Timeline(fmt.Sprintf("no cache: the %s blip parked %d tenants KEY_UNAVAILABLE, each on its first event (with the cache: a yellow ride-through, no 503)", cacheProv, parked))
 			}},
 		},
 		exit: func() {
 			w.SetCache(cacheProv, true)
 			latencyAll(false)
-			w.metrics.Timeline(fmt.Sprintf("no cache (%s, %s): KMS calls %s %.0f/s vs %s %.0f/s · p99 affected %.0f ms vs healthy %.0f ms · blip: %d tenants KEY_UNAVAILABLE",
+			w.metrics.Timeline(fmt.Sprintf("no cache (%s, %s): KMS calls peaked at %s %.0f/s vs %s %.0f/s · p99 peaked at %.0f ms affected vs %.0f ms healthy · blip: %d tenants KEY_UNAVAILABLE",
 				cacheProv, p.NoCacheFor+p.NoCacheBlip+p.NoCacheAfter, cacheProv, bandCalls, other, otherCalls, bandP99, healthyP99, parked))
 		},
 	}
@@ -190,25 +192,27 @@ func newScenarios(w *World) *scenarios {
 				lead, surged = metricsReading{}, metricsReading{}
 				latencyAll(true)
 				w.SetCache("", false)
+				w.metrics.ResetPeaks()
 			}},
 			{name: "surge", dur: p.NoCacheSurgeFor, enter: func() {
 				lead = metricsReading(w.metrics.Last())
-				w.metrics.Timeline(fmt.Sprintf("no cache (everyone): delivered %.0f/s at %.0f/s accepted (capacity %.0f/s with the cache) · KMS calls %.0f/s", lead.DeliveredPS, lead.AcceptedPS, capacity, lead.KMSCallsPS))
+				w.metrics.Timeline(fmt.Sprintf("no cache (everyone): delivered %.0f/s at %.0f/s accepted (capacity %.0f/s with the cache) · KMS calls %.0f/s · backlog %d and climbing", lead.DeliveredPS, lead.AcceptedPS, capacity, lead.KMSCallsPS, lead.Backlog))
+				w.metrics.ResetPeaks()
 				w.gen.SetGlobal(p.GlobalSurgeMult)
 			}},
 			{name: "cache_off", dur: p.NoCacheSurgeAfter, enter: func() {
-				surged = metricsReading(w.metrics.Last())
+				surged = metricsReading(w.metrics.Peaks())
 				w.gen.SetGlobal(1)
-				w.metrics.Timeline(fmt.Sprintf("no cache + ×%g surge: delivered %.0f/s · KMS calls %.0f/s · in flight %s · %d tenants KEY_UNAVAILABLE · backlog %d (with the cache: delivered ≈ %.0f/s, KMS ≤ 70/s, backlog under its cap)",
-					p.GlobalSurgeMult, surged.DeliveredPS, surged.KMSCallsPS, inflightText(p.Providers, surged.Inflight), surged.ByState[2], surged.Backlog, capacity))
+				w.metrics.Timeline(fmt.Sprintf("no cache + ×%g surge, peaks: KMS calls %.0f/s · in flight %s · backlog %d · end-to-end p99 %.0f s · delivered never above %.0f/s (with the cache: delivered ≈ %.0f/s, KMS ≤ 70/s, backlog under its cap)",
+					p.GlobalSurgeMult, surged.KMSCallsPS, inflightText(p.Providers, surged.Inflight), surged.Backlog, surged.AffectedP99Ms/1000, surged.DeliveredPS, capacity))
 			}},
 		},
 		exit: func() {
 			w.gen.SetGlobal(1)
 			w.SetCache("", true)
 			latencyAll(false)
-			w.metrics.Timeline(fmt.Sprintf("no cache (everyone, %s): delivered %.0f/s before the surge and %.0f/s during it (capacity %.0f/s) · KMS calls %.0f/s and %.0f/s",
-				p.NoCacheSurgeLead+p.NoCacheSurgeFor+p.NoCacheSurgeAfter, lead.DeliveredPS, surged.DeliveredPS, capacity, lead.KMSCallsPS, surged.KMSCallsPS))
+			w.metrics.Timeline(fmt.Sprintf("no cache (everyone, %s): delivered %.0f/s before the surge at %.0f/s accepted, never above %.0f/s during it (capacity %.0f/s) · KMS calls %.0f/s, peak %.0f/s",
+				p.NoCacheSurgeLead+p.NoCacheSurgeFor+p.NoCacheSurgeAfter, lead.DeliveredPS, lead.AcceptedPS, surged.DeliveredPS, capacity, lead.KMSCallsPS, surged.KMSCallsPS))
 		},
 	}
 	rev := rank(p.RevokeTenantRank)

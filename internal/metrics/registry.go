@@ -131,6 +131,7 @@ type Registry struct {
 	rt        []rtCount     // per provider ACTIVE↔RIDING_THROUGH counts, flushed once per second
 	rtFlushed time.Time
 	last      Reading // the last tick's tiles, for scenario summary lines
+	peak      Reading // per-field maxima since ResetPeaks, for the same lines
 }
 
 // Reading is the last tick's headline numbers as a scenario's summary line reads them.
@@ -141,6 +142,24 @@ type Reading struct {
 	ByState                             [4]int
 	Backlog                             int
 	ProviderCallsPS                     map[string]float64
+}
+
+// ResetPeaks starts a new peak window (a scenario phase); Peaks returns the per-field maxima since (Inflight and
+// ProviderCallsPS hold each key's maximum, not one tick's).
+func (r *Registry) ResetPeaks() {
+	r.mu.Lock()
+	r.peak = Reading{Inflight: map[string]int{}, ProviderCallsPS: map[string]float64{}}
+	r.mu.Unlock()
+}
+
+// Peaks returns the maxima since ResetPeaks.
+func (r *Registry) Peaks() Reading {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := r.peak
+	out.Inflight = maps.Clone(r.peak.Inflight)
+	out.ProviderCallsPS = maps.Clone(r.peak.ProviderCallsPS)
+	return out
 }
 
 // Last returns the last tick's Reading (zero before the first tick).
@@ -666,6 +685,20 @@ func (r *Registry) tick() {
 		Inflight: maps.Clone(inflight), ByState: s.Tiles.ByState, Backlog: total, ProviderCallsPS: make(map[string]float64, len(r.cfg.Providers))}
 	for i, p := range r.cfg.Providers {
 		r.last.ProviderCallsPS[p] = float64(r.kmsProv[i].Swap(0)) * perSec
+	}
+	if r.peak.Inflight != nil { // a peak window is open
+		pk := &r.peak
+		pk.DeliveredPS, pk.KMSCallsPS, pk.AcceptedPS = max(pk.DeliveredPS, r.last.DeliveredPS), max(pk.KMSCallsPS, r.last.KMSCallsPS), max(pk.AcceptedPS, r.last.AcceptedPS)
+		pk.HealthyP99Ms, pk.AffectedP99Ms, pk.Backlog = max(pk.HealthyP99Ms, r.last.HealthyP99Ms), max(pk.AffectedP99Ms, r.last.AffectedP99Ms), max(pk.Backlog, total)
+		for i := range pk.ByState {
+			pk.ByState[i] = max(pk.ByState[i], s.Tiles.ByState[i])
+		}
+		for p, v := range inflight {
+			pk.Inflight[p] = max(pk.Inflight[p], v)
+		}
+		for p, v := range r.last.ProviderCallsPS {
+			pk.ProviderCallsPS[p] = max(pk.ProviderCallsPS[p], v)
+		}
 	}
 	// step 6: transitions
 	r.flushTransitions(now)
