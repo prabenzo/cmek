@@ -2,13 +2,16 @@
 package cmek
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"strconv"
 	"time"
 
-	"github.com/prabenzo/cmek/internal/kms"
+	"github.com/tink-crypto/tink-go/v2/aead"
+	"github.com/tink-crypto/tink-go/v2/keyset"
+	"github.com/tink-crypto/tink-go/v2/tink"
 )
 
 // errBusy is the per-tenant in-flight cap: unclassified, never audited, never fed to backoff.
@@ -18,18 +21,18 @@ var errBusy = errors.New("cmek: tenant inflight cap")
 // unclassified (world.Outcome answers 500 internal, which must stay at 0).
 var errStore = errors.New("cmek: dek store")
 
-// result is one KMS outcome as apply consumes it.
+// result is one KMS outcome as apply consumes it: the usable primitive and, for a generate, the wrapped keyset.
 type result struct {
 	sentAt  time.Time
 	class   Class
 	err     error
-	key     [32]byte
-	dk      kms.DataKey
+	prim    tink.AEAD
+	wrapped []byte
 	latency time.Duration
 }
 
 // call is the only function that touches kms.KMS: tenant cap → provider semaphore raced against a KMSTimeout
-// context → sentAt → Unwrap | GenerateDataKey → release → classify. It runs with t.mu released and emits no audit.
+// context → sentAt → KEK lookup → openDEK | newDEK → release → classify. It runs with t.mu released and emits no audit.
 func (m *Manager) call(t *tenant, op string, d *dek) result {
 	if m.cfg.TenantInflight > 0 {
 		t.mu.Lock()
@@ -56,10 +59,12 @@ func (m *Manager) call(t *tenant, op string, d *dek) result {
 	m.inflight[t.spec.Provider].Add(1)
 	var r result
 	r.sentAt = m.cfg.Clock.Now() // read after the semaphore, before the call: lease validity runs from here
-	if op == "generate" {
-		r.dk, r.err = m.cfg.Keys.GenerateDataKey(ctx, t.spec.KEKID)
+	if kek, err := m.cfg.Keys.KEK(t.spec.KEKID); err != nil {
+		r.err = err
+	} else if op == "generate" {
+		r.wrapped, r.prim, r.err = newDEK(ctx, kek, t.spec.KEKID)
 	} else {
-		r.key, r.err = m.cfg.Keys.Unwrap(ctx, t.spec.KEKID, d.kekVersion, d.wrapped)
+		r.prim, r.err = openDEK(ctx, kek, t.spec.KEKID, d.wrapped)
 	}
 	r.latency = m.cfg.Clock.Now().Sub(r.sentAt)
 	m.inflight[t.spec.Provider].Add(-1)
@@ -68,8 +73,36 @@ func (m *Manager) call(t *tenant, op string, d *dek) result {
 	return r
 }
 
-// renew runs one authorization call for the tenant behind singleflight: a GenerateDataKey when the tenant has no
-// DEK (or, on the cold path, an exhausted active one), else an Unwrap of the active DEK; then apply. Inside the
+// newDEK generates a fresh AES-256-GCM keyset locally (crypto/rand inside Tink) and wraps it under the KEK with one
+// KMS call (WriteWithContext); the wrapped keyset is what the deks table stores. The error of a failed call is
+// Tink's text around the adapter's error; Classify reads the code back through kms.CodeFromText.
+func newDEK(ctx context.Context, kek tink.AEADWithContext, kekID string) (wrapped []byte, prim tink.AEAD, err error) {
+	h, err := keyset.NewHandle(aead.AES256GCMNoPrefixKeyTemplate())
+	if err != nil {
+		return nil, nil, fmt.Errorf("cmek: new keyset: %w", err)
+	}
+	var buf bytes.Buffer
+	if err := h.WriteWithContext(ctx, keyset.NewBinaryWriter(&buf), kek, []byte(kekID)); err != nil {
+		return nil, nil, err
+	}
+	prim, err = aead.New(h)
+	if err != nil {
+		return nil, nil, fmt.Errorf("cmek: aead: %w", err)
+	}
+	return buf.Bytes(), prim, nil
+}
+
+// openDEK recovers the primitive from the wrapped keyset with one KMS call (ReadWithContext): renewal, probe, warm.
+func openDEK(ctx context.Context, kek tink.AEADWithContext, kekID string, wrapped []byte) (tink.AEAD, error) {
+	h, err := keyset.ReadWithContext(ctx, keyset.NewBinaryReader(bytes.NewReader(wrapped)), kek, []byte(kekID))
+	if err != nil {
+		return nil, err
+	}
+	return aead.New(h)
+}
+
+// renew runs one authorization call for the tenant behind singleflight: a generate when the tenant has no
+// DEK (or, on the cold path, an exhausted active one), else an unwrap of the active DEK; then apply. Inside the
 // flight it rechecks under t.mu whether the call is still needed, because a concurrent flight may have landed
 // between the caller's decision and this one: two cold callers never generate two DEKs, and two probes never
 // unwrap twice for one need. cold means the caller needs a usable handle now; a probe needs a renewal. [SC-F2]
@@ -106,7 +139,7 @@ func (m *Manager) satisfied(t *tenant, cold bool) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	d := t.active
-	fresh := d != nil && d.key != nil && t.lease.Usable(now) && !(t.state == Active && m.exhausted(d, now))
+	fresh := d != nil && d.prim != nil && t.lease.Usable(now) && !(t.state == Active && m.exhausted(d, now))
 	if cold {
 		return fresh
 	}
@@ -126,7 +159,7 @@ func (m *Manager) probe(t *tenant) {
 func (m *Manager) warm(t *tenant, d *dek) {
 	m.sf.Do(t.spec.ID+"/"+d.id, func() (any, error) {
 		t.mu.Lock()
-		hot := d.key != nil
+		hot := d.prim != nil
 		if hot {
 			delete(t.pending, d.id)
 		}
@@ -147,7 +180,7 @@ func (m *Manager) clearProbing(t *tenant) {
 	t.mu.Unlock()
 }
 
-// generate calls GenerateDataKey, allocates "<t>/<seq+1>" on success, persists the wrapped form BEFORE apply, then
+// generate runs newDEK, allocates "<t>/<seq+1>" on success, persists the wrapped keyset BEFORE apply, then
 // installs the DEK as active through apply. A PutDEK error is not a KMS outcome: no state change, no audit, no
 // backoff (like errBusy); the store error goes back unclassified and a Tick-spawned probe simply retries next sweep.
 func (m *Manager) generate(t *tenant) (*dek, result) {
@@ -159,7 +192,7 @@ func (m *Manager) generate(t *tenant) (*dek, result) {
 	now := m.cfg.Clock.Now()
 	t.mu.Lock()
 	t.seq++
-	d := &dek{id: t.spec.ID + "/" + strconv.Itoa(t.seq), wrapped: r.dk.Wrapped, kekVersion: r.dk.KEKVersion, createdAt: now}
+	d := &dek{id: t.spec.ID + "/" + strconv.Itoa(t.seq), wrapped: r.wrapped, kekVersion: 1, createdAt: now}
 	t.mu.Unlock()
 	if err := m.cfg.Store.PutDEK(m.ctx, WrappedDEK{ID: d.id, Tenant: t.spec.ID, KEKID: t.spec.KEKID, KEKVersion: d.kekVersion, Wrapped: d.wrapped, CreatedAt: now}); err != nil {
 		m.log.Error("dek store write failed", "tenant", t.spec.ID, "dek", d.id, "err", err)
@@ -202,13 +235,11 @@ func (m *Manager) apply(t *tenant, op string, d *dek, r result) {
 		}
 		m.audit(Audit{At: now, Tenant: t.spec.ID, Op: auditOp, Outcome: "ok", Detail: detail, KEKVersion: d.kekVersion, Class: OK, Latency: r.latency})
 		t.lease.Renew(r.sentAt)
-		key := r.key
 		if op == "generate" {
-			key = r.dk.Plaintext
 			t.deks[d.id] = d
 			t.active = d
 		}
-		d.key = &key
+		d.prim = r.prim
 		d.hotSince = now
 		t.attempt = 0
 		delete(t.pending, d.id)

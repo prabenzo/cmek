@@ -2,7 +2,9 @@
 package world
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"math"
@@ -11,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 type testClock struct {
@@ -225,5 +229,61 @@ func TestScenarioRunner(t *testing.T) {
 	}
 	if _, running, _ := w.metrics.Scenario(); running {
 		t.Fatal("revocation still running 3 s after Restore")
+	}
+}
+
+// TestNoPlaintextAtRest (S1's mechanism): with no workers running, every ingested row sits in the messages table as
+// a Tink ciphertext longer than the payload by the IV and the tag, and neither the canary nor any JSON of the payload
+// appears in it; the deks table holds only wrapped keysets.
+func TestNoPlaintextAtRest(t *testing.T) {
+	dir := t.TempDir()
+	p := Small()
+	p.DBDir = dir
+	w, err := New(p, Deps{ID: "rest", Clock: &testClock{now: time.Date(2026, 9, 23, 0, 0, 0, 0, time.UTC)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+	const n = 12
+	for i := 0; i < n; i++ {
+		tenant := fmt.Sprintf("t-%04d", i%p.Tenants)
+		payload := fmt.Sprintf(`{"canary":"%s%s","i":%d}`, p.CanaryPrefix, tenant, i)
+		if err := w.Ingest(context.Background(), tenant, []byte(payload)); err != nil {
+			t.Fatalf("ingest %d: %v", i, err)
+		}
+	}
+	db, err := sql.Open("sqlite", filepath.Join(dir, fmt.Sprintf("killswitch-%d-rest.db", os.Getpid())))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.Query(`SELECT tenant_id, ciphertext FROM messages`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		var tenant string
+		var ct []byte
+		if err := rows.Scan(&tenant, &ct); err != nil {
+			t.Fatal(err)
+		}
+		count++
+		for _, needle := range []string{p.CanaryPrefix, `"canary"`, `"i":`, tenant} {
+			if bytes.Contains(ct, []byte(needle)) {
+				t.Errorf("row of %s: ciphertext contains %q", tenant, needle)
+			}
+		}
+		if min := 12 + len(`{"canary":"`) + len(p.CanaryPrefix) + 16; len(ct) < min {
+			t.Errorf("row of %s: ciphertext is %d bytes, shorter than IV + payload + tag (%d)", tenant, len(ct), min)
+		}
+	}
+	if count != n {
+		t.Errorf("messages at rest = %d, want %d", count, n)
+	}
+	var deks int
+	if err := db.QueryRow(`SELECT count(*) FROM deks WHERE length(wrapped_dek) > 64`).Scan(&deks); err != nil || deks < 1 {
+		t.Errorf("wrapped deks = %d (%v), want at least one keyset-sized blob", deks, err)
 	}
 }

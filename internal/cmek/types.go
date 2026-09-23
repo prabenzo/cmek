@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/tink-crypto/tink-go/v2/tink"
+
 	"github.com/prabenzo/cmek/internal/kms"
 )
 
@@ -60,22 +62,24 @@ func (c Class) String() string {
 	return "unknown"
 }
 
-// Envelope is one message's ciphertext plus what is needed to open it; AAD is derived, never stored.
+// Envelope is one message's ciphertext plus what is needed to open it: the DEK id and Tink's AES-256-GCM output
+// (IV || ciphertext || tag). AAD is derived, never stored.
 type Envelope struct {
 	DEKID      string
-	Nonce      [12]byte
 	Ciphertext []byte
 }
 
-// Handle is a copy of one plaintext DEK, usable until ValidUntil; Zero wipes it.
+// Handle is one usable DEK primitive until ValidUntil; Seal never blocks and never touches a lock. The primitive is
+// shared with the cache (Tink primitives are immutable and safe for concurrent use); Zero drops this reference.
 type Handle struct {
 	DEKID      string
 	ValidUntil time.Time
-	key        [32]byte
+	prim       tink.AEAD
 }
 
-// Zero wipes the key bytes.
-func (h *Handle) Zero() { h.key = [32]byte{} }
+// Zero drops the handle's reference to the key. Tink holds key material in ordinary Go memory and offers no
+// zeroization: plaintext DEKs are dropped on purge and collected, never wiped in place.
+func (h *Handle) Zero() { h.prim = nil }
 
 // WrappedDEK is what DEKStore persists: wrapped bytes only.
 type WrappedDEK struct {
@@ -127,7 +131,7 @@ type Auditor interface{ Audit(e Audit) }
 // Clock is the only time source the core reads.
 type Clock interface{ Now() time.Time }
 
-// Jitter is the only randomness the core reads (backoff); nonces come from crypto/rand inside Seal.
+// Jitter is the only randomness the core reads (backoff); Tink draws the IVs and the DEKs from crypto/rand.
 type Jitter interface{ Float64() float64 }
 
 // Config carries the lease parameters and injected dependencies; zero Spawn means go f().

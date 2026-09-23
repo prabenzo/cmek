@@ -81,14 +81,14 @@ func (m *Manager) exhausted(d *dek, now time.Time) bool {
 	return d.msgs >= m.cfg.DEKMaxMessages || now.Sub(d.createdAt) >= m.cfg.DEKMaxAge
 }
 
-// handle copies the active key into a Handle when the tenant may seal now; caller holds t.mu.
+// handle wraps the active primitive in a Handle when the tenant may seal now; caller holds t.mu.
 func (m *Manager) handle(t *tenant, now time.Time) (Handle, bool) {
 	d := t.active
-	if d == nil || d.key == nil || !t.lease.Usable(now) || (t.state == Active && m.exhausted(d, now)) {
+	if d == nil || d.prim == nil || !t.lease.Usable(now) || (t.state == Active && m.exhausted(d, now)) {
 		return Handle{}, false
 	}
 	d.msgs++
-	return Handle{DEKID: d.id, ValidUntil: t.lease.Until(), key: *d.key}, true
+	return Handle{DEKID: d.id, ValidUntil: t.lease.Until(), prim: d.prim}, true
 }
 
 // EncryptKey returns a handle on the tenant's active DEK, fetching synchronously on the cold path; parked tenants
@@ -143,7 +143,7 @@ func (m *Manager) EncryptKey(ctx context.Context, id string) (Handle, error) {
 	return Handle{}, ErrKeyUnavailable
 }
 
-// DecryptKey checks the lease now and returns a copy of the named DEK; ErrPoison for a dek_id the tenant does not
+// DecryptKey checks the lease now and returns a handle on the named DEK; ErrPoison for a dek_id the tenant does not
 // own [SC-F8]; it never blocks and never calls a KMS.
 func (m *Manager) DecryptKey(id, dekID string) (Handle, error) {
 	t := m.tenants[id]
@@ -166,10 +166,10 @@ func (m *Manager) DecryptKey(id, dekID string) (Handle, error) {
 	if !t.lease.Usable(now) {
 		return Handle{}, ErrLeaseExpired
 	}
-	if d.key == nil {
+	if d.prim == nil {
 		return Handle{}, ErrDEKCold
 	}
-	return Handle{DEKID: dekID, ValidUntil: t.lease.Until(), key: *d.key}, nil
+	return Handle{DEKID: dekID, ValidUntil: t.lease.Until(), prim: d.prim}, nil
 }
 
 // Hot reports whether the scheduler may dispatch the tenant now (ACTIVE or RIDING_THROUGH, usable lease, no pending
@@ -240,9 +240,8 @@ func (m *Manager) Tick(now time.Time) {
 		}
 		// 2. DEK ageing applies only to non-active DEKs [SC-F3]
 		for _, d := range t.deks {
-			if d != t.active && d.key != nil && now.Sub(d.hotSince) >= m.cfg.DEKMaxAge+m.cfg.Lease {
-				*d.key = [32]byte{}
-				d.key = nil
+			if d != t.active && d.prim != nil && now.Sub(d.hotSince) >= m.cfg.DEKMaxAge+m.cfg.Lease {
+				d.prim = nil
 				m.audit(Audit{At: now, Tenant: t.spec.ID, Op: "purge", Outcome: "aged", Detail: d.id, Purged: 1})
 			}
 		}
