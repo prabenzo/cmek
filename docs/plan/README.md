@@ -27,6 +27,7 @@ These are the build plans for the seven milestones in `docs/SPEC.md › Plan and
 | M4 UI and scenarios | 2:20–3:15 | [M4.md](M4.md) | [x] 2026-09-22, chat | all as recommended for the build; the UI decisions are reviewed by Ben in his browser testing after the push; Claude writes everything incl. `hist.go`, its test and the card copy; build starts once M3 merges |
 | M5 Checker and hardening | 3:15–3:40 | [M5.md](M5.md) | [ ] | standing: Claude writes everything incl. `holder.go`, reset and the README draft; Ben deploys, runs the clean-browser check, reviews; the rest open |
 | M6 Rationale | 3:40–4:25 | [M6.md](M6.md) | [ ] | standing: Claude writes every file; Ben reviews, records the video, exports his transcripts, deploys; the rest open |
+| Tink adoption (side branch `claude/tink-go`, merges into the M4 pull request) | — | [TINK.md](TINK.md) | [ ] | replace the hand-rolled AES-GCM in `internal/cmek/envelope.go` and `internal/kms/fake.go` with tink-go; cmek keeps only leases and caching; every decision's first option recommended; the spec's library list is amended on approval |
 
 ## Decisions recorded so far
 
