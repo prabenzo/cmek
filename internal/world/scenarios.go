@@ -23,8 +23,9 @@ type phase struct {
 }
 
 // scenario is a scripted fault or surge (Q19): targets is the declared affected set, evaluated at Start and handed
-// to metrics.SetTargets (Q8); phases run in order; exit restores whatever enter changed and is idempotent; scope
-// names the affected set in the restored line; marker is the timeline line posted at Start.
+// to metrics.SetTargets (Q8); phases run in order; exit restores whatever enter changed and is idempotent; summary,
+// when set, posts the run's numbers and runs only after a natural end (a stopped run has no finding to report);
+// scope names the affected set in the restored line; marker is the timeline line posted at Start.
 type scenario struct {
 	name    string
 	scope   string
@@ -32,6 +33,7 @@ type scenario struct {
 	targets func() []int
 	phases  []phase
 	exit    func()
+	summary func()
 }
 
 // scenarios owns the single runner goroutine; at most one scenario runs per World. cancel, done and signal are nil
@@ -177,6 +179,8 @@ func newScenarios(w *World) *scenarios {
 		exit: func() {
 			w.SetCache(cacheProv, true)
 			latencyAll(false)
+		},
+		summary: func() {
 			w.metrics.Timeline(fmt.Sprintf("no cache (%s, %s): KMS calls peaked at %s %.0f/s vs %s %.0f/s · p99 peaked at %.0f ms affected vs %.0f ms healthy · blip: %d tenants KEY_UNAVAILABLE",
 				cacheProv, p.NoCacheFor+p.NoCacheBlip+p.NoCacheAfter, cacheProv, bandCalls, other, otherCalls, bandP99, healthyP99, parked))
 		},
@@ -211,6 +215,8 @@ func newScenarios(w *World) *scenarios {
 			w.gen.SetGlobal(1)
 			w.SetCache("", true)
 			latencyAll(false)
+		},
+		summary: func() {
 			w.metrics.Timeline(fmt.Sprintf("no cache (everyone, %s): delivered %.0f/s before the surge at %.0f/s accepted, never above %.0f/s during it (capacity %.0f/s) · KMS calls %.0f/s, peak %.0f/s",
 				p.NoCacheSurgeLead+p.NoCacheSurgeFor+p.NoCacheSurgeAfter, lead.DeliveredPS, lead.AcceptedPS, surged.DeliveredPS, capacity, lead.KMSCallsPS, surged.KMSCallsPS))
 		},
@@ -348,6 +354,9 @@ func (s *scenarios) run(ctx context.Context, cancel context.CancelFunc, sc *scen
 	}
 	sc.exit()
 	if !cancelled {
+		if sc.summary != nil {
+			sc.summary()
+		}
 		s.tail(ctx, sc)
 	}
 	s.mu.Lock()

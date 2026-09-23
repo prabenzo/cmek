@@ -420,4 +420,30 @@ func TestNoCacheScenarios(t *testing.T) {
 	if !found {
 		t.Error("the global summary line was not posted")
 	}
+	// a stopped run restores everything but posts no summary line
+	count := func(prefix string) int {
+		n := 0
+		for _, l := range lines() {
+			if strings.HasPrefix(l, prefix) {
+				n++
+			}
+		}
+		return n
+	}
+	before := count("no cache (" + p.NoCacheProvider)
+	if err := w.StartScenario("no_cache"); err != nil {
+		t.Fatal(err)
+	}
+	if name := w.StopScenario(); name != "no_cache" {
+		t.Errorf("stop returned %q", name)
+	}
+	if got := count("no cache (" + p.NoCacheProvider); got != before {
+		t.Errorf("a stopped run posted a summary line (%d → %d)", before, got)
+	}
+	if err := w.Ingest(ctx, in, payload(in)); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.keys.Info(in).HotDEKs; got != 1 {
+		t.Errorf("cache not back after a stopped run: hot %d", got)
+	}
 }

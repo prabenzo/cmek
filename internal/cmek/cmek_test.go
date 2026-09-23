@@ -858,4 +858,31 @@ func TestPassThrough(t *testing.T) {
 	if _, err := m.EncryptKey(ctx, rigTenant); err != nil || r.calls() != c+1 {
 		t.Errorf("second seal with the cache back: err %v, calls %d (want %d)", err, r.calls(), c+1)
 	}
+	// concurrent first events on a DEK-less pass-through tenant generate one DEK (the generate flight), and every
+	// caller seals with it
+	r2 := newRig(t)
+	r2.m.SetPassThrough(rigTenant, true)
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int64) {
+			defer wg.Done()
+			h, err := r2.m.EncryptKey(ctx, rigTenant)
+			if err == nil {
+				_, err = Seal(h, r2.clk.Now(), rigTenant, i, pt)
+			}
+			errs <- err
+		}(int64(i))
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent first event: %v", err)
+		}
+	}
+	if len(r2.store.puts) != 1 || r2.rec.count("generate", "ok") != 1 || r2.m.Info(rigTenant).DEKs != 1 {
+		t.Errorf("concurrent first events: puts %d, generate audits %d, DEKs %d; want one of each", len(r2.store.puts), r2.rec.count("generate", "ok"), r2.m.Info(rigTenant).DEKs)
+	}
 }

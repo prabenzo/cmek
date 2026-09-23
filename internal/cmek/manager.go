@@ -104,23 +104,40 @@ func (m *Manager) SetPassThrough(id string, on bool) {
 	}
 }
 
-// passThroughEncrypt is EncryptKey without the cache: one KMS call (a generate for a tenant with no DEK or an
-// exhausted one, else an unwrap of the active DEK) made directly, outside singleflight, and its primitive handed
-// to the caller once. Called with t.mu released, after the parked-state returns.
+// passThroughEncrypt is EncryptKey without the cache: one KMS call per request and its primitive handed to the
+// caller once. An unwrap of the active DEK is made directly, outside singleflight (the per-request cost the demo
+// shows); a generate (no DEK yet, or the active one exhausted) goes through the "<t>/generate" flight with the
+// need rechecked inside it, so concurrent first events still produce one DEK, as in the cached design, and the
+// joiners use that call's primitive. Called with t.mu released, after the parked-state returns.
 func (m *Manager) passThroughEncrypt(t *tenant) (Handle, error) {
-	now := m.cfg.Clock.Now()
-	t.mu.Lock()
-	d := t.active
-	gen := d == nil || (t.state == Active && m.exhausted(d, now))
-	t.mu.Unlock()
-	var r result
-	if gen {
-		d, r = m.generate(t)
-	} else {
-		r = m.call(t, "unwrap", d)
-		m.apply(t, "unwrap", d, r)
+	needGen := func() (*dek, bool) {
+		now := m.cfg.Clock.Now()
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		d := t.active
+		return d, d == nil || (t.state == Active && m.exhausted(d, now))
 	}
-	return m.passThroughHandle(t, d, r, true)
+	d, gen := needGen()
+	if !gen {
+		r := m.call(t, "unwrap", d)
+		m.apply(t, "unwrap", d, r)
+		return m.passThroughHandle(t, d, r, true)
+	}
+	type generated struct {
+		d *dek
+		r result
+	}
+	v, _, _ := m.sf.Do(t.spec.ID+"/generate", func() (any, error) {
+		if d, still := needGen(); !still { // a concurrent flight has just generated: use its DEK with one unwrap
+			r := m.call(t, "unwrap", d)
+			m.apply(t, "unwrap", d, r)
+			return generated{d, r}, nil
+		}
+		d, r := m.generate(t)
+		return generated{d, r}, nil
+	})
+	g := v.(generated)
+	return m.passThroughHandle(t, g.d, g.r, true)
 }
 
 // passThroughHandle maps one direct call's result to a Handle or the caller's sentinel; count is true for a seal.
