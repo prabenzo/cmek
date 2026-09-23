@@ -858,8 +858,10 @@ func TestPassThrough(t *testing.T) {
 	if _, err := m.EncryptKey(ctx, rigTenant); err != nil || r.calls() != c+1 {
 		t.Errorf("second seal with the cache back: err %v, calls %d (want %d)", err, r.calls(), c+1)
 	}
-	// concurrent first events on a DEK-less pass-through tenant generate one DEK (the generate flight), and every
-	// caller seals with it
+	// concurrent first events on a DEK-less pass-through tenant generate one DEK (the generate flight). A caller
+	// either seals with it or, arriving after the flight and finding two calls already in flight for the tenant
+	// (TenantInflight = 2 in the rig), gets the cap's ErrKeyUnavailable: per-request calls run into the cap, as the
+	// card says. Nothing else may fail, and at least one caller seals.
 	r2 := newRig(t)
 	r2.m.SetPassThrough(rigTenant, true)
 	var wg sync.WaitGroup
@@ -877,10 +879,18 @@ func TestPassThrough(t *testing.T) {
 	}
 	wg.Wait()
 	close(errs)
+	sealed := 0
 	for err := range errs {
-		if err != nil {
+		switch {
+		case err == nil:
+			sealed++
+		case errors.Is(err, ErrKeyUnavailable): // the per-tenant in-flight cap
+		default:
 			t.Errorf("concurrent first event: %v", err)
 		}
+	}
+	if sealed == 0 {
+		t.Error("no concurrent first event sealed")
 	}
 	if len(r2.store.puts) != 1 || r2.rec.count("generate", "ok") != 1 || r2.m.Info(rigTenant).DEKs != 1 {
 		t.Errorf("concurrent first events: puts %d, generate audits %d, DEKs %d; want one of each", len(r2.store.puts), r2.rec.count("generate", "ok"), r2.m.Info(rigTenant).DEKs)
