@@ -338,8 +338,9 @@ func TestWrappedDEK(t *testing.T) {
 	}
 	// the Manager's own denied call audits the trimmed cause, not Tink's prefix (the timeline shows Detail verbatim)
 	r.clk.Advance(16 * time.Second)
-	if _, err := r.m.EncryptKey(ctx, rigTenant); !errors.Is(err, ErrKeyRevoked) {
-		t.Fatalf("EncryptKey after revoke: %v", err)
+	r.m.EncryptKey(ctx, rigTenant) // hot path: the handle is copied, then the soft-due renewal runs inline and is denied
+	if r.state() != Revoked {
+		t.Fatalf("state after the denied renewal = %v, want REVOKED", r.state())
 	}
 	r.rec.mu.Lock()
 	defer r.rec.mu.Unlock()
