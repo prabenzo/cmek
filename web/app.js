@@ -157,16 +157,34 @@ function bindCards() {
   $('restore').onclick = () => { const id = targetTenant(); if (id) post('/v1/tenants/' + id + '/key', { action: 'restore' }); };
   $('reset').onclick = onReset;
   $('cardtoggle').onclick = () => setCards(document.body.classList.contains('nocards'));
-  let show = true;
-  try { show = localStorage.getItem('cards') !== 'hidden'; } catch (e) { /* storage blocked: cards stay shown */ }
+  document.querySelectorAll('.card .hide').forEach(b => b.onclick = () => hideCard(b.closest('.card').dataset.scenario, true));
+  document.querySelector('#hiddencards a').onclick = () => document.querySelectorAll('.card.hidden').forEach(c => hideCard(c.dataset.scenario, false));
+  let show = true, hidden = [];
+  try {
+    show = localStorage.getItem('cards') !== 'hidden';
+    hidden = JSON.parse(localStorage.getItem('cards.hidden') || '[]');
+  } catch (e) { /* storage blocked: every card stays shown */ }
   setCards(show);
+  document.querySelectorAll('.card').forEach(c => hideCard(c.dataset.scenario, hidden.includes(c.dataset.scenario)));
 }
 
-// setCards shows or hides the scenario column (a per-viewer preference, remembered in this browser only).
+// setCards shows or hides the whole scenario column (a per-viewer preference, remembered in this browser only).
 function setCards(show) {
   document.body.classList.toggle('nocards', !show);
   $('cardtoggle').textContent = show ? 'Hide cards' : 'Show cards';
   try { localStorage.setItem('cards', show ? 'shown' : 'hidden'); } catch (e) { /* storage blocked */ }
+}
+
+// hideCard hides or shows one card (keyed by its data-scenario), remembers the set and keeps the "n hidden · show
+// all cards" line current.
+function hideCard(key, hide) {
+  const card = document.querySelector('.card[data-scenario="' + key + '"]');
+  if (card) card.classList.toggle('hidden', hide);
+  const hidden = [...document.querySelectorAll('.card.hidden')];
+  const line = $('hiddencards');
+  line.classList.toggle('on', hidden.length > 0);
+  line.querySelector('span').textContent = hidden.length + (hidden.length === 1 ? ' card hidden' : ' cards hidden');
+  try { localStorage.setItem('cards.hidden', JSON.stringify(hidden.map(c => c.dataset.scenario))); } catch (e) { /* storage blocked */ }
 }
 
 function onReset() { post('/v1/reset'); } // the stream ends with the old World; the reconnect's first snapshot carries the new id and resets the page

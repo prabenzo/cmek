@@ -23,7 +23,13 @@
   button:disabled { opacity:.45; cursor:not-allowed; }
   main { display:grid; grid-template-columns:320px 862px 1fr; gap:14px; padding:14px 20px; align-items:start; }
   #cards { display:flex; flex-direction:column; gap:10px; }
-  .card { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:10px 12px; }
+  .card { position:relative; background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:10px 12px; }
+  .card.hidden { display:none; }
+  .card .hide { position:absolute; top:6px; right:8px; padding:0 6px; font-size:14px; line-height:20px; color:var(--dim); background:none; border:none; }
+  .card .hide:hover { color:var(--fg); background:none; }
+  #hiddencards { display:none; font-size:12.5px; color:var(--dim); }
+  #hiddencards.on { display:block; }
+  #hiddencards a { color:var(--fg); cursor:pointer; text-decoration:underline; }
   .card h3 { margin:0 0 4px; font-size:14px; }
   .card p { margin:0 0 8px; color:var(--dim); font-size:12.5px; }
   .card .row { display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
@@ -69,7 +75,7 @@
 <body>
 <header>
   <button id="reset" title="Stop this World and build a fresh one: new id, empty queue, every key restored">Reset world</button>
-  <button id="cardtoggle" title="Show or hide the scenario cards; a running scenario keeps running and the timeline still reports it">Hide cards</button>
+  <button id="cardtoggle" title="Show or hide the scenario column; a running scenario keeps running and the timeline still reports it. Each card has its own × as well">Hide cards</button>
   <h1>Killswitch <span id="banner">connecting…</span></h1>
   <p>Customer-managed encryption keys (CMEK) let each tenant own the key that protects its data: revoke the key and the provider can no longer read it. This is a multi-tenant webhook queue where every message is sealed under a per-tenant data key that is itself wrapped by that tenant's KMS key, leased for at most 30 s.</p>
   <p>The thesis: one tenant's KMS trouble, revocation or traffic surge changes nothing for the other 999, and no plaintext is ever decrypted after a key is revoked. Below, 1,000 tenants across three simulated KMS providers run at about 300 events/s; each card injects a fault or a surge and says what to watch.</p>
@@ -78,41 +84,42 @@
 <main>
   <section id="cards">
     <div class="card" data-scenario="no_cache no_cache_surge">
-      <h3>No key cache</h3>
+      <h3>No key cache</h3><button class="hide" title="Hide this card (a running scenario keeps running)">×</button>
       <p>The naive integration: no lease, no DEK cache, every event is one KMS call to seal and another to deliver, with every provider at a realistic 20 ms. <b>One band + blip (55 s):</b> gcp tenants lose the cache. KMS calls/s jump from ~30 to ~190 (chart 3), the gcp p99 climbs to ~80–110 ms and the healthy line rises with it, because each gcp delivery now holds a shared worker for a KMS round trip (L1 can go red). At 30 s the same 10 s gcp blip the outage card shows as harmless parks ~190 tenants with <code>503 key_unavailable</code>. <b>Everyone + surge (90 s):</b> every tenant loses the cache: delivered drops to ~200/s against ~300/s offered, then the Global surge card's 5× arrives at 15 s. KMS calls peak near 1,600/s, the backlog hits its cap, admission sheds ~1,100 events/s and end-to-end p99 reaches tens of seconds for everyone; L4 goes red. The cache returns at 90 s and the backlog drains in about a minute.</p>
       <div class="row"><button data-start="no_cache">Start one band + blip</button><button data-start="no_cache_surge">Start everyone + surge</button><button data-stop>Stop</button></div>
       <div class="status"></div>
     </div>
     <div class="card" data-scenario="provider_blip provider_outage">
-      <h3>Provider outage</h3>
+      <h3>Provider outage</h3><button class="hide" title="Hide this card (a running scenario keeps running)">×</button>
       <p>gcp fast-fails. <b>Blip (10 s):</b> up to a third of the grid turns yellow as renewals fail, a few cold cells go orange with one 503, then everything is green within ~12 s of the clear; no chart moves. <b>Outage (60 s):</b> yellow spreads over 0–15 s with no customer impact; from ~9 s leases lapse at staggered times, cells turn orange and those tenants get <code>503 key_unavailable</code>. aws and azure stay flat. Calls to gcp decay through backoff. On restore, green within ~10 s and the parked messages deliver.</p>
       <div class="row"><button data-start="provider_blip">Start blip</button><button data-start="provider_outage">Start outage</button><button data-stop>Stop</button></div>
       <div class="status"></div>
     </div>
     <div class="card" data-scenario="key_revocation">
-      <h3>Key revocation</h3>
+      <h3>Key revocation</h3><button class="hide" title="Hide this card (a running scenario keeps running)">×</button>
       <p>The KMS key of one high-traffic tenant (rank 3) is disabled. Its cell turns purple, typically within 15 s and always within 30 s; ingest for it returns <code>403 key_revoked</code>; the timeline shows REVOKED and the data keys purged; nothing of its is decrypted after that. Click <b>Restore</b>: the re-probe sees it within 5 s and the parked messages deliver.</p>
       <div class="row"><button data-start="key_revocation">Start</button><button data-stop>Stop</button><button id="restore" disabled>Restore</button></div>
       <div class="status"></div>
     </div>
     <div class="card" data-scenario="slow_kms">
-      <h3>Slow KMS</h3>
+      <h3>Slow KMS</h3><button class="hide" title="Hide this card (a running scenario keeps running)">×</button>
       <p>azure latency rises to p50 400 ms / p99 3 s against a 500 ms timeout, for 60 s. Azure cells flicker yellow; cold azure tenants see slow ingest and a few 503s. The healthy-tenant p99 line stays flat. Calls in flight to azure rise while aws and gcp fetches run freely.</p>
       <div class="row"><button data-start="slow_kms">Start</button><button data-stop>Stop</button></div>
       <div class="status"></div>
     </div>
     <div class="card" data-scenario="tenant_surge">
-      <h3>Tenant surge</h3>
+      <h3>Tenant surge</h3><button class="hide" title="Hide this card (a running scenario keeps running)">×</button>
       <p>One top-20 tenant (rank 5) sends 100× its rate for 60 s. Its cell stays green, marked with a ring. After the 200-event burst it gets <code>429 rate_limited</code> above 100 events/s; those 429s show as <i>within share</i> by design. Its KMS calls stay flat: renewals at most 1 per 15 s, plus one data-key rotation per 10,000 accepted messages. Other tenants' p99 does not move.</p>
       <div class="row"><button data-start="tenant_surge">Start</button><button data-stop>Stop</button></div>
       <div class="status"></div>
     </div>
     <div class="card" data-scenario="global_surge">
-      <h3>Global surge</h3>
+      <h3>Global surge</h3><button class="hide" title="Hide this card (a running scenario keeps running)">×</button>
       <p>Every tenant sends 5× for 90 s: about 1,500 events/s against a delivery capacity near 640. Delivered holds at capacity instead of collapsing. The heaviest tenants are held to their fair share with 429s and, near 75 s, the heaviest ~40 are shed with <code>503 overloaded</code> while the other ~960 notice nothing. Backlog levels off under its caps and drains in about a minute. KMS calls stay under ~67/s.</p>
       <div class="row"><button data-start="global_surge">Start</button><button data-stop>Stop</button></div>
       <div class="status"></div>
     </div>
+    <p id="hiddencards"><span></span> · <a>show all cards</a></p>
   </section>
   <section id="center">
     <div id="gridwrap">
