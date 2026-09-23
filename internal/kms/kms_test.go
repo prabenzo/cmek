@@ -32,6 +32,9 @@ func TestCodeFromText(t *testing.T) {
 		{"flattened deadline", errors.New("keyset.Handle: decryption failed: context deadline exceeded"), Timeout, true},
 		{"deadline itself", context.DeadlineExceeded, Timeout, true},
 		{"code word without the frame", errors.New("KeyDisabled"), 0, false},
+		{"code word after kms but no frame", errors.New("kms call: something: KeyDisabled: x"), 0, false},
+		{"echoed upstream frame in Msg: the adapter's own frame wins", errors.New("keyset.Handle: decryption failed: kms gcp: KeyDisabled: rpc: retry 3: kms gcp: Unavailable: 503"), KeyDisabled, true},
+		{"a kms prefix before the frame", errors.New("kms wrapper: kms azure: AccessDenied: no"), AccessDenied, true},
 		{"eof", io.EOF, 0, false},
 		{"empty", errors.New(""), 0, false},
 	}
@@ -39,6 +42,28 @@ func TestCodeFromText(t *testing.T) {
 		got, ok := CodeFromText(r.err)
 		if got != r.want || ok != r.ok {
 			t.Errorf("%s: CodeFromText = %v, %v; want %v, %v", r.name, got, ok, r.want, r.ok)
+		}
+	}
+}
+
+// TestCause pins the trim the audit Detail goes through: from the frame onward, from a flattened deadline onward,
+// else the whole text.
+func TestCause(t *testing.T) {
+	rows := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"nil", nil, ""},
+		{"ours", &Error{Code: KeyDisabled, Provider: "gcp", Msg: "kek is disabled"}, "kms gcp: KeyDisabled: kek is disabled"},
+		{"tink read", errors.New("keyset.Handle: decryption failed: kms gcp: KeyDisabled: kek is disabled"), "kms gcp: KeyDisabled: kek is disabled"},
+		{"tink write", errors.New("keyset.Handle: keyset.Handle: encryption failed: kms aws: Unavailable: injected fault"), "kms aws: Unavailable: injected fault"},
+		{"flattened deadline", errors.New("keyset.Handle: decryption failed: context deadline exceeded"), "context deadline exceeded"},
+		{"other", io.EOF, "EOF"},
+	}
+	for _, r := range rows {
+		if got := Cause(r.err); got != r.want {
+			t.Errorf("%s: Cause = %q, want %q", r.name, got, r.want)
 		}
 	}
 }

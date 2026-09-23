@@ -336,6 +336,25 @@ func TestWrappedDEK(t *testing.T) {
 	if c, _ := kms.CodeFromText(err); c != kms.KeyDisabled {
 		t.Errorf("revoked: code %v, err %v", c, err)
 	}
+	// the Manager's own denied call audits the trimmed cause, not Tink's prefix (the timeline shows Detail verbatim)
+	r.clk.Advance(16 * time.Second)
+	if _, err := r.m.EncryptKey(ctx, rigTenant); !errors.Is(err, ErrKeyRevoked) {
+		t.Fatalf("EncryptKey after revoke: %v", err)
+	}
+	r.rec.mu.Lock()
+	defer r.rec.mu.Unlock()
+	denied := 0
+	for _, e := range r.rec.entries {
+		if e.Op == "unwrap" && e.Outcome == "denied" {
+			denied++
+			if want := "kms gcp: KeyDisabled: " + rigKEK + " is disabled"; e.Detail != want {
+				t.Errorf("denied audit Detail = %q, want %q", e.Detail, want)
+			}
+		}
+	}
+	if denied != 1 {
+		t.Errorf("denied audits = %d, want 1", denied)
+	}
 }
 
 // TestClassify: the down-versus-revoked table, one row per input.

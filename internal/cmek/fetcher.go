@@ -12,6 +12,8 @@ import (
 	"github.com/tink-crypto/tink-go/v2/aead"
 	"github.com/tink-crypto/tink-go/v2/keyset"
 	"github.com/tink-crypto/tink-go/v2/tink"
+
+	"github.com/prabenzo/cmek/internal/kms"
 )
 
 // errBusy is the per-tenant in-flight cap: unclassified, never audited, never fed to backoff.
@@ -33,6 +35,7 @@ type result struct {
 
 // call is the only function that touches kms.KMS: tenant cap → provider semaphore raced against a KMSTimeout
 // context → sentAt → KEK lookup → openDEK | newDEK → release → classify. It runs with t.mu released and emits no audit.
+// A failed call's error keeps Tink's full text for the service log; the audit Detail shows kms.Cause of it.
 func (m *Manager) call(t *tenant, op string, d *dek) result {
 	if m.cfg.TenantInflight > 0 {
 		t.mu.Lock()
@@ -250,7 +253,7 @@ func (m *Manager) apply(t *tenant, op string, d *dek, r result) {
 			}
 		}
 	case Deny:
-		m.audit(Audit{At: now, Tenant: t.spec.ID, Op: auditOp, Outcome: "denied", Detail: r.err.Error(), Class: Deny, Latency: r.latency})
+		m.audit(Audit{At: now, Tenant: t.spec.ID, Op: auditOp, Outcome: "denied", Detail: kms.Cause(r.err), Class: Deny, Latency: r.latency})
 		m.log.Error("kms call denied", "tenant", t.spec.ID, "op", auditOp, "state", t.state.String(), "err", r.err)
 		purged := t.purge()
 		t.deniedAt = now                              // every deny: the stale-OK guard needs the latest
@@ -260,7 +263,7 @@ func (m *Manager) apply(t *tenant, op string, d *dek, r result) {
 			m.setState(t, Revoked, now, fmtPurged("key revoked", purged), purged)
 		}
 	default: // Transient (and Poison, which no KMS call produces: treated as an unanswered call)
-		m.audit(Audit{At: now, Tenant: t.spec.ID, Op: auditOp, Outcome: "error", Detail: r.err.Error(), Class: r.class, Latency: r.latency})
+		m.audit(Audit{At: now, Tenant: t.spec.ID, Op: auditOp, Outcome: "error", Detail: kms.Cause(r.err), Class: r.class, Latency: r.latency})
 		m.log.Error("kms call failed", "tenant", t.spec.ID, "op", auditOp, "class", r.class.String(), "state", t.state.String(), "attempt", t.attempt+1, "err", r.err)
 		t.attempt++
 		t.nextProbeAt = now.Add(m.backoff(t.attempt))
