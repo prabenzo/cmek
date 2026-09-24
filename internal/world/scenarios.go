@@ -133,6 +133,39 @@ func newScenarios(w *World) *scenarios {
 		phases:  []phase{{name: "slow", dur: p.SlowFor, enter: fault(FaultRequest{Provider: slow, LatencyP50Ms: int(p.SlowP50 / time.Millisecond), LatencyP99Ms: int(p.SlowP99 / time.Millisecond)})}},
 		exit:    fault(FaultRequest{Provider: slow, Mode: "ok"}),
 	}
+	// Naive mode (NAIVE.md, stretch X1): the slow provider again, with the whole service on the naive design for the
+	// first half and the leases, cache and bulkheads back for the second, the provider still slow.
+	slowFault := fault(FaultRequest{Provider: slow, LatencyP50Ms: int(p.SlowP50 / time.Millisecond), LatencyP99Ms: int(p.SlowP99 / time.Millisecond)})
+	var naiveEnd, naivePeak, leasedPeak metricsReading
+	s.defs["slow_kms_naive"] = &scenario{
+		name: "slow_kms_naive", scope: slow,
+		marker:  fmt.Sprintf("scenario slow_kms_naive started: the naive design (no lease, cache or bulkheads) for every tenant, %s at p50 %s / p99 %s; the switch flips back at %s with %s still slow", slow, p.SlowP50, p.SlowP99, p.NaiveFor, slow),
+		targets: func() []int { return w.band(slow) },
+		phases: []phase{
+			{name: "naive", dur: p.NaiveFor, enter: func() {
+				naiveEnd, naivePeak, leasedPeak = metricsReading{}, metricsReading{}, metricsReading{}
+				slowFault()
+				w.SetNaive(true)
+				w.metrics.ResetPeaks()
+			}},
+			{name: "leased", dur: p.NaiveLeasedFor, enter: func() {
+				naiveEnd, naivePeak = metricsReading(w.metrics.Last()), metricsReading(w.metrics.Peaks())
+				w.SetNaive(false)
+				w.metrics.ResetPeaks()
+				w.metrics.Timeline(fmt.Sprintf("naive mode off: leases, cache and bulkheads back, %s still slow · the naive half ended at delivered %.0f/s, backlog %d, healthy p99 %.1f s, KMS calls %.0f/s; %s in flight peaked at %d (bulkhead %d)",
+					slow, naiveEnd.DeliveredPS, naiveEnd.Backlog, naiveEnd.HealthyP99Ms/1000, naiveEnd.KMSCallsPS, slow, naivePeak.Inflight[slow], p.ProviderInflight))
+			}},
+		},
+		exit: func() {
+			w.SetNaive(false)
+			fault(FaultRequest{Provider: slow, Mode: "ok"})()
+		},
+		summary: func() {
+			leasedPeak = metricsReading(w.metrics.Peaks())
+			w.metrics.Timeline(fmt.Sprintf("naive vs leased (%s slow throughout): delivered %.0f/s at the flip → %.0f/s peak draining with the leases back · backlog peaked at %d · healthy p99 %.1f s naive vs %.0f ms leased",
+				slow, naiveEnd.DeliveredPS, leasedPeak.DeliveredPS, naivePeak.Backlog, naivePeak.HealthyP99Ms/1000, leasedPeak.HealthyP99Ms))
+		},
+	}
 	// No key cache (NOCACHE.md): two runs at a realistic KMS latency on every provider, so the cache is the one variable.
 	latencyAll := func(on bool) {
 		for _, prov := range p.Providers {

@@ -51,7 +51,7 @@ Stretch items start only after P0 is deployed and smoke-tested. Each one ships i
 
 | # | Stretch item | Estimate | Why this position |
 | --- | --- | --- | --- |
-| X1 | Naive-mode switch for the slow-KMS scenario: workers unwrap inline per message, with no lease, cache or bulkheads | 20 min | The most persuasive moment: one slow KMS takes everyone down, then the switch brings them back |
+| X1 | Naive-mode switch for the slow-KMS scenario: workers unwrap inline per message, with no lease, cache or bulkheads. **Built 2026-09-24** as the Slow KMS card's second run, scripted (30 s naive for every tenant, 30 s leased, azure slow throughout) plus `POST /v1/naive` for a manual flip; plan and numbers in [plan/NAIVE.md](plan/NAIVE.md) | 20 min | The most persuasive moment: one slow KMS takes everyone down, then the switch brings them back |
 | X2 | Per-session worlds | 45–60 min | Removes reviewer interference; cheap because World has no globals |
 | X3 | Surge during a KMS brownout; KMS throttling (429) class; blackhole outage; cold start; key rotation; lease slider | 10–30 min each | Breadth; each is independent |
 | X4 | Scenario tests in virtual time (`testing/synctest`) | 45 min | Turns the invariants into CI checks |

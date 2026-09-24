@@ -2,12 +2,12 @@
 # The every-scenario run (docs/plan/M5.md › Tests): one persistent stream, every Start button in turn, and per
 # scenario the assertions a dead stream, a silent checker or a red light fails. Usage:
 #   scripts/m5-panel-check.sh [host:port] [scenario ...]
-# Scenarios default to all eight starts, short ones first. The two no-cache runs expect red lights (L1 in the band
+# Scenarios default to all nine starts, short ones first (slow_kms_naive expects L1 red in its naive half). The two no-cache runs expect red lights (L1 in the band
 # run; L4 in the global run, where L1 is not judged) while they run and green once their tail has ended. Exit status is the number
 # of failing scenarios. Not a Go test: it needs a running binary and about 13 minutes for the full set.
 set -u
 H=${1:-localhost:8080}; shift || true
-SCEN=("$@"); [ ${#SCEN[@]} -eq 0 ] && SCEN=(provider_blip key_revocation slow_kms tenant_surge no_cache provider_outage global_surge no_cache_surge)
+SCEN=("$@"); [ ${#SCEN[@]} -eq 0 ] && SCEN=(provider_blip key_revocation slow_kms slow_kms_naive tenant_surge no_cache provider_outage global_surge no_cache_surge)
 LIGHTS=${LIGHTS:-S1 S2 S3 S4 L1 L4}
 LOG=$(mktemp)
 curl -sN "http://$H/v1/stream" > "$LOG" &
@@ -19,8 +19,8 @@ j() { last | jq -r "$1"; }
 sleep 10 # a baseline under traffic
 [ "$(frames)" -ge 10 ] || { echo "FAIL stream: $(frames) frames in 10 s"; exit 1; }
 # duration each scenario is left to run before the assertions (its phases plus enough tail to be judged)
-dur() { case $1 in provider_blip) echo 25;; key_revocation) echo 45;; slow_kms) echo 75;; tenant_surge) echo 75;; provider_outage) echo 90;; global_surge) echo 150;; no_cache) echo 80;; no_cache_surge) echo 190;; *) echo 60;; esac; }
-allowed() { case $1 in no_cache) echo "L1";; no_cache_surge) echo "L4";; *) echo "";; esac; }
+dur() { case $1 in provider_blip) echo 25;; key_revocation) echo 45;; slow_kms) echo 75;; slow_kms_naive) echo 80;; tenant_surge) echo 75;; provider_outage) echo 90;; global_surge) echo 150;; no_cache) echo 80;; no_cache_surge) echo 190;; *) echo 60;; esac; }
+allowed() { case $1 in no_cache|slow_kms_naive) echo "L1";; no_cache_surge) echo "L4";; *) echo "";; esac; }
 fails=0
 for sc in "${SCEN[@]}"; do
   for i in $(seq 1 120); do [ "$(j '.scenario.name')" = "" ] && break; sleep 1; done

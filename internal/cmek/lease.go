@@ -96,6 +96,7 @@ type tenant struct {
 	waiters, inflight int // IngestWaiters cap; TenantInflight cap (0 = none)
 
 	passThrough bool // the no-cache demo: every EncryptKey/DecryptKey is one KMS call; the cache is neither read nor filled
+	noBulkhead  bool // the naive demo (with passThrough): call skips the per-tenant cap and the provider semaphore
 }
 
 // hot counts the DEKs whose plaintext is cached.

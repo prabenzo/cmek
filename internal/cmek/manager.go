@@ -104,6 +104,20 @@ func (m *Manager) SetPassThrough(id string, on bool) {
 	}
 }
 
+// SetNaive switches one tenant between the cached design (off) and the naive one (on): pass-through plus no
+// bulkheads, so every seal and every delivery is one inline KMS call with nothing but KMSTimeout bounding it. The
+// slow-KMS card's second run (NAIVE.md). Leaving it is SetPassThrough(id, false): the next event takes the cold path.
+func (m *Manager) SetNaive(id string, on bool) {
+	t := m.tenants[id]
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	t.noBulkhead = on
+	t.mu.Unlock()
+	m.SetPassThrough(id, on)
+}
+
 // passThroughEncrypt is EncryptKey without the cache: one KMS call per request and its primitive handed to the
 // caller once. An unwrap of the active DEK is made directly, outside singleflight (the per-request cost the demo
 // shows); a generate (no DEK yet, or the active one exhausted) goes through the "<t>/generate" flight with the

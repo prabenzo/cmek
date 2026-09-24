@@ -35,29 +35,34 @@ type result struct {
 
 // call is the only function that touches kms.KMS: tenant cap → provider semaphore raced against a KMSTimeout
 // context → sentAt → KEK lookup → openDEK | newDEK → release → classify. It runs with t.mu released and emits no audit.
-// A failed call's error keeps Tink's full text for the service log; the audit Detail shows kms.Cause of it.
+// A failed call's error keeps Tink's full text for the service log; the audit Detail shows kms.Cause of it. A naive
+// tenant (noBulkhead) skips the cap and the semaphore but is still counted in flight, so the tile shows the uncapped
+// number; KMSTimeout still bounds the call.
 func (m *Manager) call(t *tenant, op string, d *dek) result {
-	if m.cfg.TenantInflight > 0 {
-		t.mu.Lock()
+	t.mu.Lock()
+	naive := t.noBulkhead
+	if !naive && m.cfg.TenantInflight > 0 {
 		if t.inflight >= m.cfg.TenantInflight {
 			t.mu.Unlock()
 			return result{err: errBusy}
 		}
 		t.inflight++
-		t.mu.Unlock()
 		defer func() {
 			t.mu.Lock()
 			t.inflight--
 			t.mu.Unlock()
 		}()
 	}
+	t.mu.Unlock()
 	ctx, cancel := context.WithTimeout(m.ctx, m.cfg.KMSTimeout)
 	defer cancel()
 	sem := m.provSem[t.spec.Provider]
-	select {
-	case sem <- struct{}{}:
-	case <-ctx.Done(): // the bulkhead wait exhausted the deadline: a transient timeout, never a deny
-		return result{sentAt: m.cfg.Clock.Now(), class: Transient, err: fmt.Errorf("bulkhead %s: %w", t.spec.Provider, ctx.Err())}
+	if !naive {
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done(): // the bulkhead wait exhausted the deadline: a transient timeout, never a deny
+			return result{sentAt: m.cfg.Clock.Now(), class: Transient, err: fmt.Errorf("bulkhead %s: %w", t.spec.Provider, ctx.Err())}
+		}
 	}
 	m.inflight[t.spec.Provider].Add(1)
 	var r result
@@ -71,7 +76,9 @@ func (m *Manager) call(t *tenant, op string, d *dek) result {
 	}
 	r.latency = m.cfg.Clock.Now().Sub(r.sentAt)
 	m.inflight[t.spec.Provider].Add(-1)
-	<-sem
+	if !naive {
+		<-sem
+	}
 	r.class = Classify(r.err)
 	return r
 }

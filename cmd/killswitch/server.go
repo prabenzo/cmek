@@ -31,6 +31,7 @@ func (s *server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/scenarios/{name}/start", s.scenarioStart)
 	mux.HandleFunc("POST /v1/scenarios/{name}/stop", s.scenarioStop)
 	mux.HandleFunc("POST /v1/reset", s.reset)
+	mux.HandleFunc("POST /v1/naive", s.naive)
 }
 
 // reset is POST /v1/reset: stop the current World and build a fresh one; 200 {"world":"w-n"}. It is the one
@@ -43,6 +44,26 @@ func (s *server) reset(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(rw, http.StatusOK, map[string]string{"world": w.ID})
+}
+
+// naive is POST /v1/naive {"on":true|false}: the whole service on the naive design (no lease, cache or bulkheads) or
+// back on the cached one; a manual flip for curl, the card's run scripts the same switch (204; 400 bad JSON).
+func (s *server) naive(rw http.ResponseWriter, r *http.Request) {
+	var req struct {
+		On bool `json:"on"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(rw, r.Body, maxBody)).Decode(&req); err != nil {
+		writeJSON(rw, http.StatusBadRequest, errorBody{Error: "bad_request"})
+		return
+	}
+	w, release := s.holder.Ensure()
+	defer release()
+	if w == nil {
+		writeJSON(rw, http.StatusServiceUnavailable, errorBody{Error: "no_world"})
+		return
+	}
+	w.SetNaive(req.On)
+	rw.WriteHeader(http.StatusNoContent)
 }
 
 // traffic is POST /v1/traffic {"tenant":"t-0042"|"","multiplier":5}: one tenant's or everyone's offered rate
