@@ -253,22 +253,72 @@ type rig struct {
 	t0    time.Time
 }
 
-func newRig(t *testing.T) *rig {
+func newRig(t *testing.T) *rig { return newRigWith(t, nil) }
+
+// newRigWith builds the rig with mod applied to its Config first (nil for the defaults).
+func newRigWith(t *testing.T, mod func(*Config)) *rig {
 	t.Helper()
 	clk := &fakeClock{now: time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC)}
 	fake := kms.NewFake(kms.FakeConfig{Providers: []string{"gcp"}, KEKs: []kms.KEKSpec{{ID: rigKEK, Provider: "gcp", Idx: 0}}, Clock: clk, Rand: rand.New(rand.NewSource(1)), Lock: &sync.Mutex{}})
 	lat := &latentKMS{KMS: fake, clk: clk}
 	rec := &recorder{}
 	store := &mapStore{rec: rec}
-	m := New(context.Background(), Config{
+	cfg := Config{
 		Tenants: []TenantSpec{{ID: rigTenant, Provider: "gcp", KEKID: rigKEK}}, Providers: []string{"gcp"},
 		Keys: lat, Store: store, Audit: rec, Clock: clk, Jitter: fixed{0.5}, Spawn: func(f func()) { f() },
 		Lease: 30 * time.Second, SoftTTL: 15 * time.Second, EarlyExpiry: time.Second, KMSTimeout: 500 * time.Millisecond,
 		BackoffMin: 500 * time.Millisecond, BackoffMax: 8 * time.Second, BackoffJitter: 0.5, RevokedReprobe: 5 * time.Second,
 		DEKMaxMessages: 10000, DEKMaxAge: 10 * time.Minute, SweepInterval: 250 * time.Millisecond,
 		ProviderInflight: 32, TenantInflight: 2, IngestWaiters: 4,
-	})
+	}
+	if mod != nil {
+		mod(&cfg)
+	}
+	m := New(context.Background(), cfg)
 	return &rig{m: m, fake: fake, lat: lat, rec: rec, store: store, clk: clk, t0: clk.Now()}
+}
+
+// gatedKMS holds every KEK call open until release is closed and counts how many are inside at once.
+type gatedKMS struct {
+	kms.KMS
+	release chan struct{}
+	inside  atomic.Int64
+	peak    atomic.Int64
+}
+
+func (g *gatedKMS) KEK(kekID string) (tink.AEADWithContext, error) {
+	kek, err := g.KMS.KEK(kekID)
+	if err != nil {
+		return nil, err
+	}
+	return &gatedKEK{g: g, kek: kek}, nil
+}
+
+type gatedKEK struct {
+	g   *gatedKMS
+	kek tink.AEADWithContext
+}
+
+func (k *gatedKEK) enter() {
+	n := k.g.inside.Add(1)
+	for {
+		p := k.g.peak.Load()
+		if n <= p || k.g.peak.CompareAndSwap(p, n) {
+			break
+		}
+	}
+	<-k.g.release
+	k.g.inside.Add(-1)
+}
+
+func (k *gatedKEK) EncryptWithContext(ctx context.Context, pt, ad []byte) ([]byte, error) {
+	k.enter()
+	return k.kek.EncryptWithContext(ctx, pt, ad)
+}
+
+func (k *gatedKEK) DecryptWithContext(ctx context.Context, ct, ad []byte) ([]byte, error) {
+	k.enter()
+	return k.kek.DecryptWithContext(ctx, ct, ad)
 }
 
 func (r *rig) calls() int64 { return r.lat.calls.Load() }
@@ -894,5 +944,83 @@ func TestPassThrough(t *testing.T) {
 	}
 	if len(r2.store.puts) != 1 || r2.rec.count("generate", "ok") != 1 || r2.m.Info(rigTenant).DEKs != 1 {
 		t.Errorf("concurrent first events: puts %d, generate audits %d, DEKs %d; want one of each", len(r2.store.puts), r2.rec.count("generate", "ok"), r2.m.Info(rigTenant).DEKs)
+	}
+}
+
+// TestNaiveSkipsBulkheads: a naive tenant's calls pass neither the per-tenant cap nor the provider semaphore (six
+// concurrent seals are all inside the KMS at once, and in flight reads six), while the same tenant back on the cached
+// design sends exactly one call for the same six seals (the cold fetch is a singleflight; the caps never even bind).
+func TestNaiveSkipsBulkheads(t *testing.T) {
+	gate := &gatedKMS{release: make(chan struct{})}
+	r := newRigWith(t, func(c *Config) {
+		gate.KMS = c.Keys
+		c.Keys = gate
+		c.ProviderInflight, c.TenantInflight = 2, 2
+	})
+	m, ctx := r.m, context.Background()
+	// warm-up with the gate open: one generate, so pass-through seals are direct unwraps outside singleflight
+	close(gate.release)
+	if _, err := m.EncryptKey(ctx, rigTenant); err != nil {
+		t.Fatal(err)
+	}
+	gate.release = make(chan struct{})
+	gate.peak.Store(0)
+	m.SetNaive(rigTenant, true)
+	if m.Info(rigTenant).HotDEKs != 0 {
+		t.Fatalf("naive: hot %d", m.Info(rigTenant).HotDEKs)
+	}
+	const n = 6
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			_, err := m.EncryptKey(ctx, rigTenant)
+			errs <- err
+		}()
+	}
+	for i := 0; i < 200 && gate.inside.Load() < n; i++ { // every caller reaches the KMS: no cap held any back
+		time.Sleep(time.Millisecond)
+	}
+	if got := gate.inside.Load(); got != n {
+		t.Errorf("naive: %d of %d calls inside the KMS at once", got, n)
+	}
+	if got := m.Inflight("gcp"); got != n {
+		t.Errorf("naive: in flight reads %d, want %d", got, n)
+	}
+	close(gate.release)
+	for i := 0; i < n; i++ {
+		if err := <-errs; err != nil {
+			t.Errorf("naive seal: %v", err)
+		}
+	}
+	// the cached design again: six concurrent seals on an empty cache share one cold fetch; exactly one call is inside
+	m.SetNaive(rigTenant, false)
+	gate.release = make(chan struct{})
+	gate.peak.Store(0)
+	for i := 0; i < n; i++ {
+		go func() {
+			_, err := m.EncryptKey(ctx, rigTenant)
+			errs <- err
+		}()
+	}
+	for i := 0; i < 200 && gate.inside.Load() < 1; i++ {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond) // any second caller would have arrived by now
+	if got := gate.peak.Load(); got != 1 {
+		t.Errorf("leased: %d calls inside the KMS at once, want the one shared cold fetch", got)
+	}
+	close(gate.release)
+	sealed := 0
+	for i := 0; i < n; i++ {
+		switch err := <-errs; {
+		case err == nil:
+			sealed++
+		case errors.Is(err, ErrKeyUnavailable): // beyond IngestWaiters: the fast 503
+		default:
+			t.Errorf("leased seal: %v", err)
+		}
+	}
+	if sealed == 0 || r.calls() != 1+n+1 {
+		t.Errorf("leased: %d sealed, %d KMS calls in all (want warm-up 1 + naive %d + one shared fetch)", sealed, r.calls(), n)
 	}
 }

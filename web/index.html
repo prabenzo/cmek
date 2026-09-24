@@ -101,10 +101,10 @@
       <div class="row"><button data-start="key_revocation">Start</button><button data-stop>Stop</button><button id="restore" disabled>Restore</button></div>
       <div class="status"></div>
     </div>
-    <div class="card" data-scenario="slow_kms">
+    <div class="card" data-scenario="slow_kms slow_kms_naive">
       <h3>Slow KMS</h3><button class="hide" title="Hide this card (a running scenario keeps running)">×</button>
-      <p>azure latency rises to p50 400 ms / p99 3 s against a 500 ms timeout, for 60 s. Azure cells flicker yellow; cold azure tenants see slow ingest and a few 503s. The healthy-tenant p99 line stays flat. Calls in flight to azure rise while aws and gcp fetches run freely.</p>
-      <div class="row"><button data-start="slow_kms">Start</button><button data-stop>Stop</button></div>
+      <p>azure latency rises to p50 400 ms / p99 3 s against a 500 ms timeout, for 60 s. Azure cells flicker yellow; cold azure tenants see slow ingest and a few 503s. The healthy-tenant p99 line stays flat. Calls in flight to azure rise while aws and gcp fetches run freely. <b>Naive (60 s):</b> the same slow azure, but the whole service on the naive design for the first 30 s: no lease, no cache, no bulkheads, every seal and delivery one inline KMS call. azure deliveries hold the eight shared workers, delivered collapses from ~300/s to ~20/s for everyone, the healthy p99 climbs to tens of seconds, the heaviest aws and gcp tenants start getting <code>503 backlog_full</code>, and L1 goes red; azure in flight passes the bulkhead's 32. At 30 s the switch flips back with azure still slow: aws and gcp lease once and never call again, delivered jumps to capacity within a second and the backlog drains in ~10 s.</p>
+      <div class="row"><button data-start="slow_kms">Start</button><button data-start="slow_kms_naive">Start naive</button><button data-stop>Stop</button></div>
       <div class="status"></div>
     </div>
     <div class="card" data-scenario="tenant_surge">

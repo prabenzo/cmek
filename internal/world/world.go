@@ -407,6 +407,15 @@ func (w *World) SetCache(provider string, on bool) error {
 	return nil
 }
 
+// SetNaive switches every tenant between the cached design and the naive one (no lease, cache or bulkheads): the
+// slow-KMS card's second run and POST /v1/naive. A design switch is service-wide.
+func (w *World) SetNaive(on bool) {
+	for _, id := range w.ids {
+		w.keys.SetNaive(id, on)
+	}
+	w.log.Info("naive mode", "on", on, "tenants", len(w.ids))
+}
+
 // Fault validates the request and installs it in the fake KMS; a body with mode "ok" and no latency clears the scope.
 func (w *World) Fault(f FaultRequest) error {
 	var scope kms.Scope
