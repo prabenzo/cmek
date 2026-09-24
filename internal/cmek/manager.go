@@ -81,11 +81,11 @@ func (m *Manager) exhausted(d *dek, now time.Time) bool {
 	return d.msgs >= m.cfg.DEKMaxMessages || now.Sub(d.createdAt) >= m.cfg.DEKMaxAge
 }
 
-// SetPassThrough switches one tenant between the cached design (off) and per-request KMS calls (on): the no-cache
-// demo. Entering pass-through drops every cached primitive (audit purge "cache off"); leaving it lets the next
-// probe or renewal fill the cache again. Everything else (state machine, backoff, bulkheads, the Deny row and the
-// stale-OK guard) is unchanged, so the runs isolate the cache as the one variable.
-func (m *Manager) SetPassThrough(id string, on bool) {
+// SetFetch switches one tenant's key-fetch design (KEYFETCH.md). Entering a mode without the cache drops every
+// cached primitive (audit purge "cache off"); leaving one lets the next probe, renewal or cold event fill the cache
+// again. Async ↔ Sync moves nothing: only who runs the next renewal changes. Everything else (state machine,
+// backoff, the Deny row and the stale-OK guard) is the same in every mode, so each demo isolates one variable.
+func (m *Manager) SetFetch(id string, mode Fetch) {
 	t := m.tenants[id]
 	if t == nil {
 		return
@@ -93,29 +93,34 @@ func (m *Manager) SetPassThrough(id string, on bool) {
 	now := m.cfg.Clock.Now()
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.passThrough == on {
+	if t.fetch == mode {
 		return
 	}
-	t.passThrough = on
-	if on {
+	was := t.direct()
+	t.fetch = mode
+	if t.direct() && !was {
 		if purged := t.purge(); purged > 0 {
 			m.audit(Audit{At: now, Tenant: t.spec.ID, Op: "purge", Outcome: "cache off", Detail: "per-request KMS calls", Purged: purged})
 		}
 	}
 }
 
-// SetNaive switches one tenant between the cached design (off) and the naive one (on): pass-through plus no
-// bulkheads, so every seal and every delivery is one inline KMS call with nothing but KMSTimeout bounding it. The
-// slow-KMS card's second run (NAIVE.md). Leaving it is SetPassThrough(id, false): the next event takes the cold path.
-func (m *Manager) SetNaive(id string, on bool) {
-	t := m.tenants[id]
-	if t == nil {
-		return
+// SetPassThrough is SetFetch(FetchPassThrough | FetchAsync): the no-cache demo (NOCACHE.md).
+func (m *Manager) SetPassThrough(id string, on bool) {
+	if on {
+		m.SetFetch(id, FetchPassThrough)
+	} else {
+		m.SetFetch(id, FetchAsync)
 	}
-	t.mu.Lock()
-	t.noBulkhead = on
-	t.mu.Unlock()
-	m.SetPassThrough(id, on)
+}
+
+// SetNaive is SetFetch(FetchNaive | FetchAsync): pass-through plus no bulkheads (NAIVE.md, KEYFETCH.md).
+func (m *Manager) SetNaive(id string, on bool) {
+	if on {
+		m.SetFetch(id, FetchNaive)
+	} else {
+		m.SetFetch(id, FetchAsync)
+	}
 }
 
 // passThroughEncrypt is EncryptKey without the cache: one KMS call per request and its primitive handed to the
@@ -183,7 +188,7 @@ func (m *Manager) passThroughHandle(t *tenant, d *dek, r result, count bool) (Ha
 // handle wraps the active primitive in a Handle when the tenant may seal now; caller holds t.mu.
 func (m *Manager) handle(t *tenant, now time.Time) (Handle, bool) {
 	d := t.active
-	if d == nil || d.prim == nil || t.passThrough || !t.lease.Usable(now) || (t.state == Active && m.exhausted(d, now)) {
+	if d == nil || d.prim == nil || t.direct() || !t.lease.Usable(now) || (t.state == Active && m.exhausted(d, now)) {
 		return Handle{}, false
 	}
 	d.msgs++
@@ -207,12 +212,12 @@ func (m *Manager) EncryptKey(ctx context.Context, id string) (Handle, error) {
 		t.mu.Unlock()
 		return Handle{}, ErrKeyUnavailable
 	}
-	if t.passThrough {
+	if t.direct() {
 		t.mu.Unlock()
 		return m.passThroughEncrypt(t)
 	}
 	if h, ok := m.handle(t, now); ok { // hot path
-		kick := t.state == Active && t.lease.SoftDue(now) && !t.probing
+		kick := t.state == Active && t.lease.SoftDue(now) && !t.probing && t.fetch != FetchSync // sync: the worker renews
 		if kick {
 			t.probing = true
 		}
@@ -247,8 +252,10 @@ func (m *Manager) EncryptKey(ctx context.Context, id string) (Handle, error) {
 }
 
 // DecryptKey checks the lease now and returns a handle on the named DEK; ErrPoison for a dek_id the tenant does not
-// own [SC-F8]; it never blocks and never calls a KMS, except for a tenant in pass-through (the no-cache demo), where
-// it makes one unwrap call per message and a failed call parks the tenant and answers ErrKeyUnavailable.
+// own [SC-F8]; it never blocks and never calls a KMS, except in the demo modes: pass-through and naive make one
+// unwrap call per message (a failed call parks the tenant and answers ErrKeyUnavailable), and sync fetch runs the
+// renewal of a soft-due lease, the due probe of a parked tenant and the unwrap of a cold DEK here, inline, before
+// the checks (the worker waits where the async design's background goroutine would have).
 func (m *Manager) DecryptKey(id, dekID string) (Handle, error) {
 	t := m.tenants[id]
 	if t == nil {
@@ -261,6 +268,24 @@ func (m *Manager) DecryptKey(id, dekID string) (Handle, error) {
 		t.mu.Unlock()
 		return Handle{}, ErrPoison
 	}
+	if t.fetch == FetchSync && !t.probing {
+		var inline func()
+		switch {
+		case t.state == Active && t.lease.SoftDue(now):
+			inline = func() { m.probe(t) }
+		case t.state != Active && !now.Before(t.nextProbeAt):
+			inline = func() { m.probe(t) }
+		case (t.state == Active || t.state == RidingThrough) && t.lease.Usable(now) && d.prim == nil:
+			inline = func() { m.warm(t, d) }
+		}
+		if inline != nil {
+			t.probing = true
+			t.mu.Unlock()
+			inline()
+			now = m.cfg.Clock.Now()
+			t.mu.Lock()
+		}
+	}
 	switch t.state {
 	case Revoked:
 		t.mu.Unlock()
@@ -269,7 +294,7 @@ func (m *Manager) DecryptKey(id, dekID string) (Handle, error) {
 		t.mu.Unlock()
 		return Handle{}, ErrLeaseExpired
 	}
-	if t.passThrough {
+	if t.direct() {
 		t.mu.Unlock()
 		r := m.call(t, "unwrap", d)
 		m.apply(t, "unwrap", d, r)
@@ -294,7 +319,7 @@ func (m *Manager) Hot(id string) bool {
 	}
 	now := m.cfg.Clock.Now()
 	t.mu.Lock()
-	if t.passThrough { // no lease to check and nothing to kick: the worker's DecryptKey is the call
+	if t.direct() { // no lease to check and nothing to kick: the worker's DecryptKey is the call
 		hot := t.state == Active
 		t.mu.Unlock()
 		return hot
@@ -302,6 +327,10 @@ func (m *Manager) Hot(id string) bool {
 	usable := t.lease.Usable(now)
 	hot := (t.state == Active || t.state == RidingThrough) && usable && len(t.pending) == 0
 	kick := t.state == Active && !t.probing && (!usable || t.lease.SoftDue(now))
+	if t.fetch == FetchSync { // nothing is kicked: the worker's DecryptKey renews, probes and warms; a tenant whose
+		kick = false // lease lapsed or whose probe is due is dispatched so that a worker gets to do it
+		hot = hot || (!t.probing && ((t.state == Active && !usable) || (t.state != Active && !now.Before(t.nextProbeAt))))
+	}
 	if kick {
 		t.probing = true
 	}
@@ -322,7 +351,7 @@ func (m *Manager) Warm(id, dekID string) {
 	now := m.cfg.Clock.Now()
 	t.mu.Lock()
 	d := t.deks[dekID]
-	if d == nil || t.passThrough { // pass-through: nothing is warmed, every DecryptKey calls
+	if d == nil || t.direct() { // pass-through: nothing is warmed, every DecryptKey calls
 		t.mu.Unlock()
 		return
 	}
@@ -365,7 +394,7 @@ func (m *Manager) Tick(now time.Time) {
 		}
 		// 3. due probe (never for an ACTIVE tenant: Q4) or due warm
 		switch {
-		case (t.state == RidingThrough || t.state == KeyUnavailable || t.state == Revoked) && !t.probing && !now.Before(t.nextProbeAt):
+		case (t.state == RidingThrough || t.state == KeyUnavailable || t.state == Revoked) && !t.probing && !now.Before(t.nextProbeAt) && t.fetch != FetchSync:
 			t.probing = true
 			due = func() { m.probe(t) }
 		case (t.state == Active || t.state == RidingThrough) && t.lease.Usable(now) && !t.probing:

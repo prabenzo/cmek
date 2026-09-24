@@ -1024,3 +1024,62 @@ func TestNaiveSkipsBulkheads(t *testing.T) {
 		t.Errorf("leased: %d sealed, %d KMS calls in all (want warm-up 1 + naive %d + one shared fetch)", sealed, r.calls(), n)
 	}
 }
+
+// TestSyncFetch: in sync-fetch mode nothing is kicked into the background. A soft-due lease is renewed by the
+// worker's DecryptKey itself (Hot and EncryptKey serve from the cache without a call), a failed inline renewal still
+// rides through on the usable lease, a lapsed tenant with a due probe is Hot so a worker gets dispatched to probe
+// it, and that probe heals it. Back in async mode the same soft-due lease is kicked from Hot.
+func TestSyncFetch(t *testing.T) {
+	r := newRig(t)
+	m, clk, ctx := r.m, r.clk, context.Background()
+	h, err := m.EncryptKey(ctx, rigTenant) // async warm-up: one generate
+	if err != nil {
+		t.Fatal(err)
+	}
+	dekID := h.DEKID
+	m.SetFetch(rigTenant, FetchSync)
+	if m.Info(rigTenant).HotDEKs != 1 || r.calls() != 1 {
+		t.Fatalf("entering sync: hot %d, calls %d (the cache is kept)", m.Info(rigTenant).HotDEKs, r.calls())
+	}
+	clk.Advance(16 * time.Second) // soft-due (SoftTTL 15 s), still usable
+	if !m.Hot(rigTenant) || r.calls() != 1 || m.Info(rigTenant).Probing {
+		t.Errorf("sync Hot: hot %v, calls %d, probing %v (nothing may be kicked)", m.Hot(rigTenant), r.calls(), m.Info(rigTenant).Probing)
+	}
+	if _, err := m.EncryptKey(ctx, rigTenant); err != nil || r.calls() != 1 {
+		t.Errorf("sync ingest hot path: err %v, calls %d (served from the cache, no kick)", err, r.calls())
+	}
+	if _, err := m.DecryptKey(rigTenant, dekID); err != nil || r.calls() != 2 || r.rec.count("unwrap", "ok") != 1 {
+		t.Errorf("sync worker: err %v, calls %d, unwrap ok %d (the worker renews inline)", err, r.calls(), r.rec.count("unwrap", "ok"))
+	}
+	if age := m.Info(rigTenant).LeaseAge; age != 0 {
+		t.Errorf("lease age after the inline renewal: %s, want 0", age)
+	}
+	if _, err := m.DecryptKey(rigTenant, dekID); err != nil || r.calls() != 2 {
+		t.Errorf("second worker call: err %v, calls %d (the lease is fresh: no call)", err, r.calls())
+	}
+	// the inline renewal fails: RIDING_THROUGH on the usable lease, the handle still served
+	r.fake.SetFault(kms.Scope{Provider: "gcp"}, kms.Fault{Mode: kms.ModeFastFail})
+	clk.Advance(16 * time.Second)
+	if _, err := m.DecryptKey(rigTenant, dekID); err != nil || r.calls() != 3 || r.state() != RidingThrough {
+		t.Errorf("failed inline renewal: err %v, calls %d, state %v", err, r.calls(), r.state())
+	}
+	// the lease lapses: Tick parks the tenant; Tick never probes a sync tenant, but Hot dispatches it once the probe is due
+	clk.Advance(15 * time.Second)
+	m.Tick(clk.Now())
+	if r.state() != KeyUnavailable || r.calls() != 3 {
+		t.Fatalf("after the lapse: state %v, calls %d (Tick must not probe)", r.state(), r.calls())
+	}
+	if !m.Hot(rigTenant) || r.calls() != 3 {
+		t.Errorf("parked sync tenant with a due probe: hot %v, calls %d (dispatched, not kicked)", m.Hot(rigTenant), r.calls())
+	}
+	r.fake.SetFault(kms.Scope{Provider: "gcp"}, kms.Fault{})
+	if _, err := m.DecryptKey(rigTenant, dekID); err != nil || r.state() != Active || r.calls() != 4 || m.Info(rigTenant).HotDEKs != 1 {
+		t.Errorf("worker probe heals: err %v, state %v, calls %d, hot %d", err, r.state(), r.calls(), m.Info(rigTenant).HotDEKs)
+	}
+	// async again: the soft-due lease is kicked from Hot (Spawn runs it inline in the rig)
+	m.SetFetch(rigTenant, FetchAsync)
+	clk.Advance(16 * time.Second)
+	if !m.Hot(rigTenant) || r.calls() != 5 {
+		t.Errorf("async Hot: hot %v, calls %d (the kick)", m.Hot(rigTenant), r.calls())
+	}
+}

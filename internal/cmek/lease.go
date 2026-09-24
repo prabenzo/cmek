@@ -95,9 +95,22 @@ type tenant struct {
 
 	waiters, inflight int // IngestWaiters cap; TenantInflight cap (0 = none)
 
-	passThrough bool // the no-cache demo: every EncryptKey/DecryptKey is one KMS call; the cache is neither read nor filled
-	noBulkhead  bool // the naive demo (with passThrough): call skips the per-tenant cap and the provider semaphore
+	fetch Fetch // where this tenant's KMS calls run (FetchAsync unless a demo switched it)
 }
+
+// Fetch is where a tenant's KMS calls run: the design that ships, or one of the demo designs the Slow KMS and
+// no-cache cards switch to (KEYFETCH.md, NOCACHE.md).
+type Fetch uint8
+
+const (
+	FetchAsync       Fetch = iota // renewals and probes are kicked into the background; workers never wait on the KMS
+	FetchSync                     // cache, lease and bulkheads kept; the worker renews a due lease and probes a parked tenant inline
+	FetchPassThrough              // no lease, no cache; bulkheads kept: every seal and delivery is one KMS call
+	FetchNaive                    // pass-through with no bulkheads either
+)
+
+// direct reports a mode without the cache (pass-through or naive).
+func (t *tenant) direct() bool { return t.fetch == FetchPassThrough || t.fetch == FetchNaive }
 
 // hot counts the DEKs whose plaintext is cached.
 func (t *tenant) hot() int {
