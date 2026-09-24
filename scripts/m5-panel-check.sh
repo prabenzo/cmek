@@ -34,7 +34,8 @@ for sc in "${SCEN[@]}"; do
   d=$(dur "$name")
   if [ -n "$mode" ]; then sleep 30; curl -s -o /dev/null -XPOST -d '{"mode":"async"}' "http://$H/v1/keyfetch"; sleep $((d-30)); else sleep "$d"; fi
   if [ "$name" = key_revocation ]; then curl -s -o /dev/null -XPOST "http://$H/v1/scenarios/$name/stop"; sleep 15; d=$((d+15)); fi
-  if [ "$(j '.scenario.name')" != "" ]; then curl -s -o /dev/null -XPOST "http://$H/v1/scenarios/$name/stop"; sleep 2; fi
+  if [ "$(j '.scenario.name')" != "" ]; then curl -s -o /dev/null -XPOST "http://$H/v1/scenarios/$name/stop"; fi
+  sleep 3 # the checker's next pass (1 Hz) reports the lights for an ended run; a run that ended on its own this second needs it too
   end=$(frames)
   n=$((end-start))
   need=$(( d * 2 * 8 / 10 ))
