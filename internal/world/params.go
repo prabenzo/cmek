@@ -94,8 +94,6 @@ type Params struct {
 	NoCacheSurgeLead  time.Duration // 15s  everyone without the cache before the surge
 	NoCacheSurgeFor   time.Duration // 60s  the global surge (GlobalSurgeMult) without the cache
 	NoCacheSurgeAfter time.Duration // 15s  cache still off after the surge ends
-	NaiveFor          time.Duration // 30s  slow_kms_naive: the naive design for everyone with the slow provider (NAIVE.md)
-	NaiveLeasedFor    time.Duration // 30s  then leases, cache and bulkheads back with the provider still slow
 
 	// Charts, p99 and the invariant thresholds (M4 measures; M5 judges)
 	ChartWindow          time.Duration // 2m   ring the page keeps per series
@@ -170,7 +168,6 @@ func Demo() Params {
 		NoCacheProvider: "gcp", NoCacheFor: 30 * time.Second, NoCacheBlip: 10 * time.Second, NoCacheAfter: 15 * time.Second,
 		NoCacheKMSP50: 20 * time.Millisecond, NoCacheKMSP99: 80 * time.Millisecond,
 		NoCacheSurgeLead: 15 * time.Second, NoCacheSurgeFor: 60 * time.Second, NoCacheSurgeAfter: 15 * time.Second,
-		NaiveFor: 30 * time.Second, NaiveLeasedFor: 30 * time.Second,
 		ChartWindow: 2 * time.Minute, P99Window: 10, BaselineTicks: 20, L1Ratio: 1.25, L1Floor: 25 * time.Millisecond, L1Grace: 7 * time.Second, L1For: 3 * time.Second,
 		L4CapacityFactor: 0.9, L4Settle: 7 * time.Second, TimelineAggregateMin: 3,
 		CheckInterval: time.Second, CanaryFullScan: 5 * time.Second, Lights: []string{"S1", "S2", "S3", "S4", "L1", "L4"}, Capacity: 620,

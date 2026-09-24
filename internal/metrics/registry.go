@@ -139,6 +139,7 @@ type Registry struct {
 	delRing     []int64            // the last P99Window ticks' delivered counts (L4's DeliveredPS)
 	delHead     int
 	healthyRej  atomic.Int64 // rejections dealt to unaffected tenants since SetTargets (L1)
+	keyFetch    atomic.Value // string: the service's key-fetch mode for the header and the card (KEYFETCH.md)
 }
 
 // verdict is one invariant light as the snapshot carries it (the page reads ok, n, at, detail).
@@ -187,6 +188,9 @@ func (r *Registry) HealthyP99() (current, baseline time.Duration, ok bool) {
 	defer r.mu.Unlock()
 	return r.lastHealthy, r.baseline, r.scen.name != "" && r.baseline > 0
 }
+
+// SetKeyFetch records the service's key-fetch mode name for the snapshot.
+func (r *Registry) SetKeyFetch(mode string) { r.keyFetch.Store(mode) }
 
 // HealthyRejections counts every non-accepted ingest outcome dealt to a tenant outside the affected set since the
 // last SetTargets (L1: unaffected tenants see no rejections).
@@ -288,6 +292,7 @@ func New(cfg Config) *Registry {
 	}
 	n := len(cfg.Tenants)
 	r := &Registry{cfg: cfg, hub: newHub(cfg.ViewerQueue, cfg.Watcher), ln15: 0.4054651081081644, audits: make([][]Audit, n), auditHead: make([]int, n), auditN: make([]int, n), states: make([]uint8, n), grid: make([]byte, n), timeline: make([]event, cfg.TimelineRing), affected: make([]atomic.Bool, n), p99Ring: make([]time.Duration, cfg.BaselineTicks), rt: make([]rtCount, len(cfg.Providers)), kmsProv: make([]atomic.Int64, len(cfg.Providers)), detected: make([]detection, n), delRing: make([]int64, cfg.P99Window)}
+	r.keyFetch.Store("async")
 	for c := range r.hists {
 		r.hists[c] = make([]hist, cfg.P99Window)
 	}
@@ -602,11 +607,12 @@ func (r *Registry) Viewers() int { return r.hub.viewers() }
 func (r *Registry) Ticks() int64 { return r.ticks.Load() }
 
 type snapshot struct {
-	World   string `json:"world"`
-	Tick    int64  `json:"tick"`
-	T       int64  `json:"t"`
-	Viewers int    `json:"viewers"`
-	Tiles   struct {
+	World    string `json:"world"`
+	KeyFetch string `json:"key_fetch"`
+	Tick     int64  `json:"tick"`
+	T        int64  `json:"t"`
+	Viewers  int    `json:"viewers"`
+	Tiles    struct {
 		DeliveredPS  float64 `json:"delivered_ps"`
 		CapacityPS   float64 `json:"capacity_ps"`
 		OfferedPS    float64 `json:"offered_ps"`
@@ -693,6 +699,7 @@ func (r *Registry) tick() {
 	defer r.mu.Unlock()
 	var s snapshot
 	s.World, s.Tick, s.T, s.Viewers = r.cfg.WorldID, tick, now.UnixMilli(), r.hub.viewers()
+	s.KeyFetch = r.keyFetch.Load().(string)
 	var ing [reasonCount]int64
 	for i := range ing {
 		ing[i] = r.ingest[i].Swap(0)

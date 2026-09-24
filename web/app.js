@@ -41,6 +41,7 @@ function onSnapshot(s) {
   renderTiles(s);
   renderPanel(s.invariants);
   renderCards(s);
+  renderMode(s.key_fetch);
   pushCharts(s);
   renderTimeline(s.events);
 }
@@ -154,6 +155,7 @@ function targetTenant() { // the ringed cell of the running scenario (code & 4)
 function bindCards() {
   document.querySelectorAll('[data-start]').forEach(b => b.onclick = () => post('/v1/scenarios/' + b.dataset.start + '/start'));
   document.querySelectorAll('[data-stop]').forEach(b => b.onclick = () => post('/v1/scenarios/x/stop'));
+  document.querySelectorAll('[data-fetch]').forEach(b => b.onclick = () => post('/v1/keyfetch', { mode: b.dataset.fetch }));
   $('restore').onclick = () => { const id = targetTenant(); if (id) post('/v1/tenants/' + id + '/key', { action: 'restore' }); };
   $('reset').onclick = onReset;
   $('cardtoggle').onclick = () => setCards(document.body.classList.contains('nocards'));
@@ -166,6 +168,15 @@ function bindCards() {
   } catch (e) { /* storage blocked: every card stays shown */ }
   setCards(show);
   document.querySelectorAll('.card').forEach(c => hideCard(c.dataset.scenario, hidden.includes(c.dataset.scenario)));
+}
+
+// renderMode highlights the active key-fetch mode on the Slow KMS card and shows it in the header while it is not
+// the design that ships.
+function renderMode(mode) {
+  document.querySelectorAll('[data-fetch]').forEach(b => { b.classList.toggle('on', b.dataset.fetch === mode); b.disabled = !connected; });
+  const el = $('mode');
+  el.textContent = 'key fetch: ' + mode;
+  el.classList.toggle('on', !!mode && mode !== 'async');
 }
 
 // setCards shows or hides the whole scenario column (a per-viewer preference, remembered in this browser only).

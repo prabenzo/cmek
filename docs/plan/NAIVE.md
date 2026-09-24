@@ -52,6 +52,8 @@ Each: recommended · alternative.
 
 ## Status
 
+**Superseded the same day by [KEYFETCH.md](KEYFETCH.md)**: the scripted `slow_kms_naive` run and its button are gone; the Naive button on the Slow KMS card is the same mode, flipped by hand, and `POST /v1/naive` became `POST /v1/keyfetch {"mode":"naive"}`. The measurements below stand (the mode is unchanged).
+
 **Built 2026-09-24** on `claude/epic-rubin-kgewov`, approved by Ben in chat ("Scripted flip sgtm, naive for everyone, plan LGTM"; the other three decisions as recommended). Commit 4266af6 (code), then the docs commit. Suite green under `-race`; `scripts/m5-panel-check.sh localhost:PORT slow_kms slow_kms_naive`: both PASS, `slow_kms` with no red and `slow_kms_naive` with L1 red only (129 frames), every light fresh and green after the tail. The full nine-scenario run on the same binary: all PASS, exit 0 (provider_blip 54 frames, key_revocation 119, slow_kms 154, slow_kms_naive 160 with L1 red 130, tenant_surge 154, no_cache 160 with L1 red 16, provider_outage 180, global_surge 300, no_cache_surge 379 with L4 red 174; the reds exactly the allowed ones, every light fresh).
 
 **As built and as measured (one captured run on this box, tmpfs).**

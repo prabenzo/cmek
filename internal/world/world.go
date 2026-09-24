@@ -407,13 +407,31 @@ func (w *World) SetCache(provider string, on bool) error {
 	return nil
 }
 
-// SetNaive switches every tenant between the cached design and the naive one (no lease, cache or bulkheads): the
-// slow-KMS card's second run and POST /v1/naive. A design switch is service-wide.
-func (w *World) SetNaive(on bool) {
-	for _, id := range w.ids {
-		w.keys.SetNaive(id, on)
+// SetFetch switches every tenant's key-fetch design (KEYFETCH.md): "async" (the design that ships), "sync" (the
+// worker fetches inline) or "naive" (no lease, cache or bulkheads). A design switch is service-wide; the snapshot
+// carries the mode, the timeline gets a line and the peak readings start over. POST /v1/keyfetch and the Slow KMS
+// card's mode buttons.
+func (w *World) SetFetch(mode string) error {
+	var f cmek.Fetch
+	var line string
+	switch mode {
+	case "async":
+		f, line = cmek.FetchAsync, "key fetch: async (the design that ships: renewals in the background, workers never wait on the KMS)"
+	case "sync":
+		f, line = cmek.FetchSync, "key fetch: sync (cache, lease and bulkheads kept; the worker that finds a lease due fetches inline)"
+	case "naive":
+		f, line = cmek.FetchNaive, "key fetch: naive (no lease, no cache, no bulkheads: every seal and delivery is one inline KMS call)"
+	default:
+		return fmt.Errorf("%w: unknown key-fetch mode %q", ErrBadFault, mode)
 	}
-	w.log.Info("naive mode", "on", on, "tenants", len(w.ids))
+	for _, id := range w.ids {
+		w.keys.SetFetch(id, f)
+	}
+	w.metrics.SetKeyFetch(mode)
+	w.metrics.Timeline(line)
+	w.metrics.ResetPeaks()
+	w.log.Info("key fetch", "mode", mode, "tenants", len(w.ids))
+	return nil
 }
 
 // Fault validates the request and installs it in the fake KMS; a body with mode "ok" and no latency clears the scope.

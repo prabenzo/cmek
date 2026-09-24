@@ -36,11 +36,11 @@ type result struct {
 // call is the only function that touches kms.KMS: tenant cap → provider semaphore raced against a KMSTimeout
 // context → sentAt → KEK lookup → openDEK | newDEK → release → classify. It runs with t.mu released and emits no audit.
 // A failed call's error keeps Tink's full text for the service log; the audit Detail shows kms.Cause of it. A naive
-// tenant (noBulkhead) skips the cap and the semaphore but is still counted in flight, so the tile shows the uncapped
+// tenant (FetchNaive) skips the cap and the semaphore but is still counted in flight, so the tile shows the uncapped
 // number; KMSTimeout still bounds the call.
 func (m *Manager) call(t *tenant, op string, d *dek) result {
 	t.mu.Lock()
-	naive := t.noBulkhead
+	naive := t.fetch == FetchNaive
 	if !naive && m.cfg.TenantInflight > 0 {
 		if t.inflight >= m.cfg.TenantInflight {
 			t.mu.Unlock()
@@ -249,7 +249,7 @@ func (m *Manager) apply(t *tenant, op string, d *dek, r result) {
 			t.deks[d.id] = d
 			t.active = d
 		}
-		if !t.passThrough { // the no-cache demo never fills the cache: the caller uses r.prim once
+		if !t.direct() { // the no-cache demo never fills the cache: the caller uses r.prim once
 			d.prim = r.prim
 		}
 		d.hotSince = now
@@ -279,14 +279,14 @@ func (m *Manager) apply(t *tenant, op string, d *dek, r result) {
 		for id := range t.pending { // every pending warm waits for the same next slot: one KMS call per interval [SC-F5]
 			t.pending[id] = t.nextProbeAt
 		}
-		usable := t.lease.Usable(now) && !t.passThrough // no cache: nothing to ride through on
+		usable := t.lease.Usable(now) && !t.direct() // no cache: nothing to ride through on
 		switch {
 		case t.state == Active && usable:
 			m.setState(t, RidingThrough, now, "renewal failed", 0)
 		case t.state == Active && !usable: // a cold tenant: the two spec edges compose in one call (Q3)
 			purged := t.purge()
 			why := "cold fetch failed"
-			if t.passThrough {
+			if t.direct() {
 				why = "no cache: call failed"
 			}
 			m.setState(t, KeyUnavailable, now, why, purged)
