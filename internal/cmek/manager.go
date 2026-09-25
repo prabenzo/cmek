@@ -196,7 +196,11 @@ func (m *Manager) handle(t *tenant, now time.Time) (Handle, bool) {
 }
 
 // EncryptKey returns a handle on the tenant's active DEK, fetching synchronously on the cold path; parked tenants
-// get their sentinel without a KMS call. A hot ACTIVE tenant whose lease is soft-due kicks one lazy renewal.
+// get their sentinel without a KMS call. A hot ACTIVE tenant whose lease is soft-due kicks one lazy renewal. In sync
+// fetch a parked tenant whose probe is due is probed here, inline, before the checks: the sweep never probes a sync
+// tenant and a worker only visits one with ready rows, so a parked tenant with an empty backlog would otherwise
+// have no way back. The request waits where the async design's sweep goroutine would have, bounded by KMSTimeout,
+// and probing keeps it to one request per due slot; a failed probe still answers the parked sentinel.
 func (m *Manager) EncryptKey(ctx context.Context, id string) (Handle, error) {
 	t := m.tenants[id]
 	if t == nil {
@@ -204,6 +208,13 @@ func (m *Manager) EncryptKey(ctx context.Context, id string) (Handle, error) {
 	}
 	now := m.cfg.Clock.Now()
 	t.mu.Lock()
+	if t.fetch == FetchSync && !t.probing && t.state != Active && !now.Before(t.nextProbeAt) {
+		t.probing = true
+		t.mu.Unlock()
+		m.probe(t)
+		now = m.cfg.Clock.Now()
+		t.mu.Lock()
+	}
 	switch t.state {
 	case Revoked:
 		t.mu.Unlock()
