@@ -22,8 +22,9 @@
   button:hover:not(:disabled) { background:#313847; }
   button:disabled { opacity:.45; cursor:not-allowed; }
   button.on { background:var(--blue); border-color:var(--blue); color:#fff; }
-  #mode { display:none; margin-left:8px; padding:2px 8px; border-radius:4px; background:var(--orange); color:#000; font-size:12px; }
-  #mode.on { display:inline-block; }
+  #fetchctl { float:right; margin-left:8px; display:flex; gap:6px; align-items:center; padding:2px 6px; border-radius:4px; font-size:12.5px; color:var(--dim); }
+  #fetchctl.on { background:var(--orange); color:#000; }
+  #fetchctl.on button:not(.on) { background:#3a2a10; border-color:#5a3d10; color:var(--fg); }
   main { display:grid; grid-template-columns:320px 862px 1fr; gap:14px; padding:14px 20px; align-items:start; }
   #cards { display:flex; flex-direction:column; gap:10px; }
   .card { position:relative; background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:10px 12px; }
@@ -81,7 +82,8 @@
 <header>
   <button id="reset" title="Stop this World and build a fresh one: new id, empty queue, every key restored">Reset world</button>
   <button id="cardtoggle" title="Show or hide the scenario column; a running scenario keeps running and the timeline still reports it. Each card has its own × as well">Hide cards</button>
-  <h1>Killswitch <span id="banner">connecting…</span><span id="mode"></span></h1>
+  <span id="fetchctl" title="The whole service's key-fetch design, switched live; the Slow KMS card explains the three and carries the same buttons. A new World starts in Async">Key fetch: <button data-fetch="naive">Naive</button><button data-fetch="sync">Sync</button><button data-fetch="async">Async</button></span>
+  <h1>Killswitch <span id="banner">connecting…</span></h1>
   <p>Customer-managed encryption keys (CMEK) let each tenant own the key that protects its data: revoke the key and the provider can no longer read it. This is a multi-tenant webhook queue where every message is sealed under a per-tenant data key that is itself wrapped by that tenant's KMS key, leased for at most 30 s.</p>
   <p>The thesis: one tenant's KMS trouble, revocation or traffic surge changes nothing for the other 999, and no plaintext is ever decrypted after a key is revoked. Below, 1,000 tenants across three simulated KMS providers run at about 300 events/s; each card injects a fault or a surge and says what to watch.</p>
   <p class="notice">This is one shared live system: anyone viewing this page sees the same World, and a scenario started here runs for everyone. Traffic runs only while someone is watching.</p>
@@ -90,7 +92,7 @@
   <section id="cards">
     <div class="card" data-scenario="slow_kms">
       <h3>Slow KMS</h3><button class="hide" title="Hide this card (a running scenario keeps running)">×</button>
-      <p>One provider, azure, becomes slow enough that many of its calls run past the timeout, for a minute. What happens to the rest of the service depends entirely on where the key fetch runs, and the three buttons let you switch that design live, before or during the run. <b>Naive.</b> No lease, no cache, no bulkheads: every event and every delivery makes its own KMS call and waits for it. The slow provider's calls hold the shared delivery workers, so delivery collapses for every tenant, not just azure's, and the KMS call rate explodes. <b>Sync.</b> The cache and the lease are back, so calls are rare again and the bulkhead caps how many are in flight. But the worker that finds a lease due still fetches inline and waits, and every tenant's deliveries queue behind those waits: throughput mostly survives, latency does not. <b>Async.</b> The design that ships. A lease due for renewal is refreshed in the background while deliveries keep using the cached key, so azure's slowness stays azure's problem: its cells flicker yellow, the healthy line stays flat, and the moment you switch to it the backlog drains. Reset world starts over in Async.</p>
+      <p>One provider, azure, becomes slow enough that many of its calls run past the timeout, for a minute. What happens to the rest of the service depends entirely on where the key fetch runs, and the three buttons (here and in the header) switch that design live for the whole service, before or during the run. <b>Naive.</b> No lease, no cache, no bulkheads: every event and every delivery makes its own KMS call and waits for it. The slow provider's calls hold the shared delivery workers, so delivery collapses for every tenant, not just azure's, and the KMS call rate explodes. <b>Sync.</b> The cache and the lease are back, so calls are rare again and the bulkhead caps how many are in flight. But the worker that finds a lease due still fetches inline and waits, and every tenant's deliveries queue behind those waits: throughput mostly survives, latency does not. <b>Async.</b> The design that ships. A lease due for renewal is refreshed in the background while deliveries keep using the cached key, so azure's slowness stays azure's problem: its cells flicker yellow, the healthy line stays flat, and the moment you switch to it the backlog drains. Reset world starts over in Async.</p>
       <div class="row"><button data-start="slow_kms">Start</button><button data-stop>Stop</button></div>
       <div class="row"><span class="dim">Key fetch:</span><button data-fetch="naive" data-tip="No lease, no DEK cache, no bulkheads: every seal and every delivery is one inline KMS call, bounded only by the 500 ms timeout.">Naive</button><button data-fetch="sync" data-tip="Cache, lease and bulkheads kept, but nothing renews in the background: the worker that finds a lease due (or a parked tenant's probe due) does the KMS call inline and waits; a parked tenant with no backlog is probed by its next ingest request instead.">Sync</button><button data-fetch="async" data-tip="The design that ships: a renewal is kicked into a background goroutine at the soft TTL and a parked tenant is re-probed from the sweep; workers and ingest never wait on the KMS.">Async</button></div>
       <div class="status"></div>

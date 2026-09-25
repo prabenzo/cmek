@@ -170,13 +170,11 @@ function bindCards() {
   document.querySelectorAll('.card').forEach(c => hideCard(c.dataset.scenario, hidden.includes(c.dataset.scenario)));
 }
 
-// renderMode highlights the active key-fetch mode on the Slow KMS card and shows it in the header while it is not
-// the design that ships.
+// renderMode highlights the active key-fetch mode on every set of mode buttons (the header's and the Slow KMS
+// card's) and tints the header control while the service is not on the design that ships.
 function renderMode(mode) {
   document.querySelectorAll('[data-fetch]').forEach(b => { b.classList.toggle('on', b.dataset.fetch === mode); b.disabled = !connected; });
-  const el = $('mode');
-  el.textContent = 'key fetch: ' + mode;
-  el.classList.toggle('on', !!mode && mode !== 'async');
+  $('fetchctl').classList.toggle('on', !!mode && mode !== 'async');
 }
 
 // setCards shows or hides the whole scenario column (a per-viewer preference, remembered in this browser only).
