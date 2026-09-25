@@ -1083,3 +1083,79 @@ func TestSyncFetch(t *testing.T) {
 		t.Errorf("async Hot: hot %v, calls %d (the kick)", m.Hot(rigTenant), r.calls())
 	}
 }
+
+// TestSyncFetchParkedIngestProbes: in sync-fetch mode a parked tenant with no ready rows is never visited by a
+// worker and never probed by Tick, so its way back is the ingest path. A request for a KEY_UNAVAILABLE tenant whose
+// probe is due runs the probe inline: while the provider is down it fails, answers ErrKeyUnavailable and moves the
+// next slot out by the backoff, so the next request makes no call; once the provider is back the probe succeeds and
+// the same request seals with the renewed lease. A REVOKED tenant is re-probed the same way on the fixed cadence, so
+// a restore is seen without a worker. Tick stays out of it in every step.
+func TestSyncFetchParkedIngestProbes(t *testing.T) {
+	r := newRig(t)
+	m, clk, ctx := r.m, r.clk, context.Background()
+	if _, err := m.EncryptKey(ctx, rigTenant); err != nil { // async warm-up: one generate
+		t.Fatal(err)
+	}
+	m.SetFetch(rigTenant, FetchSync)
+	r.fake.SetFault(kms.Scope{Provider: "gcp"}, kms.Fault{Mode: kms.ModeFastFail})
+	clk.Advance(30 * time.Second) // the lease lapses with no traffic and no rows
+	m.Tick(clk.Now())
+	if r.state() != Active || r.calls() != 1 {
+		t.Fatalf("idle lapse: state %v, calls %d (an idle ACTIVE tenant is purged, not parked)", r.state(), r.calls())
+	}
+	// a cold event during the outage: the cold fetch fails and parks the tenant (the ordinary edge, in every mode)
+	if _, err := m.EncryptKey(ctx, rigTenant); !errors.Is(err, ErrKeyUnavailable) || r.state() != KeyUnavailable || r.calls() != 2 {
+		t.Fatalf("cold fetch in the outage: err %v, state %v, calls %d", err, r.state(), r.calls())
+	}
+	// not yet due: the parked sentinel with no call
+	if _, err := m.EncryptKey(ctx, rigTenant); !errors.Is(err, ErrKeyUnavailable) || r.calls() != 2 {
+		t.Errorf("before the probe is due: err %v, calls %d (no call)", err, r.calls())
+	}
+	// due, provider still down: the request probes inline, fails, and the slot moves out by the backoff
+	clk.Advance(time.Second)
+	m.Tick(clk.Now())
+	if r.calls() != 2 {
+		t.Fatalf("Tick probed a sync tenant: calls %d", r.calls())
+	}
+	if _, err := m.EncryptKey(ctx, rigTenant); !errors.Is(err, ErrKeyUnavailable) || r.state() != KeyUnavailable || r.calls() != 3 {
+		t.Errorf("due probe in the outage: err %v, state %v, calls %d (one inline probe)", err, r.state(), r.calls())
+	}
+	if _, err := m.EncryptKey(ctx, rigTenant); !errors.Is(err, ErrKeyUnavailable) || r.calls() != 3 {
+		t.Errorf("right after the failed probe: err %v, calls %d (backoff: no call)", err, r.calls())
+	}
+	// the provider is back: the next due request heals the tenant and seals
+	r.fake.SetFault(kms.Scope{Provider: "gcp"}, kms.Fault{})
+	clk.Advance(2 * time.Second)
+	h, err := m.EncryptKey(ctx, rigTenant)
+	if err != nil || r.state() != Active || r.calls() != 4 || m.Info(rigTenant).HotDEKs != 1 {
+		t.Fatalf("due probe after recovery: err %v, state %v, calls %d, hot %d", err, r.state(), r.calls(), m.Info(rigTenant).HotDEKs)
+	}
+	if _, err := Seal(h, clk.Now(), rigTenant, 1, []byte("x")); err != nil {
+		t.Errorf("seal on the healed lease: %v", err)
+	}
+	if m.Info(rigTenant).Probing {
+		t.Error("probing left set after the inline probe")
+	}
+	// a revoke: the re-probe runs from ingest on the fixed cadence, and a restore is seen without a worker
+	r.fake.Revoke(rigKEK)
+	clk.Advance(16 * time.Second)
+	if _, err := m.DecryptKey(rigTenant, h.DEKID); !errors.Is(err, ErrKeyRevoked) || r.state() != Revoked || r.calls() != 5 {
+		t.Fatalf("denied inline renewal: err %v, state %v, calls %d", err, r.state(), r.calls())
+	}
+	if _, err := m.EncryptKey(ctx, rigTenant); !errors.Is(err, ErrKeyRevoked) || r.calls() != 5 {
+		t.Errorf("revoked, re-probe not due: err %v, calls %d (no call)", err, r.calls())
+	}
+	clk.Advance(5 * time.Second)
+	if _, err := m.EncryptKey(ctx, rigTenant); !errors.Is(err, ErrKeyRevoked) || r.calls() != 6 || r.state() != Revoked {
+		t.Errorf("revoked, re-probe due: err %v, calls %d, state %v (one denied probe)", err, r.calls(), r.state())
+	}
+	r.fake.Restore(rigKEK)
+	clk.Advance(5 * time.Second)
+	m.Tick(clk.Now())
+	if r.calls() != 6 {
+		t.Fatalf("Tick re-probed a sync tenant: calls %d", r.calls())
+	}
+	if _, err := m.EncryptKey(ctx, rigTenant); err != nil || r.state() != Active || r.calls() != 7 {
+		t.Errorf("restore seen from ingest: err %v, state %v, calls %d", err, r.state(), r.calls())
+	}
+}
