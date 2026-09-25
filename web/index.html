@@ -99,25 +99,25 @@
     </div>
     <div class="card" data-scenario="provider_blip provider_outage">
       <h3>Provider outage</h3><button class="hide" title="Hide this card (a running scenario keeps running)">×</button>
-      <p>gcp fast-fails. <b>Blip (10 s):</b> up to a third of the grid turns yellow as renewals fail, a few cold cells go orange with one 503, then everything is green within ~12 s of the clear; no chart moves. <b>Outage (60 s):</b> yellow spreads over 0–15 s with no customer impact; from ~9 s leases lapse at staggered times, cells turn orange and those tenants get <code>503 key_unavailable</code>. aws and azure stay flat. Calls to gcp decay through backoff. On restore, green within ~10 s and the parked messages deliver.</p>
+      <p>One of the three key providers, gcp, stops answering. Every tenant on it depends on that provider to renew its key lease, but each tenant is still holding a cached key, so nothing has to stop right away. <b>Blip.</b> The provider is gone for a few seconds. The affected cells turn yellow while their renewals fail and the service rides through on the leases it already has; when the provider is back, everything is green again and no message was delayed or lost. <b>Outage.</b> The provider is gone for a minute. Yellow spreads first, with no customer impact. Only once a tenant's lease runs out does its cell turn orange: its new events are turned away with a clear error and the messages it already sent wait in the queue, sealed. Retries back off instead of hammering the dead provider. The other two providers' tenants never notice. When gcp returns, the waiting messages deliver.</p>
       <div class="row"><button data-start="provider_blip">Start blip</button><button data-start="provider_outage">Start outage</button><button data-stop>Stop</button></div>
       <div class="status"></div>
     </div>
     <div class="card" data-scenario="key_revocation">
       <h3>Key revocation</h3><button class="hide" title="Hide this card (a running scenario keeps running)">×</button>
-      <p>The KMS key of one high-traffic tenant (rank 3) is disabled. Its cell turns purple, typically within 15 s and always within 30 s; ingest for it returns <code>403 key_revoked</code>; the timeline shows REVOKED and the data keys purged; nothing of its is decrypted after that. Click <b>Restore</b>: the re-probe sees it within 5 s and the parked messages deliver.</p>
+      <p>One busy tenant revokes its key. This is the promise the whole system exists for: from the moment the key is disabled, the provider can no longer read anything of that tenant's, and within a fixed bound it stops trying. Its cell turns purple as soon as the service notices, its new events are refused with an error that says why, the keys it held in memory are purged, and the messages already in the queue stay sealed and waiting. The timeline shows the moment of revocation as the key provider saw it and how long detection took. Nothing else on the grid changes. Click Restore to give the key back: the service notices within seconds and the waiting messages deliver.</p>
       <div class="row"><button data-start="key_revocation">Start</button><button data-stop>Stop</button><button id="restore" disabled>Restore</button></div>
       <div class="status"></div>
     </div>
     <div class="card" data-scenario="tenant_surge">
       <h3>Tenant surge</h3><button class="hide" title="Hide this card (a running scenario keeps running)">×</button>
-      <p>One top-20 tenant (rank 5) sends 100× its rate for 60 s. Its cell stays green, marked with a ring. After the 200-event burst it gets <code>429 rate_limited</code> above 100 events/s; those 429s show as <i>within share</i> by design. Its KMS calls stay flat: renewals at most 1 per 15 s, plus one data-key rotation per 10,000 accepted messages. Other tenants' p99 does not move.</p>
+      <p>One busy tenant suddenly sends a hundred times its usual traffic for a minute. Its cell stays green and is marked with a ring. Above the rate it is allowed, its extra events are turned away with a rate-limit error, so it cannot crowd out anyone else. Its key traffic does not grow with its event traffic: however many events it sends, the key is renewed on the same slow schedule, which is what the cache and the lease buy. The other tenants' latency does not move.</p>
       <div class="row"><button data-start="tenant_surge">Start</button><button data-stop>Stop</button></div>
       <div class="status"></div>
     </div>
     <div class="card" data-scenario="global_surge">
       <h3>Global surge</h3><button class="hide" title="Hide this card (a running scenario keeps running)">×</button>
-      <p>Every tenant sends 5× for 90 s: about 1,500 events/s against a delivery capacity near 640. Delivered holds at capacity instead of collapsing. The heaviest tenants are held to their fair share with 429s and, near 75 s, the heaviest ~40 are shed with <code>503 overloaded</code> while the other ~960 notice nothing. Backlog levels off under its caps and drains in about a minute. KMS calls stay under ~67/s.</p>
+      <p>Every tenant sends several times its usual traffic at once, more than the service can deliver. The service does not collapse: delivery holds at its full capacity and the queue absorbs the rest. The overflow is rejected at the door, heaviest senders first, so the tenants sending within their fair share keep getting through untouched. The backlog levels off under its cap and drains once the surge ends. Key traffic stays flat throughout, because a surge of events is not a surge of key fetches.</p>
       <div class="row"><button data-start="global_surge">Start</button><button data-stop>Stop</button></div>
       <div class="status"></div>
     </div>
